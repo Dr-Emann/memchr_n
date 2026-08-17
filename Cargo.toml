@@ -12,3 +12,12 @@ keywords = ["memchr", "simd", "search", "bytes", "scan"]
 categories = ["algorithms", "text-processing"]
 
 [dependencies]
+fearless_simd = "0.7"
+
+[dev-dependencies]
+criterion = "0.8"
+memchr = "2.8"
+
+[[bench]]
+name = "memchr_n"
+harness = false
