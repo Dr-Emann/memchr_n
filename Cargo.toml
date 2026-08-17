@@ -1,14 +1,26 @@
 [package]
 name = "memchr-n"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Required for `core::range::RangeInclusive`. We could go lower otherwise.
+rust-version = "1.95"
 authors = ["Zachary Dremann <dremann@gmail.com>"]
 description = "Fast SIMD-accelerated search and iteration over the bytes belonging to an arbitrary set of byte values"
 repository = "https://github.com/Dr-Emann/memchr_n"
-readme = "README.md"
 license = "MIT OR Apache-2.0"
 keywords = ["memchr", "simd", "search", "bytes", "scan"]
 categories = ["algorithms", "text-processing"]
 
+[features]
+manual_level = []
+
 [dependencies]
+fearless_simd = { git = "https://github.com/linebender/fearless_simd.git" }
+
+[dev-dependencies]
+criterion = "0.8"
+memchr = "2.8"
+
+[[bench]]
+name = "memchr_n"
+harness = false

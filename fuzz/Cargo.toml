@@ -1,0 +1,28 @@
+[package]
+name = "memchr_n-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.memchr-n]
+path = ".."
+
+[[bin]]
+name = "fuzzer"
+path = "fuzz_targets/fuzzer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memchr_n"
+path = "fuzz_targets/memchr_n.rs"
+test = false
+doc = false
+bench = false
