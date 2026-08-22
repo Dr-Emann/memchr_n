@@ -399,11 +399,23 @@ kernel! {
         let (q1, q3) = odd_ab.deinterleave(odd_cd);
         let (q0, q1, q2, q3) = (q0.into(), q1.into(), q2.into(), q3.into());
 
+        // shift the second vector right by one, insert the top bit from the first vector
+        // The top two bits each element of temp0 are from the first and second vector
         let temp0 = vsriq_n_u8::<1>(q1, q0);
+        // shift the fourth vector right by one, insert the top bit from the third vector
+        // The top two bits each element of temp1 are from the third and fourth vector
         let temp1 = vsriq_n_u8::<1>(q3, q2);
+        // shift temp1 (the top two bits of which are from the third and fourth vector) right by 2,
+        // insert the top two bits from temp0 (the top two bits of which are from the first and
+        // second vector)
+        // The top four bits of each element of temp2 are from the first, second, third, and fourth
+        // vector
         let temp2 = vsriq_n_u8::<2>(temp1, temp0);
+        // duplicate the top 4 bits into the bottom 4 bits of each element
         let temp3 = vsriq_n_u8::<4>(temp2, temp2);
 
+        // Returns a value where the first 4 bits are the low 4 bits of the first element,
+        // the next 4 bits are the high 4 bits of the second element, and so on.
         let result_vector = vshrn_n_u16::<4>(vreinterpretq_u16_u8(temp3));
         vget_lane_u64::<0>(vreinterpret_u64_u8(result_vector))
     }
