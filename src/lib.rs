@@ -12,7 +12,6 @@ use core::fmt;
 use core::mem::transmute_copy;
 use core::range::RangeInclusive;
 use fearless_simd::{Level, Simd, dispatch};
-use vector::{ConstantNibble, NibbleLookup};
 
 /// Bytes matched per kernel invocation.
 const CHUNK_BYTES: usize = 64;
@@ -144,103 +143,13 @@ struct Scan {
     count_all: unsafe fn(&FinderKind, &mut IterState<'_>) -> usize,
 }
 
-/// A vector kernel that can be rebuilt from the [`FinderKind`] it was chosen for.
-///
-/// Which variant each impl reads is the other half of [`build_scan_with`]'s match, which
-/// installs this kernel's entry points in that same arm; the two are edited together.
-trait VectorKernel<S: Simd>: vector::Kernel<S> {
-    /// Returns `None` unless `kind` is the variant this kernel was chosen for.
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self>;
-}
-
-impl<S: Simd> VectorKernel<S> for vector::AnyOf<S, 1> {
-    #[inline(always)]
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::OneByte(needle) = *kind else {
-            return None;
-        };
-        Some(Self {
-            simd,
-            needles: [needle],
-        })
-    }
-}
-
-impl<S: Simd> VectorKernel<S> for vector::AnyOf<S, 2> {
-    #[inline(always)]
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::TwoBytes(needles) = *kind else {
-            return None;
-        };
-        Some(Self { simd, needles })
-    }
-}
-
-impl<S: Simd> VectorKernel<S> for vector::AnyOf<S, 3> {
-    #[inline(always)]
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::ThreeBytes(needles) = *kind else {
-            return None;
-        };
-        Some(Self { simd, needles })
-    }
-}
-
-impl<S: Simd> VectorKernel<S> for vector::OneRange {
-    #[inline(always)]
-    fn from_kind(_simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::OneRange(range) = *kind else {
-            return None;
-        };
-        Some(Self { range })
-    }
-}
-
-impl<S: Simd> VectorKernel<S> for vector::SmallSet<S> {
-    #[inline(always)]
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::SmallSet {
-            lo_lookup,
-            hi_lookup,
-        } = *kind
-        else {
-            return None;
-        };
-        Some(Self {
-            simd,
-            lo_lookup,
-            hi_lookup,
-        })
-    }
-}
-
-impl<S: Simd> VectorKernel<S> for vector::SingleNibble<S> {
-    #[inline(always)]
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::ConstantNibble(which, table) = *kind else {
-            return None;
-        };
-        Some(Self { simd, which, table })
-    }
-}
-
-impl<S: Simd> VectorKernel<S> for vector::AnyByte<S> {
-    #[inline(always)]
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::AnyByte(bytes) = *kind else {
-            return None;
-        };
-        Some(Self { simd, bytes })
-    }
-}
-
 /// Builds the [`Scan`] for a vector kernel at one SIMD level.
 ///
 /// A SIMD token is a zero-sized proof that the running target supports its level, so `S` alone
 /// carries the level into the entry points below: each rebuilds its token and re-enters that
 /// level's target-feature context through [`Simd::vectorize`].
-fn vector_scan<S: Simd, K: VectorKernel<S>>(simd: S) -> Scan {
-    unsafe fn find_next<S: Simd, K: VectorKernel<S>>(kind: &FinderKind, state: &mut IterState<'_>) {
+fn vector_scan<S: Simd, K: vector::Kernel>(simd: S) -> Scan {
+    unsafe fn find_next<S: Simd, K: vector::Kernel>(kind: &FinderKind, state: &mut IterState<'_>) {
         // SAFETY: this function is only ever instantiated by `vector_scan`, which accepts an S,
         // so we know the caller proved the right target features are available
         let simd = unsafe { token::<S>() };
@@ -250,13 +159,13 @@ fn vector_scan<S: Simd, K: VectorKernel<S>>(simd: S) -> Scan {
                 // SAFETY: the `Scan` below stores this function only for the variant `K` was
                 // chosen for, so `from_kind` returns `Some`. Unwrapping it checked costs a
                 // measurable amount on refill-heavy searches.
-                let kernel = unsafe { K::from_kind(simd, kind).unwrap_unchecked() };
+                let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
                 vector::find_next(simd, state, kernel);
             },
         );
     }
 
-    unsafe fn count_all<S: Simd, K: VectorKernel<S>>(
+    unsafe fn count_all<S: Simd, K: vector::Kernel>(
         kind: &FinderKind,
         state: &mut IterState<'_>,
     ) -> usize {
@@ -268,7 +177,7 @@ fn vector_scan<S: Simd, K: VectorKernel<S>>(simd: S) -> Scan {
                 // SAFETY: the `Scan` below stores this function only for the variant `K` was
                 // chosen for, so `from_kind` returns `Some`. Unwrapping it checked costs a
                 // measurable amount on refill-heavy searches.
-                let kernel = unsafe { K::from_kind(simd, kind).unwrap_unchecked() };
+                let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
                 let total = vector::count(simd, &state.haystack[state.pos..], kernel);
                 state.pos = state.haystack.len();
                 total
@@ -408,13 +317,13 @@ fn build_scan(level: Level, family: Family, kind: FinderKind) -> Scan {
 /// [`VectorKernel`] impl.
 fn vector_build<S: Simd>(simd: S, kind: FinderKind) -> Scan {
     match kind {
-        FinderKind::OneByte(_) => vector_scan::<S, vector::AnyOf<S, 1>>(simd),
-        FinderKind::TwoBytes(_) => vector_scan::<S, vector::AnyOf<S, 2>>(simd),
-        FinderKind::ThreeBytes(_) => vector_scan::<S, vector::AnyOf<S, 3>>(simd),
-        FinderKind::OneRange(_) => vector_scan::<S, vector::OneRange>(simd),
-        FinderKind::SmallSet { .. } => vector_scan::<S, vector::SmallSet<S>>(simd),
-        FinderKind::ConstantNibble(..) => vector_scan::<S, vector::SingleNibble<S>>(simd),
-        FinderKind::AnyByte(_) => vector_scan::<S, vector::AnyByte<S>>(simd),
+        FinderKind::OneByte(_) => vector_scan::<S, vector::kernels::AnyOf<1>>(simd),
+        FinderKind::TwoBytes(_) => vector_scan::<S, vector::kernels::AnyOf<2>>(simd),
+        FinderKind::ThreeBytes(_) => vector_scan::<S, vector::kernels::AnyOf<3>>(simd),
+        FinderKind::OneRange(_) => vector_scan::<S, vector::kernels::OneRange>(simd),
+        FinderKind::SmallSet { .. } => vector_scan::<S, vector::kernels::SmallSet>(simd),
+        FinderKind::ConstantNibble(..) => vector_scan::<S, vector::kernels::SingleNibble>(simd),
+        FinderKind::AnyByte(_) => vector_scan::<S, vector::kernels::AnyByte>(simd),
         FinderKind::Never => never_scan(),
     }
 }
@@ -475,6 +384,24 @@ impl<'a> Iterator for Iter<'a> {
             total += unsafe { (finder.scan.count_all)(&finder.kind, &mut self.state) };
         }
         total
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ConstantNibble {
+    Lo,
+    Hi,
+}
+
+#[derive(Debug, Default, Copy, Clone)]
+struct NibbleLookup([u8; 16]);
+
+impl NibbleLookup {
+    #[inline]
+    fn set(&mut self, nibble: u8, bit: u8) {
+        debug_assert!(nibble < 16);
+        debug_assert!(bit < 8);
+        self.0[usize::from(nibble)] |= 1 << bit;
     }
 }
 
@@ -743,7 +670,7 @@ mod tests {
     #[test]
     fn counts_do_not_overflow_the_accumulator() {
         let finder = build(b"x");
-        let len = CHUNK_BYTES * (vector::CHUNKS_PER_ACCUMULATOR * 2 + 3);
+        let len = CHUNK_BYTES * (512 + 3);
         let haystack = vec![b'x'; len];
         assert_eq!(finder.iter(&haystack).count(), len);
     }
