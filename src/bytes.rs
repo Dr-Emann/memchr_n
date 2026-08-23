@@ -1,6 +1,5 @@
 use crate::bitset::Bitset;
-use crate::vector::{ConstantNibble, NibbleLookup};
-use crate::{Backend, Family, Finder, FinderKind, vector};
+use crate::{Backend, ConstantNibble, Family, Finder, FinderKind, NibbleLookup, vector};
 use core::range::RangeInclusive;
 use fearless_simd::Level;
 

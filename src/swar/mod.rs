@@ -17,6 +17,7 @@ const WORD: usize = 8;
 /// Bit 7 of every byte.
 const HIGH: u64 = 0x8080_8080_8080_8080;
 
+#[inline]
 const fn splat(byte: u8) -> u64 {
     u64::from_ne_bytes([byte; WORD])
 }
@@ -27,7 +28,7 @@ const fn splat(byte: u8) -> u64 {
 /// and cannot carry out of the byte, so OR-ing `b` back in covers `0x80` as well. The
 /// classic `(w - LOW) & !w & HIGH` is two operations shorter but marks the wrong byte
 /// when a zero borrows into its neighbour, and these marks have to be exact.
-#[inline(always)]
+#[inline]
 const fn nonzero_bytes(word: u64) -> u64 {
     ((word & !HIGH) + !HIGH) | word
 }
@@ -37,7 +38,7 @@ const fn nonzero_bytes(word: u64) -> u64 {
 /// Bit `8i + 7` times the multiplier's bit at `49 - 7i` lands on bit `56 + i`. No two of
 /// the sixty-four partial products share a position, so nothing carries into the result,
 /// and every off-diagonal one lands either below bit 56 or past bit 63.
-#[inline(always)]
+#[inline]
 const fn movemask(marks: u64) -> u64 {
     marks.wrapping_mul(0x0002_0408_1020_4081) >> 56
 }
