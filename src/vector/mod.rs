@@ -2,7 +2,7 @@ pub(crate) mod kernels;
 
 use crate::{CHUNK_BYTES, FinderKind, IterState, MatchedBitset};
 use fearless_simd::prelude::*;
-use fearless_simd::{Level, i8x64, kernel, mask8x64, u8x64};
+use fearless_simd::{Level, i8x64, kernel, mask8x64, u8x16, u8x32, u8x64};
 
 /// Tests a chunk of [`CHUNK_BYTES`] bytes against a byte set.
 pub(crate) trait Kernel: Copy {
@@ -114,14 +114,73 @@ pub(crate) fn count<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: K) -> 
 fn tail_bits<S: Simd, K: Kernel>(simd: S, kernel: &K, haystack: &[u8], len: usize) -> u64 {
     debug_assert!(0 < len && len < CHUNK_BYTES);
     if let Some(chunk) = haystack.last_chunk::<CHUNK_BYTES>() {
-        let matched = kernel.matches(u8x64::from_slice(simd, chunk));
+        let matched = kernel.matches(u8x64::load_array_ref(simd, chunk));
         bitmask(simd, matched) >> (CHUNK_BYTES - len)
     } else {
-        let mut buf = [0; CHUNK_BYTES];
-        buf[..len].copy_from_slice(haystack.windows(len).last().unwrap());
-        let matched = kernel.matches(u8x64::load_array(simd, buf));
-        bitmask(simd, matched) & !(u64::MAX << len)
+        short_tail_bits(simd, kernel, &haystack[haystack.len() - len..])
     }
+}
+
+/// Matches a haystack shorter than one [`CHUNK_BYTES`], returning its bits at positions
+/// `0..short_haystack.len()`.
+///
+/// llvm really likes to turn copies of dynamic size into actual calls to memcpy, even if we
+/// can convince it the number of bytes is very small. We go to some lengths here to ensure
+/// we keep all copies to constants here
+#[inline(always)]
+fn short_tail_bits<S: Simd, K: Kernel>(simd: S, kernel: &K, short_haystack: &[u8]) -> u64 {
+    // Copies the first and last `N` bytes of `haystack` into the front of a buffer, for a
+    // haystack too short to load a `u8x16` from either end.
+    #[inline]
+    fn stage<const N: usize>(haystack: &[u8]) -> [u8; 16] {
+        const { assert!(N <= 16 / 2) }
+        debug_assert!(haystack.len() >= N);
+
+        let mut buf = [0; 16];
+        buf[..N].copy_from_slice(&haystack[..N]);
+        buf[N..2 * N].copy_from_slice(&haystack[haystack.len() - N..]);
+        buf
+    }
+
+    // Slides the bits of two `staged`-byte ends back to the positions they were read from,
+    // discarding everything the ends did not cover.
+    //
+    // The two overlap in the middle, where they agree. Neither half may keep more bits than it
+    // read bytes: above the front's sit the back's, and above the back's sit the lanes it was
+    // duplicated into and the staging buffer's zero padding, which matches whenever the byte
+    // set holds zero.
+    #[inline]
+    fn slide_ends(bits: u64, staged: usize, len: usize) -> u64 {
+        let kept = !(u64::MAX << staged);
+        (bits & kept) | (((bits >> staged) & kept) << (len - staged))
+    }
+    let len = short_haystack.len();
+    debug_assert!(0 < len && len < CHUNK_BYTES);
+
+    if let (Some(front), Some(back)) = (
+        short_haystack.first_chunk::<32>(),
+        short_haystack.last_chunk::<32>(),
+    ) {
+        let ends = u8x32::load_array_ref(simd, front).combine(u8x32::load_array_ref(simd, back));
+        return slide_ends(bitmask(simd, kernel.matches(ends)), 32, len);
+    }
+    // The kernel only speaks `u8x64`, so ends narrower than one are duplicated up to it.
+    if let (Some(front), Some(back)) = (
+        short_haystack.first_chunk::<16>(),
+        short_haystack.last_chunk::<16>(),
+    ) {
+        let ends = u8x16::load_array_ref(simd, front).combine(u8x16::load_array_ref(simd, back));
+        return slide_ends(bitmask(simd, kernel.matches(ends.combine(ends))), 16, len);
+    }
+
+    let (buf, staged) = match len {
+        8.. => (stage::<8>(short_haystack), 8),
+        4.. => (stage::<4>(short_haystack), 4),
+        2.. => (stage::<2>(short_haystack), 2),
+        _ => (stage::<1>(short_haystack), 1),
+    };
+    let ends = u8x64::block_splat(u8x16::load_array(simd, buf));
+    slide_ends(bitmask(simd, kernel.matches(ends)), staged, len)
 }
 
 #[inline(always)]
