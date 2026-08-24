@@ -2,6 +2,7 @@
 
 mod bitset;
 mod bytes;
+mod bytewise;
 mod swar;
 mod vector;
 
@@ -232,6 +233,32 @@ fn word_scan<K: swar::Kernel>() -> Scan {
     }
 }
 
+/// The byte-at-a-time counterpart of [`word_scan`].
+fn bytewise_scan<K: bytewise::Kernel>() -> Scan {
+    unsafe fn find_next<K: bytewise::Kernel>(kind: &FinderKind, state: &mut IterState<'_>) {
+        // SAFETY: as in `vector_scan`, the `Scan` below stores this function only for the
+        // variant `K` was chosen for.
+        let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
+        bytewise::find_next(state, kernel);
+    }
+
+    unsafe fn count_all<K: bytewise::Kernel>(
+        kind: &FinderKind,
+        state: &mut IterState<'_>,
+    ) -> usize {
+        // SAFETY: as above.
+        let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
+        let total = bytewise::count(&state.haystack[state.pos..], kernel);
+        state.pos = state.haystack.len();
+        total
+    }
+
+    Scan {
+        find_next: find_next::<K>,
+        count_all: count_all::<K>,
+    }
+}
+
 /// Builds the [`Scan`] for a byte set that nothing can match.
 fn never_scan() -> Scan {
     fn find_next(_kind: &FinderKind, state: &mut IterState<'_>) {
@@ -278,7 +305,7 @@ fn word_build(kind: FinderKind) -> Scan {
         FinderKind::TwoBytes(_) => word_scan::<swar::kernels::AnyOf<2>>(),
         FinderKind::ThreeBytes(_) => word_scan::<swar::kernels::AnyOf<3>>(),
         FinderKind::OneRange(_) => word_scan::<swar::kernels::OneRange>(),
-        FinderKind::AnyByte(_) => word_scan::<swar::kernels::AnyByte>(),
+        FinderKind::AnyByte(_) => bytewise_scan::<bytewise::kernels::AnyByte>(),
         FinderKind::Never => never_scan(),
         // Both scan by shuffling bytes within a vector, which is what picks them over
         // `AnyByte` in the first place; `Bytes::kind` only builds them for a family that has
@@ -561,12 +588,15 @@ mod tests {
         }
     }
 
-    /// Both families scan the tail by re-reading the last whole unit they work in, so bits
-    /// belonging to offsets the main loop already reported have to be shifted off. A
-    /// haystack that matches at every offset catches any that are not.
+    /// Both wide families scan the tail by re-reading the last whole unit they work in, so
+    /// bits belonging to offsets the main loop already reported have to be shifted off, and
+    /// the bytewise family instead has to advance past exactly the run it reported. A
+    /// haystack that matches at every offset catches either going wrong.
     #[test]
     fn overlapping_tail_does_not_repeat_matches() {
-        for finder in [build(b"x"), build_word(b"x")] {
+        // The third set is large enough to reach `AnyByte`, and contains `x`.
+        let dense: Vec<u8> = (0..=u8::MAX).step_by(3).collect();
+        for finder in [build(b"x"), build_word(b"x"), build_word(&dense)] {
             for len in 0..192 {
                 let haystack = vec![b'x'; len];
                 let expected: Vec<usize> = (0..len).collect();

@@ -7,15 +7,15 @@
 //! time, and an explicitly requested [`crate::Backend::Scalar`].
 //!
 //! The win over a plain byte loop comes from the kernels an arithmetic trick can express:
-//! one to three needles, or a range. [`kernels::AnyByte`] still has to probe the set a byte at a
-//! time, because SWAR has no gather, so it gains little or nothing.
+//! one to three needles, or a range. A set that needs a table lookup has no such trick, because
+//! SWAR has no gather, so it goes to [`crate::bytewise`] instead.
 
 pub(crate) mod kernels;
 
 use crate::{CHUNK_BYTES, FinderKind, IterState};
 
 /// Bytes tested per general-purpose register.
-const WORD_BYTES: usize = 8;
+pub(crate) const WORD_BYTES: usize = 8;
 
 /// Bit 7 of every byte.
 const HIGH: u64 = 0x8080_8080_8080_8080;
@@ -42,7 +42,7 @@ const fn nonzero_bytes(word: u64) -> u64 {
 /// the sixty-four partial products share a position, so nothing carries into the result,
 /// and every off-diagonal one lands either below bit 56 or past bit 63.
 #[inline]
-const fn movemask(marks: u64) -> u64 {
+pub(crate) const fn movemask(marks: u64) -> u64 {
     marks.wrapping_mul(0x0002_0408_1020_4081) >> 56
 }
 

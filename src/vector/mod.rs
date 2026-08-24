@@ -15,7 +15,7 @@ pub(crate) trait Kernel: Copy {
 ///
 /// [`kernels::SmallSet`], [`kernels::SingleNibble`] and [`kernels::AnyByte`] are built on one. Where it is missing,
 /// `swizzle_dyn` degrades into a per-lane gather through memory, which loses to probing
-/// the byte set directly with [`crate::swar`].
+/// the byte set directly with [`crate::bytewise`].
 pub(crate) fn has_byte_shuffle(level: Level) -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
