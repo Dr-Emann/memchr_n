@@ -210,72 +210,15 @@ unsafe fn token<S: Simd>() -> S {
     unsafe { transmute_copy(&()) }
 }
 
-/// The word-at-a-time counterpart of [`VectorKernel`].
-trait WordKernel: swar::Kernel {
-    /// As [`VectorKernel::from_kind`].
-    fn from_kind(kind: &FinderKind) -> Option<Self>;
-}
-
-impl WordKernel for swar::AnyOf<1> {
-    #[inline(always)]
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::OneByte(needle) = *kind else {
-            return None;
-        };
-        Some(Self { needles: [needle] })
-    }
-}
-
-impl WordKernel for swar::AnyOf<2> {
-    #[inline(always)]
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::TwoBytes(needles) = *kind else {
-            return None;
-        };
-        Some(Self { needles })
-    }
-}
-
-impl WordKernel for swar::AnyOf<3> {
-    #[inline(always)]
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::ThreeBytes(needles) = *kind else {
-            return None;
-        };
-        Some(Self { needles })
-    }
-}
-
-impl WordKernel for swar::OneRange {
-    #[inline(always)]
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::OneRange(range) = *kind else {
-            return None;
-        };
-        Some(Self::new(range))
-    }
-}
-
-impl WordKernel for swar::AnyByte {
-    #[inline(always)]
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::AnyByte(bytes) = *kind else {
-            return None;
-        };
-        Some(Self { bytes })
-    }
-}
-/// Builds the [`Scan`] for a word-at-a-time kernel, which needs no target features and so no
-/// per-level entry points.
-fn word_scan<K: WordKernel>() -> Scan {
-    unsafe fn find_next<K: WordKernel>(kind: &FinderKind, state: &mut IterState<'_>) {
+fn word_scan<K: swar::Kernel>() -> Scan {
+    unsafe fn find_next<K: swar::Kernel>(kind: &FinderKind, state: &mut IterState<'_>) {
         // SAFETY: as in `vector_scan`, the `Scan` below stores this function only for the
         // variant `K` was chosen for.
         let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
         swar::find_next(state, kernel);
     }
 
-    unsafe fn count_all<K: WordKernel>(kind: &FinderKind, state: &mut IterState<'_>) -> usize {
+    unsafe fn count_all<K: swar::Kernel>(kind: &FinderKind, state: &mut IterState<'_>) -> usize {
         // SAFETY: as above.
         let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
         let total = swar::count(&state.haystack[state.pos..], kernel);
@@ -314,7 +257,7 @@ fn build_scan(level: Level, family: Family, kind: FinderKind) -> Scan {
 }
 
 /// Picks the vector kernel for a kind. Each arm's kernel reads that same arm back in its
-/// [`VectorKernel`] impl.
+/// [`vector::Kernel`] impl.
 fn vector_build<S: Simd>(simd: S, kind: FinderKind) -> Scan {
     match kind {
         FinderKind::OneByte(_) => vector_scan::<S, vector::kernels::AnyOf<1>>(simd),
@@ -331,11 +274,11 @@ fn vector_build<S: Simd>(simd: S, kind: FinderKind) -> Scan {
 /// The word-at-a-time counterpart of [`vector_build`].
 fn word_build(kind: FinderKind) -> Scan {
     match kind {
-        FinderKind::OneByte(_) => word_scan::<swar::AnyOf<1>>(),
-        FinderKind::TwoBytes(_) => word_scan::<swar::AnyOf<2>>(),
-        FinderKind::ThreeBytes(_) => word_scan::<swar::AnyOf<3>>(),
-        FinderKind::OneRange(_) => word_scan::<swar::OneRange>(),
-        FinderKind::AnyByte(_) => word_scan::<swar::AnyByte>(),
+        FinderKind::OneByte(_) => word_scan::<swar::kernels::AnyOf<1>>(),
+        FinderKind::TwoBytes(_) => word_scan::<swar::kernels::AnyOf<2>>(),
+        FinderKind::ThreeBytes(_) => word_scan::<swar::kernels::AnyOf<3>>(),
+        FinderKind::OneRange(_) => word_scan::<swar::kernels::OneRange>(),
+        FinderKind::AnyByte(_) => word_scan::<swar::kernels::AnyByte>(),
         FinderKind::Never => never_scan(),
         // Both scan by shuffling bytes within a vector, which is what picks them over
         // `AnyByte` in the first place; `Bytes::kind` only builds them for a family that has
@@ -578,7 +521,11 @@ mod tests {
     fn matches_naive_across_lengths() {
         for set in sets() {
             for (name, finder) in [("vector", build(&set)), ("word", build_word(&set))] {
-                for len in [0, 1, 5, 63, 64, 65, 127, 128, 129, 255, 256, 1000] {
+                // Every length up to a chunk-and-change, so each way the tail can split
+                // into whole words and a short remainder is covered, then the pair and
+                // multi-chunk boundaries.
+                let lens = (0..=80).chain([127, 128, 129, 255, 256, 1000]);
+                for len in lens {
                     let haystack = haystack(len);
                     let expected = naive(&set, &haystack);
                     let got: Vec<usize> = finder.iter(&haystack).collect();
@@ -597,7 +544,11 @@ mod tests {
     fn find_matches_naive() {
         for set in sets() {
             for (name, finder) in [("vector", build(&set)), ("word", build_word(&set))] {
-                for len in [0, 1, 5, 63, 64, 65, 127, 128, 129, 255, 256, 1000] {
+                // Every length up to a chunk-and-change, so each way the tail can split
+                // into whole words and a short remainder is covered, then the pair and
+                // multi-chunk boundaries.
+                let lens = (0..=80).chain([127, 128, 129, 255, 256, 1000]);
+                for len in lens {
                     let haystack = haystack(len);
                     let expected = naive(&set, &haystack).first().copied();
                     assert_eq!(
@@ -610,9 +561,9 @@ mod tests {
         }
     }
 
-    /// The tail is scanned by re-reading the last full chunk, so bits belonging to
-    /// offsets the chunk loop already reported have to be shifted off. A haystack that
-    /// matches at every offset catches any that are not.
+    /// Both families scan the tail by re-reading the last whole unit they work in, so bits
+    /// belonging to offsets the main loop already reported have to be shifted off. A
+    /// haystack that matches at every offset catches any that are not.
     #[test]
     fn overlapping_tail_does_not_repeat_matches() {
         for finder in [build(b"x"), build_word(b"x")] {

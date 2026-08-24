@@ -1,9 +1,9 @@
 use super::Kernel;
 use crate::bitset::Bitset;
 use crate::{ConstantNibble, FinderKind, NibbleLookup};
+use core::range::RangeInclusive;
 use fearless_simd::prelude::*;
 use fearless_simd::{mask8x64, u8x16, u8x32, u8x64};
-use std::range::RangeInclusive;
 
 /// Compares against each needle in turn, which beats a table lookup while the set is
 /// small enough that the comparisons stay cheaper than the lookup they replace.

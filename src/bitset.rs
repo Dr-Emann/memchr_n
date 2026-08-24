@@ -1,4 +1,4 @@
-use std::range::RangeInclusive;
+use core::range::RangeInclusive;
 
 const TABLE_BITS: usize = 256;
 const TABLE_BYTES: usize = TABLE_BITS / u8::BITS as usize;
