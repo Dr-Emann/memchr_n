@@ -1,6 +1,5 @@
 use crate::FinderKind;
-use crate::bitset::Bitset;
-use crate::swar::{HIGH, Kernel, WORD_BYTES, nonzero_bytes, splat};
+use crate::swar::{HIGH, Kernel, nonzero_bytes, splat};
 use core::range::RangeInclusive;
 
 #[derive(Copy, Clone)]
@@ -116,35 +115,10 @@ impl Kernel for OneRange {
     }
 }
 
-/// The counterpart of the vector `AnyByte` kernel. Without a shuffle to run the table
-/// lookup on there is nothing to do but probe the set one byte at a time.
-#[derive(Copy, Clone)]
-pub(crate) struct AnyByte {
-    bitset: Bitset,
-}
-
-impl Kernel for AnyByte {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::AnyByte(bitset) = *kind else {
-            return None;
-        };
-        Some(Self { bitset })
-    }
-
-    #[inline]
-    fn matches(&self, word: u64) -> u64 {
-        let mut marks = 0;
-        for i in 0..WORD_BYTES {
-            let byte = (word >> (i * 8)) as u8;
-            marks |= u64::from(self.bitset.contains(byte)) << (i * 8 + 7);
-        }
-        marks
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::swar::WORD_BYTES;
 
     fn assert_marks<K: Kernel>(kernel: &K, bytes: [u8; WORD_BYTES], accepts: impl Fn(u8) -> bool) {
         let marks = kernel.matches(u64::from_le_bytes(bytes));
