@@ -13,7 +13,7 @@ pub(crate) trait Kernel: Copy {
 
 /// Whether the target has a single-instruction dynamic byte shuffle.
 ///
-/// [`SmallSet`], [`SingleNibble`] and [`AnyByte`] are built on one. Where it is missing,
+/// [`kernels::SmallSet`], [`kernels::SingleNibble`] and [`kernels::AnyByte`] are built on one. Where it is missing,
 /// `swizzle_dyn` degrades into a per-lane gather through memory, which loses to probing
 /// the byte set directly with [`crate::swar`].
 pub(crate) fn has_byte_shuffle(level: Level) -> bool {
