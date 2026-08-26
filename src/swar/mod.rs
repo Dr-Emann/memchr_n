@@ -97,12 +97,16 @@ fn chunk_bits<K: Kernel>(kernel: &K, chunk: &[u8; CHUNK_BYTES]) -> u64 {
 /// Matches the final `len` bytes of `haystack`, returning their bits at positions
 /// `0..len`.
 ///
-/// Whole words are marked from the start of the tail, and whatever is left over is picked
-/// up by [`last_word_bits`], so a tail costs one word per eight bytes rather than a whole
-/// chunk however short it is.
+/// Whole words are marked from the start of the tail, and whatever is left over is picked up
+/// by re-reading the last whole word of the haystack, so a tail costs one word per eight bytes
+/// rather than a whole chunk however short it is. Only a haystack too short to hold a whole
+/// word has to be staged, which [`short_haystack_bits`] does.
 #[inline]
 fn tail_bits<K: Kernel>(kernel: &K, haystack: &[u8], len: usize) -> u64 {
     debug_assert!(0 < len && len < CHUNK_BYTES);
+    let Some(last_word) = haystack.last_chunk::<WORD_BYTES>() else {
+        return short_haystack_bits(kernel, &haystack[haystack.len() - len..]);
+    };
     let (words, rest) = haystack[haystack.len() - len..].as_chunks::<WORD_BYTES>();
     debug_assert!(words.len() < CHUNK_BYTES / WORD_BYTES);
 
@@ -113,30 +117,45 @@ fn tail_bits<K: Kernel>(kernel: &K, haystack: &[u8], len: usize) -> u64 {
         bits |= movemask(kernel.matches(u64::from_le_bytes(*word))) << (i * WORD_BYTES);
     }
     if !rest.is_empty() {
-        bits |= last_word_bits(kernel, haystack, rest.len()) << (words.len() * WORD_BYTES);
+        // The re-read overlaps bytes that have already been scanned, either by the loop above
+        // or by an earlier chunk; shifting their bits off the bottom discards them.
+        let last = movemask(kernel.matches(u64::from_le_bytes(*last_word)));
+        bits |= (last >> (WORD_BYTES - rest.len())) << (words.len() * WORD_BYTES);
     }
     bits
 }
 
-/// Matches the final `len` bytes of `haystack`, for a `len` shorter than one [`WORD_BYTES`],
-/// returning their bits at positions `0..len`.
+/// Matches a haystack shorter than one [`WORD_BYTES`], returning its bits at positions
+/// `0..haystack.len()`.
 ///
-/// The word-at-a-time counterpart of the way the vector path's tail re-reads the last whole
-/// chunk: reading the last whole word overlaps bytes that have already been scanned, and
-/// shifting their bits off the bottom discards them. Only a haystack with no whole word in
-/// it at all has to be copied into a padded buffer.
+/// Staged the way [`crate::vector`]'s short tail is, for the same reason. Write `n` for the
+/// largest power of two that is at most the length: 4, 2 or 1. Copying the first and last `n`
+/// bytes covers the whole of it, because the two ends overlap in the middle, and both copies
+/// have a constant length and a constant destination. Sizing one copy to the length instead
+/// lowers to a `memcpy` call that costs more than the scan it feeds.
 #[inline]
-fn last_word_bits<K: Kernel>(kernel: &K, haystack: &[u8], len: usize) -> u64 {
-    debug_assert!(0 < len && len < WORD_BYTES);
-    if let Some(word) = haystack.last_chunk::<WORD_BYTES>() {
-        movemask(kernel.matches(u64::from_le_bytes(*word))) >> (WORD_BYTES - len)
-    } else {
+fn short_haystack_bits<K: Kernel>(kernel: &K, haystack: &[u8]) -> u64 {
+    /// Copies the first and last `N` bytes of `haystack` into the front of a word.
+    #[inline]
+    fn stage<const N: usize>(haystack: &[u8]) -> [u8; WORD_BYTES] {
         let mut buf = [0; WORD_BYTES];
-        buf[..len].copy_from_slice(&haystack[haystack.len() - len..]);
-        // The padding above lane `len` matches whenever the byte set contains zero, so it
-        // has to be masked off rather than merely ignored.
-        movemask(kernel.matches(u64::from_le_bytes(buf))) & !(u64::MAX << len)
+        buf[..N].copy_from_slice(&haystack[..N]);
+        buf[N..2 * N].copy_from_slice(&haystack[haystack.len() - N..]);
+        buf
     }
+
+    let len = haystack.len();
+    debug_assert!(0 < len && len < WORD_BYTES);
+    let (buf, staged) = match len {
+        4.. => (stage::<4>(haystack), 4),
+        2.. => (stage::<2>(haystack), 2),
+        _ => (stage::<1>(haystack), 1),
+    };
+    // Neither end may keep more bits than it read bytes: above the front's sit the back's, and
+    // above the back's sits the padding, which matches whenever the byte set contains zero.
+    let bits = movemask(kernel.matches(u64::from_le_bytes(buf)));
+    let kept = !(u64::MAX << staged);
+    (bits & kept) | (((bits >> staged) & kept) << (len - staged))
 }
 
 /// Counts every matching byte of `haystack`.
