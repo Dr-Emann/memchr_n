@@ -150,7 +150,27 @@ struct Scan {
 /// carries the level into the entry points below: each rebuilds its token and re-enters that
 /// level's target-feature context through [`Simd::vectorize`].
 fn vector_scan<S: Simd, K: vector::Kernel<S>>(simd: S) -> Scan {
-    unsafe fn find_next<S: Simd, K: vector::Kernel<S>>(kind: &FinderKind, state: &mut IterState<'_>) {
+    /// Rebuilds a SIMD token, which holds no data beyond the support it proves.
+    ///
+    /// # Safety
+    ///
+    /// The running target must support `S`'s level.
+    #[inline(always)]
+    unsafe fn token<S: Simd>() -> S {
+        const {
+            assert!(size_of::<S>() == 0);
+            assert!(align_of::<S>() == 1);
+        };
+        // SAFETY: the assertion above makes this a zero-byte copy, and a zero-sized type has
+        // exactly one value; the caller guarantees the support that value stands for.
+        unsafe { transmute_copy(&()) }
+    }
+
+
+    unsafe fn find_next<S: Simd, K: vector::Kernel<S>>(
+        kind: &FinderKind,
+        state: &mut IterState<'_>,
+    ) {
         // SAFETY: this function is only ever instantiated by `vector_scan`, which accepts an S,
         // so we know the caller proved the right target features are available
         let simd = unsafe { token::<S>() };
@@ -195,23 +215,7 @@ fn vector_scan<S: Simd, K: vector::Kernel<S>>(simd: S) -> Scan {
     }
 }
 
-/// Rebuilds a SIMD token, which holds no data beyond the support it proves.
-///
-/// # Safety
-///
-/// The running target must support `S`'s level.
-#[inline(always)]
-unsafe fn token<S: Simd>() -> S {
-    const {
-        assert!(size_of::<S>() == 0);
-        assert!(align_of::<S>() == 1);
-    };
-    // SAFETY: the assertion above makes this a zero-byte copy, and a zero-sized type has
-    // exactly one value; the caller guarantees the support that value stands for.
-    unsafe { transmute_copy(&()) }
-}
-
-fn word_scan<K: swar::Kernel>() -> Scan {
+fn swar_scan<K: swar::Kernel>() -> Scan {
     unsafe fn find_next<K: swar::Kernel>(kind: &FinderKind, state: &mut IterState<'_>) {
         // SAFETY: as in `vector_scan`, the `Scan` below stores this function only for the
         // variant `K` was chosen for.
@@ -233,7 +237,7 @@ fn word_scan<K: swar::Kernel>() -> Scan {
     }
 }
 
-/// The byte-at-a-time counterpart of [`word_scan`].
+/// The byte-at-a-time counterpart of [`swar_scan`].
 fn bytewise_scan<K: bytewise::Kernel>() -> Scan {
     unsafe fn find_next<K: bytewise::Kernel>(kind: &FinderKind, state: &mut IterState<'_>) {
         // SAFETY: as in `vector_scan`, the `Scan` below stores this function only for the
@@ -301,10 +305,10 @@ fn vector_build<S: Simd>(simd: S, kind: FinderKind) -> Scan {
 /// The word-at-a-time counterpart of [`vector_build`].
 fn word_build(kind: FinderKind) -> Scan {
     match kind {
-        FinderKind::OneByte(_) => word_scan::<swar::kernels::AnyOf<1>>(),
-        FinderKind::TwoBytes(_) => word_scan::<swar::kernels::AnyOf<2>>(),
-        FinderKind::ThreeBytes(_) => word_scan::<swar::kernels::AnyOf<3>>(),
-        FinderKind::OneRange(_) => word_scan::<swar::kernels::OneRange>(),
+        FinderKind::OneByte(_) => swar_scan::<swar::kernels::AnyOf<1>>(),
+        FinderKind::TwoBytes(_) => swar_scan::<swar::kernels::AnyOf<2>>(),
+        FinderKind::ThreeBytes(_) => swar_scan::<swar::kernels::AnyOf<3>>(),
+        FinderKind::OneRange(_) => swar_scan::<swar::kernels::OneRange>(),
         FinderKind::AnyByte(_) => bytewise_scan::<bytewise::kernels::AnyByte>(),
         FinderKind::Never => never_scan(),
         // Both scan by shuffling bytes within a vector, which is what picks them over
@@ -325,12 +329,9 @@ impl<'a> Iterator for Iter<'a> {
             if self.state.pos == self.state.haystack.len() {
                 return None;
             }
-            // Copied out first: `finder` is a `&'a Finder`, so reading through it does
-            // not conflict with handing `self` over mutably.
-            let finder = self.finder;
             // SAFETY: `build_scan` installs each function for the kind passed back to it
             // here, and the `Level` that chose it proves the target has its features.
-            unsafe { (finder.scan.find_next)(&finder.kind, &mut self.state) };
+            unsafe { (self.finder.scan.find_next)(&self.finder.kind, &mut self.state) };
             if self.state.bits == 0 {
                 return None;
             }

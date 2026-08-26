@@ -88,7 +88,6 @@ pub(crate) fn count<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) 
 
     let (chunks, tail) = haystack.as_chunks::<CHUNK_BYTES>();
 
-    // TODO: as_chunks
     let mut total = 0;
     for batch in chunks.chunks(CHUNKS_PER_ACCUMULATOR) {
         let mut counts = u8x64::splat(simd, 0);
