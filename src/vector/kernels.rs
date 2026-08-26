@@ -8,12 +8,12 @@ use fearless_simd::{mask8x64, u8x16, u8x32, u8x64};
 /// Compares against each needle in turn, which beats a table lookup while the set is
 /// small enough that the comparisons stay cheaper than the lookup they replace.
 #[derive(Copy, Clone)]
-pub(crate) struct AnyOf<const N: usize> {
-    needles: [u8; N],
+pub(crate) struct AnyOf<S: Simd, const N: usize> {
+    needles: [u8x64<S>; N],
 }
 
 #[inline(always)]
-fn any_of_matches<S: Simd, const N: usize>(chunk: u8x64<S>, needles: [u8; N]) -> mask8x64<S> {
+fn any_of_matches<S: Simd, const N: usize>(chunk: u8x64<S>, needles: [u8x64<S>; N]) -> mask8x64<S> {
     let mut matched = mask8x64::splat(chunk.simd, false);
     for &needle in &needles {
         matched |= chunk.simd_eq(needle);
@@ -21,64 +21,73 @@ fn any_of_matches<S: Simd, const N: usize>(chunk: u8x64<S>, needles: [u8; N]) ->
     matched
 }
 
-impl Kernel for AnyOf<1> {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
+impl<S: Simd> Kernel<S> for AnyOf<S, 1> {
+    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
         let FinderKind::OneByte(needle) = *kind else {
             return None;
         };
-        Some(Self { needles: [needle] })
+        Some(Self {
+            needles: [u8x64::splat(simd, needle)],
+        })
     }
 
     #[inline(always)]
-    fn matches<S: Simd>(&self, chunk: u8x64<S>) -> mask8x64<S> {
+    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
         any_of_matches(chunk, self.needles)
     }
 }
 
-impl Kernel for AnyOf<2> {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
+impl<S: Simd> Kernel<S> for AnyOf<S, 2> {
+    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
         let FinderKind::TwoBytes(needles) = *kind else {
             return None;
         };
-        Some(Self { needles })
+        Some(Self {
+            needles: needles.map(|n| u8x64::splat(simd, n)),
+        })
     }
 
     #[inline(always)]
-    fn matches<S: Simd>(&self, chunk: u8x64<S>) -> mask8x64<S> {
+    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
         any_of_matches(chunk, self.needles)
     }
 }
 
-impl Kernel for AnyOf<3> {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
+impl<S: Simd> Kernel<S> for AnyOf<S, 3> {
+    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
         let FinderKind::ThreeBytes(needles) = *kind else {
             return None;
         };
-        Some(Self { needles })
+        Some(Self {
+            needles: needles.map(|n| u8x64::splat(simd, n)),
+        })
     }
 
     #[inline(always)]
-    fn matches<S: Simd>(&self, chunk: u8x64<S>) -> mask8x64<S> {
+    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
         any_of_matches(chunk, self.needles)
     }
 }
 
 #[derive(Copy, Clone)]
-pub(crate) struct OneRange {
-    range: RangeInclusive<u8>,
+pub(crate) struct OneRange<S: Simd> {
+    start: u8x64<S>,
+    last: u8x64<S>,
 }
 
-impl Kernel for OneRange {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::OneRange(range) = *kind else {
+impl<S: Simd> Kernel<S> for OneRange<S> {
+    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
+        let FinderKind::OneRange(RangeInclusive { start, last }) = *kind else {
             return None;
         };
-        Some(Self { range })
+        Some(Self {
+            start: start.simd_into(simd),
+            last: last.simd_into(simd),
+        })
     }
     #[inline(always)]
-    fn matches<S: Simd>(&self, chunk: u8x64<S>) -> mask8x64<S> {
-        let RangeInclusive { start, last } = self.range;
-        chunk.simd_ge(start) & chunk.simd_le(last)
+    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
+        chunk.simd_ge(self.start) & chunk.simd_le(self.last)
     }
 }
 
@@ -88,8 +97,8 @@ pub(crate) struct SmallSet {
     hi_lookup: NibbleLookup,
 }
 
-impl Kernel for SmallSet {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
+impl<S: Simd> Kernel<S> for SmallSet {
+    fn from_kind(_simd: S, kind: &FinderKind) -> Option<Self> {
         let FinderKind::SmallSet {
             lo_lookup,
             hi_lookup,
@@ -104,7 +113,7 @@ impl Kernel for SmallSet {
     }
 
     #[inline(always)]
-    fn matches<S: Simd>(&self, chunk: u8x64<S>) -> mask8x64<S> {
+    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
         let simd = chunk.simd;
         let lo_lookup = u8x64::block_splat(u8x16::load_array(simd, self.lo_lookup.0));
         let hi_lookup = u8x64::block_splat(u8x16::load_array(simd, self.hi_lookup.0));
@@ -122,8 +131,8 @@ pub(crate) struct SingleNibble {
     table: [u8; 16],
 }
 
-impl Kernel for SingleNibble {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
+impl<S: Simd> Kernel<S> for SingleNibble {
+    fn from_kind(_simd: S, kind: &FinderKind) -> Option<Self> {
         let FinderKind::ConstantNibble(which, table) = *kind else {
             return None;
         };
@@ -131,7 +140,7 @@ impl Kernel for SingleNibble {
     }
 
     #[inline(always)]
-    fn matches<S: Simd>(&self, chunk: u8x64<S>) -> mask8x64<S> {
+    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
         let table = u8x64::block_splat(u8x16::simd_from(chunk.simd, self.table));
         let non_const_nibbles = match self.which {
             ConstantNibble::Lo => chunk >> 4,
@@ -147,8 +156,8 @@ pub(crate) struct AnyByte {
     bitset: Bitset,
 }
 
-impl Kernel for AnyByte {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
+impl<S: Simd> Kernel<S> for AnyByte {
+    fn from_kind(_simd: S, kind: &FinderKind) -> Option<Self> {
         let FinderKind::AnyByte(bitset) = *kind else {
             return None;
         };
@@ -156,7 +165,7 @@ impl Kernel for AnyByte {
     }
 
     #[inline(always)]
-    fn matches<S: Simd>(&self, chunk: u8x64<S>) -> mask8x64<S> {
+    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
         let bits = u8x64::block_splat(u8x16::from_fn(chunk.simd, |i| 1 << (i % 8)));
         let bit = bits.swizzle_dyn_within_blocks(chunk & 0b0111);
         !(bit & membership_bits(&self.bitset, chunk >> 3)).simd_eq(0)
