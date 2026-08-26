@@ -149,8 +149,8 @@ struct Scan {
 /// A SIMD token is a zero-sized proof that the running target supports its level, so `S` alone
 /// carries the level into the entry points below: each rebuilds its token and re-enters that
 /// level's target-feature context through [`Simd::vectorize`].
-fn vector_scan<S: Simd, K: vector::Kernel>(simd: S) -> Scan {
-    unsafe fn find_next<S: Simd, K: vector::Kernel>(kind: &FinderKind, state: &mut IterState<'_>) {
+fn vector_scan<S: Simd, K: vector::Kernel<S>>(simd: S) -> Scan {
+    unsafe fn find_next<S: Simd, K: vector::Kernel<S>>(kind: &FinderKind, state: &mut IterState<'_>) {
         // SAFETY: this function is only ever instantiated by `vector_scan`, which accepts an S,
         // so we know the caller proved the right target features are available
         let simd = unsafe { token::<S>() };
@@ -160,13 +160,13 @@ fn vector_scan<S: Simd, K: vector::Kernel>(simd: S) -> Scan {
                 // SAFETY: the `Scan` below stores this function only for the variant `K` was
                 // chosen for, so `from_kind` returns `Some`. Unwrapping it checked costs a
                 // measurable amount on refill-heavy searches.
-                let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
+                let kernel = unsafe { K::from_kind(simd, kind).unwrap_unchecked() };
                 vector::find_next(simd, state, kernel);
             },
         );
     }
 
-    unsafe fn count_all<S: Simd, K: vector::Kernel>(
+    unsafe fn count_all<S: Simd, K: vector::Kernel<S>>(
         kind: &FinderKind,
         state: &mut IterState<'_>,
     ) -> usize {
@@ -178,7 +178,7 @@ fn vector_scan<S: Simd, K: vector::Kernel>(simd: S) -> Scan {
                 // SAFETY: the `Scan` below stores this function only for the variant `K` was
                 // chosen for, so `from_kind` returns `Some`. Unwrapping it checked costs a
                 // measurable amount on refill-heavy searches.
-                let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
+                let kernel = unsafe { K::from_kind(simd, kind).unwrap_unchecked() };
                 let total = vector::count(simd, &state.haystack[state.pos..], kernel);
                 state.pos = state.haystack.len();
                 total
@@ -287,10 +287,10 @@ fn build_scan(level: Level, family: Family, kind: FinderKind) -> Scan {
 /// [`vector::Kernel`] impl.
 fn vector_build<S: Simd>(simd: S, kind: FinderKind) -> Scan {
     match kind {
-        FinderKind::OneByte(_) => vector_scan::<S, vector::kernels::AnyOf<1>>(simd),
-        FinderKind::TwoBytes(_) => vector_scan::<S, vector::kernels::AnyOf<2>>(simd),
-        FinderKind::ThreeBytes(_) => vector_scan::<S, vector::kernels::AnyOf<3>>(simd),
-        FinderKind::OneRange(_) => vector_scan::<S, vector::kernels::OneRange>(simd),
+        FinderKind::OneByte(_) => vector_scan::<S, vector::kernels::AnyOf<S, 1>>(simd),
+        FinderKind::TwoBytes(_) => vector_scan::<S, vector::kernels::AnyOf<S, 2>>(simd),
+        FinderKind::ThreeBytes(_) => vector_scan::<S, vector::kernels::AnyOf<S, 3>>(simd),
+        FinderKind::OneRange(_) => vector_scan::<S, vector::kernels::OneRange<S>>(simd),
         FinderKind::SmallSet { .. } => vector_scan::<S, vector::kernels::SmallSet>(simd),
         FinderKind::ConstantNibble(..) => vector_scan::<S, vector::kernels::SingleNibble>(simd),
         FinderKind::AnyByte(_) => vector_scan::<S, vector::kernels::AnyByte>(simd),

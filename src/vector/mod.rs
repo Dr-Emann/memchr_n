@@ -5,10 +5,10 @@ use fearless_simd::prelude::*;
 use fearless_simd::{Level, i8x64, kernel, mask8x64, u8x16, u8x32, u8x64};
 
 /// Tests a chunk of [`CHUNK_BYTES`] bytes against a byte set.
-pub(crate) trait Kernel: Copy {
-    fn from_kind(kind: &FinderKind) -> Option<Self>;
+pub(crate) trait Kernel<S: Simd>: Copy {
+    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self>;
 
-    fn matches<S: Simd>(&self, chunk: u8x64<S>) -> mask8x64<S>;
+    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S>;
 }
 
 /// Whether the target has a single-instruction dynamic byte shuffle.
@@ -41,7 +41,7 @@ pub(crate) fn has_byte_shuffle(level: Level) -> bool {
 /// on the next call, which costs more than the shared check saves as soon as matches are
 /// dense enough to land in most pairs.
 #[inline(always)]
-pub(crate) fn find_next<S: Simd, K: Kernel>(simd: S, state: &mut IterState<'_>, kernel: K) {
+pub(crate) fn find_next<S: Simd, K: Kernel<S>>(simd: S, state: &mut IterState<'_>, kernel: K) {
     let (haystack, from) = (state.haystack, state.pos);
     let (chunks, tail) = haystack[from..].as_chunks::<CHUNK_BYTES>();
     let (pairs, rest) = chunks.as_chunks::<2>();
@@ -81,7 +81,7 @@ pub(crate) fn find_next<S: Simd, K: Kernel>(simd: S, state: &mut IterState<'_>, 
 
 /// Counts every matching byte of `haystack`.
 #[inline(always)]
-pub(crate) fn count<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: K) -> usize {
+pub(crate) fn count<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) -> usize {
     // Each lane of the counting accumulator starts at zero, and gains at most one per chunk,
     // we can accumulate within a single vector until
     const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
@@ -111,7 +111,7 @@ pub(crate) fn count<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: K) -> 
 /// shifting the already-scanned bits off the bottom, which avoids staging the tail in
 /// a padded buffer.
 #[inline(always)]
-fn tail_bits<S: Simd, K: Kernel>(simd: S, kernel: &K, haystack: &[u8], len: usize) -> u64 {
+fn tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, haystack: &[u8], len: usize) -> u64 {
     debug_assert!(0 < len && len < CHUNK_BYTES);
     if let Some(chunk) = haystack.last_chunk::<CHUNK_BYTES>() {
         let matched = kernel.matches(u8x64::load_array_ref(simd, chunk));
@@ -128,7 +128,7 @@ fn tail_bits<S: Simd, K: Kernel>(simd: S, kernel: &K, haystack: &[u8], len: usiz
 /// can convince it the number of bytes is very small. We go to some lengths here to ensure
 /// we keep all copies to constants here
 #[inline(always)]
-fn short_tail_bits<S: Simd, K: Kernel>(simd: S, kernel: &K, short_haystack: &[u8]) -> u64 {
+fn short_tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, short_haystack: &[u8]) -> u64 {
     // Copies the first and last `N` bytes of `haystack` into the front of a buffer, for a
     // haystack too short to load a `u8x16` from either end.
     #[inline]
