@@ -12,7 +12,7 @@ keywords = ["memchr", "simd", "search", "bytes", "scan"]
 categories = ["algorithms", "text-processing"]
 
 [dependencies]
-fearless_simd = "0.7"
+fearless_simd = { git = "https://github.com/linebender/fearless_simd.git" }
 
 [dev-dependencies]
 criterion = "0.8"
