@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fearless_simd = "0.7"
+fearless_simd = { git = "https://github.com/linebender/fearless_simd.git" }
 
 [dev-dependencies]
 criterion = "0.8"

@@ -8,7 +8,10 @@ use fearless_simd::{Level, i8x64, kernel, mask8x64, u8x16, u8x32, u8x64};
 pub(crate) trait Kernel<S: Simd>: Copy {
     fn from_kind(simd: S, kind: &FinderKind) -> Option<Self>;
 
-    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S>;
+    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
+        &self,
+        chunk: V,
+    ) -> V::Mask;
 }
 
 /// Whether the target has a single-instruction dynamic byte shuffle.
@@ -169,7 +172,7 @@ fn short_tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, short_haystack: &
         short_haystack.last_chunk::<16>(),
     ) {
         let ends = u8x16::load_array_ref(simd, front).combine(u8x16::load_array_ref(simd, back));
-        return slide_ends(bitmask(simd, kernel.matches(ends.combine(ends))), 16, len);
+        return slide_ends(kernel.matches(ends).to_bitmask(), 16, len);
     }
 
     let (buf, staged) = match len {
@@ -178,8 +181,8 @@ fn short_tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, short_haystack: &
         2.. => (stage::<2>(short_haystack), 2),
         _ => (stage::<1>(short_haystack), 1),
     };
-    let ends = u8x64::block_splat(u8x16::load_array(simd, buf));
-    slide_ends(bitmask(simd, kernel.matches(ends)), staged, len)
+    let ends = u8x16::load_array(simd, buf);
+    slide_ends(kernel.matches(ends).to_bitmask(), staged, len)
 }
 
 #[inline(always)]
@@ -199,7 +202,7 @@ fn sum_lanes<S: Simd>(simd: S, counts: u8x64<S>) -> usize {
     }
     let _ = simd;
     let mut total = 0;
-    for &lane in counts.as_array_ref() {
+    for &lane in counts.as_array() {
         total += usize::from(lane);
     }
     total
@@ -327,5 +330,17 @@ kernel! {
         // the next 4 bits are the high 4 bits of the second element, and so on.
         let result_vector = vshrn_n_u16::<4>(vreinterpretq_u16_u8(temp3));
         vget_lane_u64::<0>(vreinterpret_u64_u8(result_vector))
+    }
+}
+
+kernel! {
+    #[inline(always)]
+    fn aarch64_swizzle_32_to_16(simd: Neon, table: [u8; 32], idx: [u8; 16]) -> [u8; 16] {
+        use core::arch::aarch64::*;
+
+        let table = u8x32::load_array(simd, table);
+        let idx = u8x16::load_array(simd, idx);
+        let res = vqtbl2q_u8(table.into(), idx.into());
+        u8x16::simd_from(simd, res).into()
     }
 }

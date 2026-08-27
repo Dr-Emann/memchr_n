@@ -3,20 +3,23 @@ use crate::bitset::Bitset;
 use crate::{ConstantNibble, FinderKind, NibbleLookup};
 use core::range::RangeInclusive;
 use fearless_simd::prelude::*;
-use fearless_simd::{mask8x64, u8x16, u8x32, u8x64};
+use fearless_simd::{u8x16, u8x32, u8x64};
 
 /// Compares against each needle in turn, which beats a table lookup while the set is
 /// small enough that the comparisons stay cheaper than the lookup they replace.
 #[derive(Copy, Clone)]
 pub(crate) struct AnyOf<S: Simd, const N: usize> {
-    needles: [u8x64<S>; N],
+    needles: [u8x16<S>; N],
 }
 
 #[inline(always)]
-fn any_of_matches<S: Simd, const N: usize>(chunk: u8x64<S>, needles: [u8x64<S>; N]) -> mask8x64<S> {
-    let mut matched = mask8x64::splat(chunk.simd, false);
+fn any_of_matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>, const N: usize>(
+    chunk: V,
+    needles: [u8x16<S>; N],
+) -> V::Mask {
+    let mut matched = V::Mask::splat(chunk.witness(), false);
     for &needle in &needles {
-        matched |= chunk.simd_eq(needle);
+        matched |= chunk.simd_eq(V::block_splat(needle));
     }
     matched
 }
@@ -27,12 +30,12 @@ impl<S: Simd> Kernel<S> for AnyOf<S, 1> {
             return None;
         };
         Some(Self {
-            needles: [u8x64::splat(simd, needle)],
+            needles: [u8x16::splat(simd, needle)],
         })
     }
 
     #[inline(always)]
-    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
+    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
         any_of_matches(chunk, self.needles)
     }
 }
@@ -43,12 +46,12 @@ impl<S: Simd> Kernel<S> for AnyOf<S, 2> {
             return None;
         };
         Some(Self {
-            needles: needles.map(|n| u8x64::splat(simd, n)),
+            needles: needles.map(|n| u8x16::splat(simd, n)),
         })
     }
 
     #[inline(always)]
-    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
+    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
         any_of_matches(chunk, self.needles)
     }
 }
@@ -59,20 +62,20 @@ impl<S: Simd> Kernel<S> for AnyOf<S, 3> {
             return None;
         };
         Some(Self {
-            needles: needles.map(|n| u8x64::splat(simd, n)),
+            needles: needles.map(|n| u8x16::splat(simd, n)),
         })
     }
 
     #[inline(always)]
-    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
+    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
         any_of_matches(chunk, self.needles)
     }
 }
 
 #[derive(Copy, Clone)]
 pub(crate) struct OneRange<S: Simd> {
-    start: u8x64<S>,
-    last: u8x64<S>,
+    start: u8x16<S>,
+    last: u8x16<S>,
 }
 
 impl<S: Simd> Kernel<S> for OneRange<S> {
@@ -86,8 +89,8 @@ impl<S: Simd> Kernel<S> for OneRange<S> {
         })
     }
     #[inline(always)]
-    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
-        chunk.simd_ge(self.start) & chunk.simd_le(self.last)
+    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
+        chunk.simd_ge(V::block_splat(self.start)) & chunk.simd_le(V::block_splat(self.last))
     }
 }
 
@@ -113,10 +116,13 @@ impl<S: Simd> Kernel<S> for SmallSet {
     }
 
     #[inline(always)]
-    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
-        let simd = chunk.simd;
-        let lo_lookup = u8x64::block_splat(u8x16::load_array(simd, self.lo_lookup.0));
-        let hi_lookup = u8x64::block_splat(u8x16::load_array(simd, self.hi_lookup.0));
+    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
+        &self,
+        chunk: V,
+    ) -> V::Mask {
+        let simd = chunk.witness();
+        let lo_lookup = V::block_splat(u8x16::load_array(simd, self.lo_lookup.0));
+        let hi_lookup = V::block_splat(u8x16::load_array(simd, self.hi_lookup.0));
 
         let lo = lo_lookup.swizzle_dyn_within_blocks(chunk & 0x0F);
         let hi = hi_lookup.swizzle_dyn_within_blocks(chunk >> 4);
@@ -140,8 +146,11 @@ impl<S: Simd> Kernel<S> for SingleNibble {
     }
 
     #[inline(always)]
-    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
-        let table = u8x64::block_splat(u8x16::simd_from(chunk.simd, self.table));
+    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
+        &self,
+        chunk: V,
+    ) -> V::Mask {
+        let table = V::block_splat(u8x16::simd_from(chunk.witness(), self.table));
         let non_const_nibbles = match self.which {
             ConstantNibble::Lo => chunk >> 4,
             ConstantNibble::Hi => chunk & 0x0F,
@@ -165,8 +174,11 @@ impl<S: Simd> Kernel<S> for AnyByte {
     }
 
     #[inline(always)]
-    fn matches(&self, chunk: u8x64<S>) -> mask8x64<S> {
-        let bits = u8x64::block_splat(u8x16::from_fn(chunk.simd, |i| 1 << (i % 8)));
+    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
+        &self,
+        chunk: V,
+    ) -> V::Mask {
+        let bits = V::block_splat(u8x16::from_fn(chunk.witness(), |i| 1 << (i % 8)));
         let bit = bits.swizzle_dyn_within_blocks(chunk & 0b0111);
         !(bit & membership_bits(&self.bitset, chunk >> 3)).simd_eq(0)
     }
@@ -175,15 +187,37 @@ impl<S: Simd> Kernel<S> for AnyByte {
 /// Looks each byte's high five bits up in the 256-bit table, giving the table byte
 /// that holds its membership bit.
 #[inline(always)]
-fn membership_bits<S: Simd>(bitset: &Bitset, indices: u8x64<S>) -> u8x64<S> {
-    let table = u8x32::load_array_ref(indices.simd, bitset.as_array());
-    // The table spans 32 lanes, so the lookup runs at whatever width the target
-    // implements natively rather than at `u8x64` always.
-    if S::u8s::N >= 64 {
-        let table = table.combine(table);
-        table.swizzle_dyn(indices)
-    } else {
-        let (lo, hi) = indices.split();
-        table.swizzle_dyn(lo).combine(table.swizzle_dyn(hi))
+fn membership_bits<S: Simd, V: SimdInt<S, Element = u8, ByteVector = V>>(
+    bitset: &Bitset,
+    indices: V,
+) -> V {
+    let simd = indices.witness();
+    let table = u8x32::load_array_ref(simd, bitset.as_array());
+
+    const { assert!(V::N == 16 || V::N == 32 || V::N == 64) }
+    match V::N {
+        16 => {
+            let indices = u8x16::from_slice(simd, indices.as_slice());
+            // TODO: When concat_swizzle_dyn is available, use it
+            let res = table.swizzle_dyn(indices.combine(indices)).split().0;
+            V::from_slice(simd, res.as_slice())
+        }
+        32 => {
+            let indices = u8x32::from_slice(simd, indices.as_slice());
+            let res = table.swizzle_dyn(indices);
+            V::from_slice(simd, res.as_slice())
+        }
+        64 => {
+            let indices = u8x64::from_slice(simd, indices.as_slice());
+            let res = if S::u8s::N >= 64 {
+                table.combine(table).swizzle_dyn(indices)
+            } else {
+                let (lo_indices, hi_indices) = indices.split();
+                let (lo, hi) = (table.swizzle_dyn(lo_indices), table.swizzle_dyn(hi_indices));
+                lo.combine(hi)
+            };
+            V::from_slice(simd, res.as_slice())
+        }
+        _ => unreachable!(),
     }
 }
