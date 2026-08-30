@@ -166,7 +166,6 @@ fn vector_scan<S: Simd, K: vector::Kernel<S>>(simd: S) -> Scan {
         unsafe { transmute_copy(&()) }
     }
 
-
     unsafe fn find_next<S: Simd, K: vector::Kernel<S>>(
         kind: &FinderKind,
         state: &mut IterState<'_>,
@@ -355,6 +354,29 @@ impl<'a> Iterator for Iter<'a> {
             total += unsafe { (finder.scan.count_all)(&finder.kind, &mut self.state) };
         }
         total
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let mut remaining = n;
+        while (self.state.bits.count_ones() as usize) <= remaining {
+            remaining -= self.state.bits.count_ones() as usize;
+            self.state.bits = 0;
+            if self.state.pos == self.state.haystack.len() {
+                return None;
+            }
+            // SAFETY: as in `next`.
+            unsafe { (self.finder.scan.find_next)(&self.finder.kind, &mut self.state) };
+            if self.state.bits == 0 {
+                return None;
+            }
+        }
+        for _ in 0..remaining {
+            self.state.bits &= self.state.bits - 1;
+        }
+        let bit = self.state.bits.trailing_zeros() as usize;
+        self.state.bits &= self.state.bits - 1;
+        Some(self.state.bits_offset + bit)
     }
 }
 
@@ -608,6 +630,52 @@ mod tests {
                 );
                 assert_eq!(finder.iter(&haystack).count(), len, "{len}");
             }
+        }
+    }
+
+    #[test]
+    fn nth_matches_naive() {
+        for set in sets() {
+            for (name, finder) in [("vector", build(&set)), ("word", build_word(&set))] {
+                for len in (0..=80).chain([127, 128, 129, 255, 256, 1000]) {
+                    let haystack = haystack(len);
+                    let expected = naive(&set, &haystack);
+                    for n in [0, 1, 2, 3, 7, 63, 64, 65, 100] {
+                        assert_eq!(
+                            finder.iter(&haystack).nth(n),
+                            expected.get(n).copied(),
+                            "{name} set {set:?} len {len} nth {n}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `nth` has to consume the same matches `next` would, so mixing the two must walk the
+    /// haystack exactly once.
+    #[test]
+    fn nth_advances_like_repeated_next() {
+        let set = b"aeiouAEI";
+        let finder = build(set);
+        let haystack = haystack(1000);
+        let expected = naive(set, &haystack);
+        for step in [0, 1, 5, 64, 200] {
+            let mut iter = finder.iter(&haystack);
+            let mut index = 0;
+            let mut got = Vec::new();
+            while let Some(offset) = iter.nth(step) {
+                index += step;
+                got.push((index, offset));
+                index += 1;
+            }
+            let mut want = Vec::new();
+            let mut index = step;
+            while index < expected.len() {
+                want.push((index, expected[index]));
+                index += step + 1;
+            }
+            assert_eq!(got, want, "step {step}");
         }
     }
 
