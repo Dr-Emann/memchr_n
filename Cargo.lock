@@ -193,7 +193,7 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 [[package]]
 name = "fearless_simd"
 version = "0.7.0"
-source = "git+https://github.com/linebender/fearless_simd.git#4cf57d84be78ccbf211ec9db54cba9bcc45de972"
+source = "git+https://github.com/linebender/fearless_simd.git#30c7f38cd545b20ec98624bbf62d1357cd8814e3"
 
 [[package]]
 name = "find-msvc-tools"
