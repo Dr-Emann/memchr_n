@@ -3,9 +3,9 @@
 use libfuzzer_sys::fuzz_target;
 use memchr_n::Backend;
 
-fuzz_target!(|data: ([u64; 4], &[u8])| {
-    let (bitset, data) = data;
-    target(Bitset(bitset), data);
+fuzz_target!(|data: (bool, [u64; 4], &[u8])| {
+    let (simd, bitset, data) = data;
+    target(simd, Bitset(bitset), data);
 });
 
 struct Bitset([u64; 4]);
@@ -18,8 +18,8 @@ impl Bitset {
     }
 }
 
-fn target(bitset: Bitset, data: &[u8]) {
-    let finder = finder_for_bitset(&bitset);
+fn target(simd: bool, bitset: Bitset, data: &[u8]) {
+    let finder = finder_for_bitset(simd, &bitset);
     let mut prev = None;
     let mut count = 0;
     for idx in finder.iter(data) {
@@ -36,7 +36,7 @@ fn target(bitset: Bitset, data: &[u8]) {
     assert_eq!(finder.iter(data).count(), count);
 }
 
-fn finder_for_bitset(bitset: &Bitset) -> memchr_n::Finder {
+fn finder_for_bitset(simd: bool, bitset: &Bitset) -> memchr_n::Finder {
     let mut b = memchr_n::Bytes::new();
     for (i, mut chunk) in bitset.0.iter().copied().enumerate() {
         let base = (i * 64) as u8;
@@ -48,5 +48,5 @@ fn finder_for_bitset(bitset: &Bitset) -> memchr_n::Finder {
             chunk &= chunk - 1;
         }
     }
-    b.finder_with(Backend::Auto)
+    b.finder_with(if simd { Backend::Auto } else { Backend::Scalar })
 }
