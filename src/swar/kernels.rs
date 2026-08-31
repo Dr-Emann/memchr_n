@@ -1,4 +1,4 @@
-use crate::FinderKind;
+use crate::KernelData;
 use crate::swar::{HIGH, Kernel, nonzero_bytes, splat};
 use core::range::RangeInclusive;
 
@@ -16,46 +16,15 @@ fn any_of_matches<const N: usize>(word: u64, splatted_needles: [u64; N]) -> u64 
     !nonzero & HIGH
 }
 
-impl Kernel for AnyOf<1> {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::OneByte(needle) = *kind else {
-            return None;
-        };
-        Some(Self {
-            splatted_needles: [splat(needle)],
-        })
-    }
-
-    #[inline]
-    fn matches(&self, word: u64) -> u64 {
-        any_of_matches(word, self.splatted_needles)
-    }
-}
-
-impl Kernel for AnyOf<2> {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::TwoBytes(needles) = *kind else {
-            return None;
-        };
-        Some(Self {
-            splatted_needles: needles.map(splat),
-        })
-    }
-
-    #[inline]
-    fn matches(&self, word: u64) -> u64 {
-        any_of_matches(word, self.splatted_needles)
-    }
-}
-
-impl Kernel for AnyOf<3> {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::ThreeBytes(needles) = *kind else {
-            return None;
-        };
-        Some(Self {
-            splatted_needles: needles.map(splat),
-        })
+impl<const N: usize> Kernel for AnyOf<N> {
+    unsafe fn from_data(data: &KernelData) -> Self {
+        const { assert!(N <= 3, "`splatted_words` holds three") }
+        // SAFETY: the caller guarantees `splatted_words` is live, and the assertion above
+        // keeps the reads below inside it.
+        let splatted = unsafe { data.splatted_words };
+        Self {
+            splatted_needles: core::array::from_fn(|i| splatted[i]),
+        }
     }
 
     #[inline]
@@ -78,7 +47,7 @@ pub(crate) struct OneRange {
 }
 
 impl OneRange {
-    fn new(range: RangeInclusive<u8>) -> Self {
+    pub(crate) fn new(range: RangeInclusive<u8>) -> Self {
         let RangeInclusive { start, last } = range;
         let span = last.wrapping_sub(start);
         let start = splat(start);
@@ -92,11 +61,9 @@ impl OneRange {
 }
 
 impl Kernel for OneRange {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::OneRange(range) = *kind else {
-            return None;
-        };
-        Some(Self::new(range))
+    unsafe fn from_data(data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `range_masks` is live.
+        unsafe { data.range_masks }
     }
 
     #[inline]

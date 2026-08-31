@@ -15,7 +15,7 @@
 pub(crate) mod kernels;
 
 use crate::swar::{WORD_BYTES, movemask};
-use crate::{FinderKind, IterState};
+use crate::{IterState, KernelData, MatchedBitset};
 
 /// Bytes marked between one gate check and the next.
 ///
@@ -40,7 +40,12 @@ const _: () = assert!(CHUNK.is_multiple_of(WORD_BYTES));
 
 /// Tests one byte at a time, the narrowest counterpart of [`crate::vector::Kernel`].
 pub(crate) trait Kernel: Copy {
-    fn from_kind(kind: &FinderKind) -> Option<Self>;
+    /// Reads this kernel out of the field of `data` that holds it.
+    ///
+    /// # Safety
+    ///
+    /// As in [`crate::vector::Kernel::from_data`].
+    unsafe fn from_data(data: &KernelData) -> Self;
 
     fn matches(&self, byte: u8) -> bool;
 }
@@ -136,7 +141,7 @@ pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
 
 /// Scans from `from` for the first [`CHUNK`] that contains a match.
 #[inline]
-pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) {
+pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {
     let (haystack, from) = (state.haystack, state.pos);
     // SAFETY: as in `crate::vector::find_next`.
     let unscanned = unsafe { haystack.get_unchecked(from..) };
@@ -150,10 +155,9 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) {
     if let Some((_i, chunk)) = chunks.next() {
         let (marks, any) = chunk_marks(&kernel, chunk);
         if any != 0 {
-            state.bits = pack_marks(marks).into();
             state.bits_offset = from;
             state.pos = from + CHUNK;
-            return;
+            return pack_marks(marks).into();
         }
     }
 
@@ -161,14 +165,13 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) {
         let (marks, any) = chunk_marks(&kernel, chunk);
         if any != 0 {
             let offset = from + i * CHUNK;
-            state.bits = pack_marks(marks).into();
             state.bits_offset = offset;
             state.pos = offset + CHUNK;
-            return;
+            return pack_marks(marks).into();
         }
     }
 
-    state.bits = tail_bits(&kernel, tail).into();
     state.bits_offset = haystack.len() - tail.len();
     state.pos = haystack.len();
+    tail_bits(&kernel, tail).into()
 }

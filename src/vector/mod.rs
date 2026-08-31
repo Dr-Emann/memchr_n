@@ -1,14 +1,20 @@
 pub(crate) mod kernels;
 
-use crate::{CHUNK_BYTES, FinderKind, IterState, MatchedBitset};
+use crate::{CHUNK_BYTES, IterState, KernelData, MatchedBitset};
 use fearless_simd::prelude::*;
-use fearless_simd::{Level, i8x16, i8x64, kernel, mask8x64, u8x16, u8x32, u8x64};
+use fearless_simd::{Level, i8x16, i8x64, kernel, u8x16, u8x32, u8x64};
 
 const BLOCK_BYTES: usize = 16;
 
 /// Tests a chunk of [`CHUNK_BYTES`] bytes against a byte set.
 pub(crate) trait Kernel<S: Simd>: Copy {
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self>;
+    /// Reads this kernel out of the field of `data` that holds it.
+    ///
+    /// # Safety
+    ///
+    /// `data`'s live field must be the one this kernel reads, as [`KernelData::new`] and
+    /// [`crate::vector_build`] agree on for a [`crate::FinderKind`].
+    unsafe fn from_data(simd: S, data: &KernelData) -> Self;
 
     fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
         &self,
@@ -46,7 +52,11 @@ pub(crate) fn has_byte_shuffle(level: Level) -> bool {
 /// on the next call, which costs more than the shared check saves as soon as matches are
 /// dense enough to land in most pairs.
 #[inline(always)]
-pub(crate) fn find_next<S: Simd, K: Kernel<S>>(simd: S, state: &mut IterState<'_>, kernel: K) {
+pub(crate) fn find_next<S: Simd, K: Kernel<S>>(
+    simd: S,
+    state: &mut IterState<'_>,
+    kernel: K,
+) -> MatchedBitset {
     let (haystack, mut from) = (state.haystack, state.pos);
     // SAFETY: `pos` only ever moves to an offset this function already scanned to, so it
     // never passes the end.
@@ -58,11 +68,10 @@ pub(crate) fn find_next<S: Simd, K: Kernel<S>>(simd: S, state: &mut IterState<'_
         let matched_first = kernel.matches(u8x64::load_array_ref(simd, first));
         let matched_second = kernel.matches(u8x64::load_array_ref(simd, second));
         if (matched_first | matched_second).any_true() {
-            state.bits = MatchedBitset::from(matched_first.to_bitmask())
-                | MatchedBitset::from(matched_second.to_bitmask()) << CHUNK_BYTES;
             state.bits_offset = from;
             state.pos = from + first.len() + second.len();
-            return;
+            return MatchedBitset::from(matched_first.to_bitmask())
+                | MatchedBitset::from(matched_second.to_bitmask()) << CHUNK_BYTES;
         }
         from += first.len() + second.len();
     }
@@ -70,10 +79,9 @@ pub(crate) fn find_next<S: Simd, K: Kernel<S>>(simd: S, state: &mut IterState<'_
     if let [chunk] = rest {
         let matched = kernel.matches(u8x64::load_array_ref(simd, chunk));
         if matched.any_true() {
-            state.bits = MatchedBitset::from(matched.to_bitmask());
             state.bits_offset = from;
             state.pos = from + CHUNK_BYTES;
-            return;
+            return MatchedBitset::from(matched.to_bitmask());
         }
         from += chunk.len();
     }
@@ -82,20 +90,19 @@ pub(crate) fn find_next<S: Simd, K: Kernel<S>>(simd: S, state: &mut IterState<'_
     for block in blocks {
         let matched = kernel.matches(u8x16::load_array_ref(simd, block));
         if matched.any_true() {
-            state.bits = MatchedBitset::from(matched.to_bitmask());
             state.bits_offset = from;
             state.pos = from + block.len();
-            return;
+            return MatchedBitset::from(matched.to_bitmask());
         }
         from += block.len();
     }
-    state.bits = if tail.is_empty() {
+    state.bits_offset = haystack.len() - tail.len();
+    state.pos = haystack.len();
+    if tail.is_empty() {
         0
     } else {
         MatchedBitset::from(tail_bits(simd, &kernel, haystack, tail))
-    };
-    state.bits_offset = haystack.len() - tail.len();
-    state.pos = haystack.len();
+    }
 }
 
 /// Counts every matching byte of `haystack`.

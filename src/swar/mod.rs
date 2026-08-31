@@ -12,7 +12,7 @@
 
 pub(crate) mod kernels;
 
-use crate::{FinderKind, IterState, MatchedBitset};
+use crate::{IterState, KernelData, MatchedBitset};
 
 /// Bytes tested per general-purpose register.
 pub(crate) const WORD_BYTES: usize = 8;
@@ -21,7 +21,7 @@ pub(crate) const WORD_BYTES: usize = 8;
 const HIGH: u64 = splat(1 << 7);
 
 #[inline]
-const fn splat(byte: u8) -> u64 {
+pub(crate) const fn splat(byte: u8) -> u64 {
     u64::from_ne_bytes([byte; WORD_BYTES])
 }
 
@@ -49,7 +49,12 @@ pub(crate) const fn movemask(marks: u64) -> u64 {
 /// The result has bit 7 set in every matching byte and every other bit clear, which is
 /// the form both [`movemask`] and [`u64::count_ones`] consume.
 pub(crate) trait Kernel: Copy {
-    fn from_kind(kind: &FinderKind) -> Option<Self>;
+    /// Reads this kernel out of the field of `data` that holds it.
+    ///
+    /// # Safety
+    ///
+    /// As in [`crate::vector::Kernel::from_data`].
+    unsafe fn from_data(data: &KernelData) -> Self;
 
     fn matches(&self, word: u64) -> u64;
 }
@@ -126,7 +131,7 @@ pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
 }
 
 #[inline]
-pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) {
+pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {
     let (haystack, mut from) = (state.haystack, state.pos);
     // SAFETY: as in `crate::vector::find_next`.
     let unscanned = unsafe { haystack.get_unchecked(from..) };
@@ -137,32 +142,31 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) {
         let first_match = kernel.matches(u64::from_le_bytes(*first_word));
         let second_match = kernel.matches(u64::from_le_bytes(*second_word));
         if (first_match | second_match) != 0 {
-            state.bits =
-                MatchedBitset::from(movemask(first_match) | movemask(second_match) << WORD_BYTES);
             state.bits_offset = from;
             state.pos = from + first_word.len() + second_word.len();
-            return;
+            return MatchedBitset::from(
+                movemask(first_match) | movemask(second_match) << WORD_BYTES,
+            );
         }
         from += first_word.len() + second_word.len();
     }
     for word in words {
         let matches = kernel.matches(u64::from_le_bytes(*word));
         if matches != 0 {
-            state.bits = MatchedBitset::from(movemask(matches));
             state.bits_offset = from;
             state.pos = from + word.len();
-            return;
+            return MatchedBitset::from(movemask(matches));
         }
         from += word.len();
     }
 
-    state.bits = if tail.is_empty() {
+    state.bits_offset = haystack.len() - tail.len();
+    state.pos = haystack.len();
+    if tail.is_empty() {
         0
     } else {
         tail_bits(&kernel, haystack, tail).into()
-    };
-    state.bits_offset = haystack.len() - tail.len();
-    state.pos = haystack.len();
+    }
 }
 
 #[cfg(test)]

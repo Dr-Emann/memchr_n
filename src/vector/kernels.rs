@@ -1,7 +1,6 @@
 use super::{aarch64_swizzle_32_to_16, Kernel};
 use crate::bitset::Bitset;
-use crate::{ConstantNibble, FinderKind, NibbleLookup};
-use core::range::RangeInclusive;
+use crate::{ConstantNibble, KernelData, NibbleLookup};
 use fearless_simd::prelude::*;
 use fearless_simd::{u8x16, u8x32, u8x64};
 
@@ -12,63 +11,24 @@ pub(crate) struct AnyOf<S: Simd, const N: usize> {
     needles: [u8x16<S>; N],
 }
 
-#[inline(always)]
-fn any_of_matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>, const N: usize>(
-    chunk: V,
-    needles: [u8x16<S>; N],
-) -> V::Mask {
-    let mut matched = V::Mask::splat(chunk.witness(), false);
-    for &needle in &needles {
-        matched |= chunk.simd_eq(V::block_splat(needle));
-    }
-    matched
-}
-
-impl<S: Simd> Kernel<S> for AnyOf<S, 1> {
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::OneByte(needle) = *kind else {
-            return None;
-        };
-        Some(Self {
-            needles: [u8x16::splat(simd, needle)],
-        })
+impl<S: Simd, const N: usize> Kernel<S> for AnyOf<S, N> {
+    unsafe fn from_data(simd: S, data: &KernelData) -> Self {
+        const { assert!(N <= 3, "`splatted_needles` holds three") }
+        // SAFETY: the caller guarantees `splatted_needles` is live, and the assertion above
+        // keeps the reads below inside it.
+        let splatted = unsafe { data.splatted_needles };
+        Self {
+            needles: core::array::from_fn(|i| u8x16::load_array(simd, splatted[i])),
+        }
     }
 
     #[inline(always)]
     fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
-        any_of_matches(chunk, self.needles)
-    }
-}
-
-impl<S: Simd> Kernel<S> for AnyOf<S, 2> {
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::TwoBytes(needles) = *kind else {
-            return None;
-        };
-        Some(Self {
-            needles: needles.map(|n| u8x16::splat(simd, n)),
-        })
-    }
-
-    #[inline(always)]
-    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
-        any_of_matches(chunk, self.needles)
-    }
-}
-
-impl<S: Simd> Kernel<S> for AnyOf<S, 3> {
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::ThreeBytes(needles) = *kind else {
-            return None;
-        };
-        Some(Self {
-            needles: needles.map(|n| u8x16::splat(simd, n)),
-        })
-    }
-
-    #[inline(always)]
-    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
-        any_of_matches(chunk, self.needles)
+        let mut matched = V::Mask::splat(chunk.witness(), false);
+        for &needle in &self.needles {
+            matched |= chunk.simd_eq(V::block_splat(needle));
+        }
+        matched
     }
 }
 
@@ -79,14 +39,13 @@ pub(crate) struct OneRange<S: Simd> {
 }
 
 impl<S: Simd> Kernel<S> for OneRange<S> {
-    fn from_kind(simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::OneRange(RangeInclusive { start, last }) = *kind else {
-            return None;
-        };
-        Some(Self {
-            start: start.simd_into(simd),
-            last: last.simd_into(simd),
-        })
+    unsafe fn from_data(simd: S, data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `splatted_range` is live.
+        let [start, last] = unsafe { data.splatted_range };
+        Self {
+            start: u8x16::load_array(simd, start),
+            last: u8x16::load_array(simd, last),
+        }
     }
     #[inline(always)]
     fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
@@ -101,18 +60,13 @@ pub(crate) struct SmallSet {
 }
 
 impl<S: Simd> Kernel<S> for SmallSet {
-    fn from_kind(_simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::SmallSet {
+    unsafe fn from_data(_simd: S, data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `nibble_lookups` is live.
+        let [lo_lookup, hi_lookup] = unsafe { data.nibble_lookups };
+        Self {
             lo_lookup,
             hi_lookup,
-        } = *kind
-        else {
-            return None;
-        };
-        Some(Self {
-            lo_lookup,
-            hi_lookup,
-        })
+        }
     }
 
     #[inline(always)]
@@ -138,11 +92,13 @@ pub(crate) struct SingleNibble {
 }
 
 impl<S: Simd> Kernel<S> for SingleNibble {
-    fn from_kind(_simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::ConstantNibble(which, table) = *kind else {
-            return None;
-        };
-        Some(Self { which, table })
+    unsafe fn from_data(_simd: S, data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `nibble_table` is live.
+        let table = unsafe { data.nibble_table };
+        Self {
+            which: table.which,
+            table: table.table,
+        }
     }
 
     #[inline(always)]
@@ -166,11 +122,11 @@ pub(crate) struct AnyByte {
 }
 
 impl<S: Simd> Kernel<S> for AnyByte {
-    fn from_kind(_simd: S, kind: &FinderKind) -> Option<Self> {
-        let FinderKind::AnyByte(bitset) = *kind else {
-            return None;
-        };
-        Some(Self { bitset })
+    unsafe fn from_data(_simd: S, data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `bitset` is live.
+        Self {
+            bitset: unsafe { data.bitset },
+        }
     }
 
     #[inline(always)]
