@@ -1,4 +1,4 @@
-use super::Kernel;
+use super::{aarch64_swizzle_32_to_16, Kernel};
 use crate::bitset::Bitset;
 use crate::{ConstantNibble, FinderKind, NibbleLookup};
 use core::range::RangeInclusive;
@@ -199,6 +199,11 @@ fn membership_bits<S: Simd, V: SimdInt<S, Element = u8, ByteVector = V>>(
         16 => {
             let indices = u8x16::from_slice(simd, indices.as_slice());
             // TODO: When concat_swizzle_dyn is available, use it
+            #[cfg(target_arch = "aarch64")]
+            if let Some(neon) = simd.level().as_neon() {
+                let res = aarch64_swizzle_32_to_16(neon, table.into(), indices.into());
+                return V::from_slice(simd, &res);
+            }
             let res = table.swizzle_dyn(indices.combine(indices)).split().0;
             V::from_slice(simd, res.as_slice())
         }
