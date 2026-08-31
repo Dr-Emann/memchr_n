@@ -54,21 +54,21 @@ pub(crate) trait Kernel: Copy {
     fn matches(&self, word: u64) -> u64;
 }
 
-/// Matches the final `len` bytes of `haystack`, returning their bits at positions
-/// `0..len`.
+/// Matches `tail`, the final bytes of `haystack`, returning their bits at positions
+/// `0..tail.len()`.
 ///
 /// Whole words are marked from the start of the tail, and whatever is left over is picked up
 /// by re-reading the last whole word of the haystack, so a tail costs one word per eight bytes
 /// rather than a whole chunk however short it is. Only a haystack too short to hold a whole
 /// word has to be staged, which [`short_haystack_bits`] does.
 #[inline]
-fn tail_bits<K: Kernel>(kernel: &K, haystack: &[u8], len: usize) -> u64 {
-    debug_assert!(0 < len && len < WORD_BYTES);
+fn tail_bits<K: Kernel>(kernel: &K, haystack: &[u8], tail: &[u8]) -> u64 {
+    debug_assert!(0 < tail.len() && tail.len() < WORD_BYTES);
     if let Some(word) = haystack.last_chunk::<WORD_BYTES>() {
         let matched = kernel.matches(u64::from_le_bytes(*word));
-        movemask(matched) >> (WORD_BYTES - len)
+        movemask(matched) >> (WORD_BYTES - tail.len())
     } else {
-        short_tail_bits(kernel, &haystack[haystack.len() - len..])
+        short_tail_bits(kernel, tail)
     }
 }
 
@@ -128,7 +128,9 @@ pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
 #[inline]
 pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) {
     let (haystack, mut from) = (state.haystack, state.pos);
-    let (words, tail) = haystack[from..].as_chunks::<WORD_BYTES>();
+    // SAFETY: as in `crate::vector::find_next`.
+    let unscanned = unsafe { haystack.get_unchecked(from..) };
+    let (words, tail) = unscanned.as_chunks::<WORD_BYTES>();
     let (pairs, words) = words.as_chunks::<2>();
 
     for [first_word, second_word] in pairs {
@@ -157,7 +159,7 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) {
     state.bits = if tail.is_empty() {
         0
     } else {
-        tail_bits(&kernel, haystack, tail.len()).into()
+        tail_bits(&kernel, haystack, tail).into()
     };
     state.bits_offset = haystack.len() - tail.len();
     state.pos = haystack.len();

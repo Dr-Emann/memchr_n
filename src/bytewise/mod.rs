@@ -138,7 +138,9 @@ pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
 #[inline]
 pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) {
     let (haystack, from) = (state.haystack, state.pos);
-    let (chunks, tail) = haystack[from..].as_chunks::<CHUNK>();
+    // SAFETY: as in `crate::vector::find_next`.
+    let unscanned = unsafe { haystack.get_unchecked(from..) };
+    let (chunks, tail) = unscanned.as_chunks::<CHUNK>();
 
     let mut chunks = chunks.iter().fuse().enumerate();
     // As in `crate::swar::find_next`: the first chunk packs unconditionally, because a dense

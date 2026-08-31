@@ -48,7 +48,10 @@ pub(crate) fn has_byte_shuffle(level: Level) -> bool {
 #[inline(always)]
 pub(crate) fn find_next<S: Simd, K: Kernel<S>>(simd: S, state: &mut IterState<'_>, kernel: K) {
     let (haystack, mut from) = (state.haystack, state.pos);
-    let (chunks, tail) = haystack[from..].as_chunks::<CHUNK_BYTES>();
+    // SAFETY: `pos` only ever moves to an offset this function already scanned to, so it
+    // never passes the end.
+    let unscanned = unsafe { haystack.get_unchecked(from..) };
+    let (chunks, tail) = unscanned.as_chunks::<CHUNK_BYTES>();
     let (pairs, rest) = chunks.as_chunks::<2>();
 
     for [first, second] in pairs {
@@ -89,7 +92,7 @@ pub(crate) fn find_next<S: Simd, K: Kernel<S>>(simd: S, state: &mut IterState<'_
     state.bits = if tail.is_empty() {
         0
     } else {
-        MatchedBitset::from(tail_bits(simd, &kernel, haystack, tail.len()))
+        MatchedBitset::from(tail_bits(simd, &kernel, haystack, tail))
     };
     state.bits_offset = haystack.len() - tail.len();
     state.pos = haystack.len();
@@ -127,26 +130,26 @@ pub(crate) fn count<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) 
         total += usize::from((count_l + count_r).reduce_sum());
     }
     if !tail.is_empty() {
-        let bits = tail_bits(simd, &kernel, haystack, tail.len());
+        let bits = tail_bits(simd, &kernel, haystack, tail);
         total += bits.count_ones() as usize;
     }
     total
 }
 
-/// Matches the final `len` bytes of `haystack`, returning their bits at positions
-/// `0..len`.
+/// Matches `tail`, the final bytes of `haystack`, returning their bits at positions
+/// `0..tail.len()`.
 ///
 /// A haystack of at least one full block is handled by re-reading the last block and
 /// shifting the already-scanned bits off the bottom, which avoids staging the tail in
 /// a padded buffer.
 #[inline(always)]
-fn tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, haystack: &[u8], len: usize) -> u64 {
-    debug_assert!(0 < len && len < BLOCK_BYTES);
+fn tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, haystack: &[u8], tail: &[u8]) -> u64 {
+    debug_assert!(0 < tail.len() && tail.len() < BLOCK_BYTES);
     if let Some(chunk) = haystack.last_chunk::<BLOCK_BYTES>() {
         let matched = kernel.matches(u8x16::load_array_ref(simd, chunk));
-        matched.to_bitmask() >> (BLOCK_BYTES - len)
+        matched.to_bitmask() >> (BLOCK_BYTES - tail.len())
     } else {
-        short_tail_bits(simd, kernel, &haystack[haystack.len() - len..])
+        short_tail_bits(simd, kernel, tail)
     }
 }
 
@@ -195,12 +198,6 @@ fn short_tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, short_haystack: &
     };
     let ends = u8x16::load_array(simd, buf);
     slide_ends(kernel.matches(ends).to_bitmask(), staged, len)
-}
-
-#[inline(always)]
-fn mask_to_u8s<S: Simd>(simd: S, mask: mask8x64<S>) -> u8x64<S> {
-    let lanes = <[i8; 64]>::from(mask);
-    i8x64::load_array(simd, lanes).bitcast()
 }
 
 /// Sums every lane of a vector.

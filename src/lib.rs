@@ -198,7 +198,7 @@ fn vector_scan<S: Simd, K: vector::Kernel<S>>(simd: S) -> Scan {
                 // chosen for, so `from_kind` returns `Some`. Unwrapping it checked costs a
                 // measurable amount on refill-heavy searches.
                 let kernel = unsafe { K::from_kind(simd, kind).unwrap_unchecked() };
-                let total = vector::count(simd, &state.haystack[state.pos..], kernel);
+                let total = vector::count(simd, unsafe { state.haystack.get_unchecked(state.pos..) }, kernel);
                 state.pos = state.haystack.len();
                 total
             },
@@ -225,7 +225,7 @@ fn swar_scan<K: swar::Kernel>() -> Scan {
     unsafe fn count_all<K: swar::Kernel>(kind: &FinderKind, state: &mut IterState<'_>) -> usize {
         // SAFETY: as above.
         let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
-        let total = swar::count(&state.haystack[state.pos..], kernel);
+        let total = swar::count(unsafe { state.haystack.get_unchecked(state.pos..) }, kernel);
         state.pos = state.haystack.len();
         total
     }
@@ -251,7 +251,7 @@ fn bytewise_scan<K: bytewise::Kernel>() -> Scan {
     ) -> usize {
         // SAFETY: as above.
         let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
-        let total = bytewise::count(&state.haystack[state.pos..], kernel);
+        let total = bytewise::count(unsafe { state.haystack.get_unchecked(state.pos..) }, kernel);
         state.pos = state.haystack.len();
         total
     }
