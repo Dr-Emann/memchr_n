@@ -1,4 +1,4 @@
-use crate::FinderKind;
+use crate::KernelData;
 use crate::bitset::Bitset;
 use crate::bytewise::Kernel;
 
@@ -12,11 +12,11 @@ pub(crate) struct AnyByte {
 }
 
 impl Kernel for AnyByte {
-    fn from_kind(kind: &FinderKind) -> Option<Self> {
-        let FinderKind::AnyByte(bitset) = *kind else {
-            return None;
-        };
-        Some(Self { bitset })
+    unsafe fn from_data(data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `bitset` is live.
+        Self {
+            bitset: unsafe { data.bitset },
+        }
     }
 
     #[inline]

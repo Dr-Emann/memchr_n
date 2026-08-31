@@ -43,11 +43,12 @@ const _: () = {
 
 #[derive(Clone)]
 pub struct Finder {
-    /// Kept, with `family`, only for [`Debug`]; `kind` and `scan` are what searching goes
-    /// through.
+    /// Kept, with `family` and `kind`, only for [`Debug`]; `data` and `scan` are what
+    /// searching goes through.
     level: Level,
     family: Family,
-    kind: FinderKind,
+    kind: KindTag,
+    data: KernelData,
     scan: Scan,
 }
 
@@ -76,6 +77,40 @@ enum FinderKind {
     Never,
 }
 
+/// Which [`FinderKind`] a [`Finder`] was built from, less the payload that [`KernelData`]
+/// holds in the shape its kernel wants.
+///
+/// The payload cannot be recovered from [`KernelData`] in every case — `swar`'s `OneRange`
+/// keeps only the low seven bits of its start — so naming the kind is as much as [`Debug`]
+/// can offer without carrying a second copy of it. This costs nothing: it fits in the
+/// padding [`KernelData`]'s alignment leaves behind.
+#[derive(Copy, Clone, Debug)]
+enum KindTag {
+    AnyByte,
+    SmallSet,
+    ConstantNibble,
+    OneByte,
+    TwoBytes,
+    ThreeBytes,
+    OneRange,
+    Never,
+}
+
+impl KindTag {
+    fn of(kind: FinderKind) -> Self {
+        match kind {
+            FinderKind::AnyByte(_) => Self::AnyByte,
+            FinderKind::SmallSet { .. } => Self::SmallSet,
+            FinderKind::ConstantNibble(..) => Self::ConstantNibble,
+            FinderKind::OneByte(_) => Self::OneByte,
+            FinderKind::TwoBytes(_) => Self::TwoBytes,
+            FinderKind::ThreeBytes(_) => Self::ThreeBytes,
+            FinderKind::OneRange(_) => Self::OneRange,
+            FinderKind::Never => Self::Never,
+        }
+    }
+}
+
 /// Which kernels a [`Finder`] runs, resolved from [`Backend`] and the level.
 #[derive(Copy, Clone, Debug)]
 enum Family {
@@ -88,7 +123,8 @@ impl Finder {
         Self {
             level,
             family,
-            kind,
+            kind: KindTag::of(kind),
+            data: KernelData::new(family, kind),
             scan: build_scan(level, family, kind),
         }
     }
@@ -107,9 +143,9 @@ impl Finder {
             state: IterState {
                 haystack,
                 pos: 0,
-                bits: 0,
                 bits_offset: 0,
             },
+            bits: 0,
         }
     }
 }
@@ -117,17 +153,122 @@ impl Finder {
 pub struct Iter<'a> {
     finder: &'a Finder,
     state: IterState<'a>,
+    /// Matches of the most recently scanned run that have not been yielded yet.
+    ///
+    /// Deliberately not in [`IterState`]: a scan neither reads nor writes it, so keeping it
+    /// out of the struct the scan is handed keeps the caller from having to set it up before
+    /// every call, and a scan returns its bits in registers instead.
+    bits: MatchedBitset,
 }
 
-/// What a scan reads and writes: everything in [`Iter`] except which [`Finder`] it came from.
+/// What a scan reads and writes, which is everything about the search but its matches.
 struct IterState<'a> {
     haystack: &'a [u8],
     /// Offset of the first byte that has not been scanned yet.
     pos: usize,
-    /// Matches of the most recently scanned run that have not been yielded yet.
-    bits: MatchedBitset,
-    /// Offset of the first byte that `bits` describes.
+    /// Offset of the first byte the most recent scan's bits describe.
     bits_offset: usize,
+}
+
+/// Everything a kernel needs, in the shape that kernel reads it, built once when the
+/// [`Finder`] is.
+///
+/// Rebuilding the kernel per call — splatting needles across a block, re-deriving a range's
+/// four masks — was pure overhead on a search that refills often, and reading it back out of
+/// [`FinderKind`] cost an unaligned load at the enum's payload offset. A union pays neither:
+/// the live field is decided once, by the same [`build_scan`] call that installs the [`Scan`]
+/// beside it, and the alignment lets a whole block come back in one load.
+///
+/// # Safety
+///
+/// Which field is live is fixed for a [`Finder`]'s lifetime by its [`FinderKind`], as
+/// [`KernelData::new`] lays out. Nothing but the [`Scan`] built from that same kind may read
+/// it.
+#[derive(Copy, Clone)]
+#[repr(align(16))]
+union KernelData {
+    /// [`vector::kernels::AnyOf`]: one to three needles, each splatted across a block.
+    splatted_needles: [[u8; 16]; 3],
+    /// [`vector::kernels::OneRange`]: the endpoints, each splatted across a block.
+    splatted_range: [[u8; 16]; 2],
+    /// [`vector::kernels::SmallSet`]: the low- and high-nibble tables.
+    nibble_lookups: [NibbleLookup; 2],
+    /// [`vector::kernels::SingleNibble`].
+    nibble_table: NibbleTable,
+    /// [`vector::kernels::AnyByte`] and [`bytewise::kernels::AnyByte`].
+    bitset: Bitset,
+    /// [`swar::kernels::AnyOf`]: one to three needles, each splatted across a word.
+    splatted_words: [u64; 3],
+    /// [`swar::kernels::OneRange`], whose masks are all derived up front.
+    range_masks: swar::kernels::OneRange,
+    /// never has no data
+    never: (),
+}
+
+/// [`vector::kernels::SingleNibble`]'s table and the nibble it is indexed by.
+#[derive(Copy, Clone)]
+struct NibbleTable {
+    which: ConstantNibble,
+    table: [u8; 16],
+}
+
+impl KernelData {
+    /// Builds the field the kernels for `family` and `kind` read. The arms line up
+    /// one-for-one with [`vector_build`] and [`word_build`], which pick those kernels.
+    fn new(family: Family, kind: FinderKind) -> Self {
+        /// Splats one to three needles across whichever unit `family` scans in, leaving
+        /// the slots past `N` zeroed for a kernel that will not read them.
+        fn splat_needles<const N: usize>(family: Family, needles: [u8; N]) -> KernelData {
+            const { assert!(N <= 3) }
+            match family {
+                Family::Vector => {
+                    let mut splatted = [[0; 16]; 3];
+                    for (slot, needle) in splatted.iter_mut().zip(needles) {
+                        *slot = [needle; 16];
+                    }
+                    KernelData {
+                        splatted_needles: splatted,
+                    }
+                }
+                Family::Word => {
+                    let mut splatted = [0; 3];
+                    for (slot, needle) in splatted.iter_mut().zip(needles) {
+                        *slot = swar::splat(needle);
+                    }
+                    KernelData {
+                        splatted_words: splatted,
+                    }
+                }
+            }
+        }
+
+        match kind {
+            FinderKind::OneByte(needle) => splat_needles(family, [needle]),
+            FinderKind::TwoBytes(needles) => splat_needles(family, needles),
+            FinderKind::ThreeBytes(needles) => splat_needles(family, needles),
+            // The other kind both families reach, and the only one where they want
+            // different shapes: one splats the endpoints, the other derives masks from them.
+            FinderKind::OneRange(range) => match family {
+                Family::Vector => Self {
+                    splatted_range: [[range.start; 16], [range.last; 16]],
+                },
+                Family::Word => Self {
+                    range_masks: swar::kernels::OneRange::new(range),
+                },
+            },
+            FinderKind::SmallSet {
+                lo_lookup,
+                hi_lookup,
+            } => Self {
+                nibble_lookups: [lo_lookup, hi_lookup],
+            },
+            FinderKind::ConstantNibble(which, table) => Self {
+                nibble_table: NibbleTable { which, table },
+            },
+            FinderKind::AnyByte(bitset) => Self { bitset },
+            FinderKind::Never => Self { never: () },
+        }
+    }
 }
 
 /// The search loops for one level-and-kernel pair, chosen when the [`Finder`] is built.
@@ -140,8 +281,8 @@ struct IterState<'a> {
 /// copies of the loop body out of [`Iter::next`].
 #[derive(Copy, Clone)]
 struct Scan {
-    find_next: unsafe fn(&FinderKind, &mut IterState<'_>),
-    count_all: unsafe fn(&FinderKind, &mut IterState<'_>) -> usize,
+    find_next: unsafe fn(&KernelData, &mut IterState<'_>) -> MatchedBitset,
+    count_all: unsafe fn(&KernelData, &mut IterState<'_>) -> usize,
 }
 
 /// Builds the [`Scan`] for a vector kernel at one SIMD level.
@@ -167,26 +308,25 @@ fn vector_scan<S: Simd, K: vector::Kernel<S>>(simd: S) -> Scan {
     }
 
     unsafe fn find_next<S: Simd, K: vector::Kernel<S>>(
-        kind: &FinderKind,
+        data: &KernelData,
         state: &mut IterState<'_>,
-    ) {
+    ) -> MatchedBitset {
         // SAFETY: this function is only ever instantiated by `vector_scan`, which accepts an S,
         // so we know the caller proved the right target features are available
         let simd = unsafe { token::<S>() };
         simd.vectorize(
             #[inline(always)]
             move || {
-                // SAFETY: the `Scan` below stores this function only for the variant `K` was
-                // chosen for, so `from_kind` returns `Some`. Unwrapping it checked costs a
-                // measurable amount on refill-heavy searches.
-                let kernel = unsafe { K::from_kind(simd, kind).unwrap_unchecked() };
-                vector::find_next(simd, state, kernel);
+                // SAFETY: the `Scan` below stores this function only for the kind whose
+                // `KernelData` field `K` reads.
+                let kernel = unsafe { K::from_data(simd, data) };
+                vector::find_next(simd, state, kernel)
             },
-        );
+        )
     }
 
     unsafe fn count_all<S: Simd, K: vector::Kernel<S>>(
-        kind: &FinderKind,
+        data: &KernelData,
         state: &mut IterState<'_>,
     ) -> usize {
         // SAFETY: as above.
@@ -194,11 +334,14 @@ fn vector_scan<S: Simd, K: vector::Kernel<S>>(simd: S) -> Scan {
         simd.vectorize(
             #[inline(always)]
             move || {
-                // SAFETY: the `Scan` below stores this function only for the variant `K` was
-                // chosen for, so `from_kind` returns `Some`. Unwrapping it checked costs a
-                // measurable amount on refill-heavy searches.
-                let kernel = unsafe { K::from_kind(simd, kind).unwrap_unchecked() };
-                let total = vector::count(simd, unsafe { state.haystack.get_unchecked(state.pos..) }, kernel);
+                // SAFETY: the `Scan` below stores this function only for the kind whose
+                // `KernelData` field `K` reads.
+                let kernel = unsafe { K::from_data(simd, data) };
+                let total = vector::count(
+                    simd,
+                    unsafe { state.haystack.get_unchecked(state.pos..) },
+                    kernel,
+                );
                 state.pos = state.haystack.len();
                 total
             },
@@ -215,16 +358,19 @@ fn vector_scan<S: Simd, K: vector::Kernel<S>>(simd: S) -> Scan {
 }
 
 fn swar_scan<K: swar::Kernel>() -> Scan {
-    unsafe fn find_next<K: swar::Kernel>(kind: &FinderKind, state: &mut IterState<'_>) {
+    unsafe fn find_next<K: swar::Kernel>(
+        data: &KernelData,
+        state: &mut IterState<'_>,
+    ) -> MatchedBitset {
         // SAFETY: as in `vector_scan`, the `Scan` below stores this function only for the
-        // variant `K` was chosen for.
-        let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
-        swar::find_next(state, kernel);
+        // kind whose `KernelData` field `K` reads.
+        let kernel = unsafe { K::from_data(data) };
+        swar::find_next(state, kernel)
     }
 
-    unsafe fn count_all<K: swar::Kernel>(kind: &FinderKind, state: &mut IterState<'_>) -> usize {
+    unsafe fn count_all<K: swar::Kernel>(data: &KernelData, state: &mut IterState<'_>) -> usize {
         // SAFETY: as above.
-        let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
+        let kernel = unsafe { K::from_data(data) };
         let total = swar::count(unsafe { state.haystack.get_unchecked(state.pos..) }, kernel);
         state.pos = state.haystack.len();
         total
@@ -238,19 +384,22 @@ fn swar_scan<K: swar::Kernel>() -> Scan {
 
 /// The byte-at-a-time counterpart of [`swar_scan`].
 fn bytewise_scan<K: bytewise::Kernel>() -> Scan {
-    unsafe fn find_next<K: bytewise::Kernel>(kind: &FinderKind, state: &mut IterState<'_>) {
+    unsafe fn find_next<K: bytewise::Kernel>(
+        data: &KernelData,
+        state: &mut IterState<'_>,
+    ) -> MatchedBitset {
         // SAFETY: as in `vector_scan`, the `Scan` below stores this function only for the
-        // variant `K` was chosen for.
-        let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
-        bytewise::find_next(state, kernel);
+        // kind whose `KernelData` field `K` reads.
+        let kernel = unsafe { K::from_data(data) };
+        bytewise::find_next(state, kernel)
     }
 
     unsafe fn count_all<K: bytewise::Kernel>(
-        kind: &FinderKind,
+        data: &KernelData,
         state: &mut IterState<'_>,
     ) -> usize {
         // SAFETY: as above.
-        let kernel = unsafe { K::from_kind(kind).unwrap_unchecked() };
+        let kernel = unsafe { K::from_data(data) };
         let total = bytewise::count(unsafe { state.haystack.get_unchecked(state.pos..) }, kernel);
         state.pos = state.haystack.len();
         total
@@ -264,11 +413,12 @@ fn bytewise_scan<K: bytewise::Kernel>() -> Scan {
 
 /// Builds the [`Scan`] for a byte set that nothing can match.
 fn never_scan() -> Scan {
-    fn find_next(_kind: &FinderKind, state: &mut IterState<'_>) {
+    fn find_next(_data: &KernelData, state: &mut IterState<'_>) -> MatchedBitset {
         state.pos = state.haystack.len();
+        0
     }
 
-    fn count_all(_kind: &FinderKind, state: &mut IterState<'_>) -> usize {
+    fn count_all(_data: &KernelData, state: &mut IterState<'_>) -> usize {
         state.pos = state.haystack.len();
         0
     }
@@ -324,34 +474,34 @@ impl<'a> Iterator for Iter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.state.bits == 0 {
+        if self.bits == 0 {
             if self.state.pos == self.state.haystack.len() {
                 return None;
             }
             // SAFETY: `build_scan` installs each function for the kind passed back to it
             // here, and the `Level` that chose it proves the target has its features.
-            unsafe { (self.finder.scan.find_next)(&self.finder.kind, &mut self.state) };
-            if self.state.bits == 0 {
+            self.bits = unsafe { (self.finder.scan.find_next)(&self.finder.data, &mut self.state) };
+            if self.bits == 0 {
                 return None;
             }
         }
-        let bit = self.state.bits.trailing_zeros() as usize;
-        self.state.bits &= self.state.bits - 1;
+        let bit = self.bits.trailing_zeros() as usize;
+        self.bits &= self.bits - 1;
         Some(self.state.bits_offset + bit)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let min = self.state.bits.count_ones() as usize;
+        let min = self.bits.count_ones() as usize;
         let max = min.checked_add(self.state.haystack.len() - self.state.pos);
         (min, max)
     }
 
     fn count(mut self) -> usize {
-        let mut total = self.state.bits.count_ones() as usize;
+        let mut total = self.bits.count_ones() as usize;
         if self.state.pos != self.state.haystack.len() {
             let finder = self.finder;
             // SAFETY: as in `next`.
-            total += unsafe { (finder.scan.count_all)(&finder.kind, &mut self.state) };
+            total += unsafe { (finder.scan.count_all)(&finder.data, &mut self.state) };
         }
         total
     }
@@ -359,23 +509,23 @@ impl<'a> Iterator for Iter<'a> {
     #[inline]
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         let mut remaining = n;
-        while (self.state.bits.count_ones() as usize) <= remaining {
-            remaining -= self.state.bits.count_ones() as usize;
-            self.state.bits = 0;
+        while (self.bits.count_ones() as usize) <= remaining {
+            remaining -= self.bits.count_ones() as usize;
+            self.bits = 0;
             if self.state.pos == self.state.haystack.len() {
                 return None;
             }
             // SAFETY: as in `next`.
-            unsafe { (self.finder.scan.find_next)(&self.finder.kind, &mut self.state) };
-            if self.state.bits == 0 {
+            self.bits = unsafe { (self.finder.scan.find_next)(&self.finder.data, &mut self.state) };
+            if self.bits == 0 {
                 return None;
             }
         }
         for _ in 0..remaining {
-            self.state.bits &= self.state.bits - 1;
+            self.bits &= self.bits - 1;
         }
-        let bit = self.state.bits.trailing_zeros() as usize;
-        self.state.bits &= self.state.bits - 1;
+        let bit = self.bits.trailing_zeros() as usize;
+        self.bits &= self.bits - 1;
         Some(self.state.bits_offset + bit)
     }
 }
@@ -401,6 +551,24 @@ impl NibbleLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Finder` is built per search often enough that its size is worth keeping honest.
+    /// `KernelData` is the bulk of it, and everything else fits in the padding its
+    /// alignment leaves behind.
+    #[test]
+    fn finder_stays_small() {
+        assert!(
+            size_of::<Finder>() <= 80,
+            "Finder is {} bytes",
+            size_of::<Finder>()
+        );
+    }
+
+    #[test]
+    fn debug_names_the_chosen_kernel() {
+        let debug = format!("{:?}", Bytes::from_bytes(b"az").finder());
+        assert!(debug.contains("TwoBytes"), "{debug}");
+    }
 
     #[test]
     fn add_range_matches_adding_each_byte() {
