@@ -10,9 +10,15 @@ use std::time::Instant;
 
 const SEED: &[u8] = include_bytes!("../benches/haystacks/sherlock/huge.txt");
 
+/// Never occurs in the text, so the scan runs the whole way through.
+const NEVER: u8 = b'<';
+const RARE: u8 = b'z';
+
 fn finder(needles: &[u8]) -> Finder {
     Bytes::from_bytes(needles).finder()
 }
+
+const ROUNDS: u32 = 100;
 
 fn best<T>(rounds: u32, mut f: impl FnMut() -> T) -> f64 {
     // The first pass over a fresh mapping pays for its page faults, and at these sizes
@@ -27,6 +33,18 @@ fn best<T>(rounds: u32, mut f: impl FnMut() -> T) -> f64 {
     best
 }
 
+fn row(label: &str, len: usize, ours: f64, theirs: f64) {
+    let gbs = |t: f64| len as f64 / t / 1e9;
+    println!(
+        "{label:22} {:9.1} us {:6.1} GB/s   memchr {:9.1} us {:6.1} GB/s   {:5.2}x",
+        ours * 1e6,
+        gbs(ours),
+        theirs * 1e6,
+        gbs(theirs),
+        theirs / ours,
+    );
+}
+
 fn main() {
     for mb in [1usize, 4, 16, 64, 256] {
         let len = mb * 1024 * 1024;
@@ -35,21 +53,19 @@ fn main() {
             let take = (len - haystack.len()).min(SEED.len());
             haystack.extend_from_slice(&SEED[..take]);
         }
-        // `<` never occurs in the text, so the scan runs the whole way through.
-        let never = finder(b"<");
-        let rare = finder(b"z");
+        let never = finder(&[NEVER]);
+        let rare = finder(&[RARE]);
 
+        let scan = best(ROUNDS, || never.find(black_box(&haystack)));
+        let scan_theirs = best(ROUNDS, || memchr::memchr(NEVER, black_box(&haystack)));
         // `count` does not go through the widened loop, so it holds still between builds
         // and shows how much of any difference is the machine rather than the code.
-        let scan = best(20, || never.find(black_box(&haystack)));
-        let count = best(20, || rare.iter(black_box(&haystack)).count());
-        let gbs = |t: f64| len as f64 / t / 1e9;
-        println!(
-            "{mb:4} MB   find(never) {:9.1} us {:6.1} GB/s    count(rare) {:9.1} us {:6.1} GB/s",
-            scan * 1e6,
-            gbs(scan),
-            count * 1e6,
-            gbs(count),
-        );
+        let count = best(ROUNDS, || rare.iter(black_box(&haystack)).count());
+        let count_theirs = best(ROUNDS, || {
+            memchr::memchr_iter(RARE, black_box(&haystack)).count()
+        });
+
+        row(&format!("{mb:4} MB  find(never)"), len, scan, scan_theirs);
+        row(&format!("{mb:4} MB  count(rare)"), len, count, count_theirs);
     }
 }
