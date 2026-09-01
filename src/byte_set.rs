@@ -1,35 +1,34 @@
 use crate::bitset::Bitset;
-use crate::{Backend, ConstantNibble, Family, Finder, FinderKind, NibbleLookup, vector};
+use crate::{ConstantNibble, Kind, NibbleLookup};
 use core::range::RangeInclusive;
-use fearless_simd::Level;
 
 const ARRAY_MAX: usize = 24;
 
+/// A set of bytes, kept in whichever of three representations the bytes added so far fit.
+///
+/// Only a building block: [`MemchrN`](crate::MemchrN) collects a caller's bytes into one of
+/// these, asks it for a [`Kind`], and drops it. Nothing here survives into the
+/// searcher, so the representations exist purely to make collection cheap and to make
+/// [`kind`](Self::kind) able to tell a range or a small set from a scattered one.
 #[derive(Debug, Copy, Clone)]
-pub struct Bytes(pub(crate) BytesRepr);
+pub(crate) struct ByteSet(Repr);
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) enum BytesRepr {
+enum Repr {
     Array { count: u8, arr: [u8; ARRAY_MAX] },
     Range(RangeInclusive<u8>),
     Bitset(Bitset),
 }
 
-impl Default for Bytes {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Bytes {
-    pub const fn new() -> Self {
-        Self(BytesRepr::Array {
+impl ByteSet {
+    pub(crate) const fn new() -> Self {
+        Self(Repr::Array {
             count: 0,
             arr: [0; ARRAY_MAX],
         })
     }
 
-    pub const fn from_bytes(bytes: &[u8]) -> Self {
+    pub(crate) const fn from_bytes(bytes: &[u8]) -> Self {
         // `add` dedups by scanning the array it has already filled, which is quadratic in
         // the input. That is cheapest for an input the array could hold, and increasingly
         // wasteful past it, so longer inputs dedup through a bitset instead.
@@ -52,8 +51,8 @@ impl Bytes {
 
         if seen.count() as usize > ARRAY_MAX {
             return Self(match seen.extract_range() {
-                Some(range) => BytesRepr::Range(range),
-                None => BytesRepr::Bitset(seen),
+                Some(range) => Repr::Range(range),
+                None => Repr::Bitset(seen),
             });
         }
 
@@ -72,12 +71,12 @@ impl Bytes {
             }
             i += 1;
         }
-        Self(BytesRepr::Array { count, arr })
+        Self(Repr::Array { count, arr })
     }
 
     // Intentionally take a ops::RangeInclusive rather than a range::RangeInclusive.
     // Its worth it to support `..=` syntax
-    pub const fn from_range(range: core::ops::RangeInclusive<u8>) -> Self {
+    pub(crate) const fn from_range(range: core::ops::RangeInclusive<u8>) -> Self {
         let mut res = Self::new();
         res.add_range(RangeInclusive {
             start: *range.start(),
@@ -86,9 +85,9 @@ impl Bytes {
         res
     }
 
-    pub const fn add(&mut self, item: u8) {
+    pub(crate) const fn add(&mut self, item: u8) {
         match &mut self.0 {
-            BytesRepr::Array { count, arr } => {
+            Repr::Array { count, arr } => {
                 let len = *count as usize;
                 // Not worth keeping sorted/binary searching vs linear search on 24 items
                 let mut i = 0;
@@ -103,15 +102,15 @@ impl Bytes {
                     *count += 1;
                 } else {
                     self.0 = if let Some(range) = disjoint_items_to_range(item, arr) {
-                        BytesRepr::Range(range)
+                        Repr::Range(range)
                     } else {
                         let mut bitset = Bitset::from_bytes(arr);
                         bitset.add(item);
-                        BytesRepr::Bitset(bitset)
+                        Repr::Bitset(bitset)
                     };
                 }
             }
-            BytesRepr::Range(range) => {
+            Repr::Range(range) => {
                 if let Some(x) = range.start.checked_sub(1)
                     && x == item
                 {
@@ -124,10 +123,10 @@ impl Bytes {
                     let mut bitset = Bitset::new();
                     bitset.add_range(*range);
                     bitset.add(item);
-                    self.0 = BytesRepr::Bitset(bitset);
+                    self.0 = Repr::Bitset(bitset);
                 }
             }
-            BytesRepr::Bitset(bitset) => {
+            Repr::Bitset(bitset) => {
                 bitset.add(item);
             }
         }
@@ -136,7 +135,7 @@ impl Bytes {
     /// Adds every byte from `range.start` through `range.last`, inclusive.
     ///
     /// An empty range (one whose `start` is past its `last`) adds nothing.
-    pub const fn add_range(&mut self, range: RangeInclusive<u8>) {
+    pub(crate) const fn add_range(&mut self, range: RangeInclusive<u8>) {
         let RangeInclusive { start, last } = range;
         if start > last {
             return;
@@ -144,17 +143,17 @@ impl Bytes {
         match self.0 {
             // A range too wide to fit the array cannot end up in it, so adding it a byte at
             // a time would only rediscover that after up to 256 inserts.
-            BytesRepr::Array { count, arr } if (last - start) as usize >= ARRAY_MAX => {
+            Repr::Array { count, arr } if (last - start) as usize >= ARRAY_MAX => {
                 let mut bitset = Bitset::from_bytes(arr.split_at(count as usize).0);
                 bitset.add_range(range);
                 self.0 = match bitset.extract_range() {
-                    Some(range) => BytesRepr::Range(range),
-                    None => BytesRepr::Bitset(bitset),
+                    Some(range) => Repr::Range(range),
+                    None => Repr::Bitset(bitset),
                 };
             }
             // One at a time, so a range small enough to stay in the array keeps the
             // representations only the array can reach.
-            BytesRepr::Array { .. } => {
+            Repr::Array { .. } => {
                 let mut item = start;
                 loop {
                     self.add(item);
@@ -164,12 +163,12 @@ impl Bytes {
                     item += 1;
                 }
             }
-            BytesRepr::Range(existing) => {
+            Repr::Range(existing) => {
                 // Two ranges stay one range only if they overlap or touch.
                 if start <= existing.last.saturating_add(1)
                     && existing.start <= last.saturating_add(1)
                 {
-                    self.0 = BytesRepr::Range(RangeInclusive {
+                    self.0 = Repr::Range(RangeInclusive {
                         start: if start < existing.start {
                             start
                         } else {
@@ -185,31 +184,14 @@ impl Bytes {
                     let mut bitset = Bitset::new();
                     bitset.add_range(existing);
                     bitset.add_range(range);
-                    self.0 = BytesRepr::Bitset(bitset);
+                    self.0 = Repr::Bitset(bitset);
                 }
             }
-            BytesRepr::Bitset(mut bitset) => {
+            Repr::Bitset(mut bitset) => {
                 bitset.add_range(range);
-                self.0 = BytesRepr::Bitset(bitset);
+                self.0 = Repr::Bitset(bitset);
             }
         }
-    }
-
-    pub fn finder(&self) -> Finder {
-        self.finder_with(Backend::Auto)
-    }
-
-    pub fn finder_with(&self, backend: Backend) -> Finder {
-        let level = Level::new();
-        let family = match backend {
-            Backend::Scalar => Family::Word,
-            Backend::Auto if level.is_fallback() => Family::Word,
-            Backend::Auto => Family::Vector,
-        };
-        // A word kernel has no shuffle to reach for, so it classifies as a vector target
-        // without fast ones does.
-        let fast_shuffles = matches!(family, Family::Vector) && vector::has_byte_shuffle(level);
-        Finder::new(level, family, self.kind(fast_shuffles))
     }
 
     /// Picks the kind that matches this set most cheaply.
@@ -217,37 +199,37 @@ impl Bytes {
     /// `fast_shuffles` gates the kinds a kernel can only scan by shuffling bytes within a
     /// vector: unset for a target whose shuffles are slow, and for the word kernels, which
     /// have none.
-    fn kind(&self, fast_shuffles: bool) -> FinderKind {
+    pub(crate) fn kind(&self, fast_shuffles: bool) -> Kind {
         match self.0 {
-            BytesRepr::Array { count: 0, arr: _ } => FinderKind::Never,
+            Repr::Array { count: 0, arr: _ } => Kind::Never,
 
             // 1-3 bytes
-            BytesRepr::Array {
+            Repr::Array {
                 count: 1,
                 arr: [item1, ..],
-            } => FinderKind::OneByte(item1),
-            BytesRepr::Array {
+            } => Kind::OneByte(item1),
+            Repr::Array {
                 count: 2,
                 arr: [item1, item2, ..],
-            } => FinderKind::TwoBytes([item1, item2]),
-            BytesRepr::Array {
+            } => Kind::TwoBytes([item1, item2]),
+            Repr::Array {
                 count: 3,
                 arr: [item1, item2, item3, ..],
-            } => FinderKind::ThreeBytes([item1, item2, item3]),
+            } => Kind::ThreeBytes([item1, item2, item3]),
 
             // Ranges
-            BytesRepr::Array { count, ref arr }
+            Repr::Array { count, ref arr }
                 if let Some(range) = disjoint_slice_to_range(&arr[..usize::from(count)]) =>
             {
-                FinderKind::OneRange(range)
+                Kind::OneRange(range)
             }
-            BytesRepr::Range(range) => FinderKind::OneRange(range),
-            BytesRepr::Bitset(bitset) if let Some(range) = bitset.extract_range() => {
-                FinderKind::OneRange(range)
+            Repr::Range(range) => Kind::OneRange(range),
+            Repr::Bitset(bitset) if let Some(range) = bitset.extract_range() => {
+                Kind::OneRange(range)
             }
 
             // Small set
-            BytesRepr::Array {
+            Repr::Array {
                 count: count @ ..=8,
                 ref arr,
             } if fast_shuffles => {
@@ -257,27 +239,27 @@ impl Bytes {
                     lo_lookup.set(item & 0x0F, i as u8);
                     hi_lookup.set(item >> 4, i as u8);
                 }
-                FinderKind::SmallSet {
+                Kind::SmallSet {
                     lo_lookup,
                     hi_lookup,
                 }
             }
 
             // Constant Nibble
-            BytesRepr::Array {
+            Repr::Array {
                 count: count @ ..=16,
                 ref arr,
             } if fast_shuffles
                 && let Some((nibble, lookup)) = constant_nibble(&arr[..usize::from(count)]) =>
             {
-                FinderKind::ConstantNibble(nibble, lookup)
+                Kind::ConstantNibble(nibble, lookup)
             }
 
             // Bitset-based any byte
-            BytesRepr::Array { count, ref arr } => {
-                FinderKind::AnyByte(Bitset::from_bytes(&arr[..usize::from(count)]))
+            Repr::Array { count, ref arr } => {
+                Kind::AnyByte(Bitset::from_bytes(&arr[..usize::from(count)]))
             }
-            BytesRepr::Bitset(bitset) => FinderKind::AnyByte(bitset),
+            Repr::Bitset(bitset) => Kind::AnyByte(bitset),
         }
     }
 }
@@ -375,7 +357,7 @@ fn constant_nibble(items: &[u8]) -> Option<(ConstantNibble, [u8; 16])> {
     }
 }
 
-impl FromIterator<u8> for Bytes {
+impl FromIterator<u8> for ByteSet {
     fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
         let mut res = Self::new();
         res.extend(iter);
@@ -383,7 +365,7 @@ impl FromIterator<u8> for Bytes {
     }
 }
 
-impl Extend<u8> for Bytes {
+impl Extend<u8> for ByteSet {
     fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
         iter.into_iter().for_each(|item| self.add(item));
     }

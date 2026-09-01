@@ -2,7 +2,7 @@
 //! without criterion's sampling in the way. Reports the best of several rounds, which
 //! is far more stable run-to-run than criterion's `--quick` estimates.
 
-use memchr_n::{Bytes, Finder};
+use memchr_n::MemchrN;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -10,8 +10,8 @@ const HAYSTACK: &[u8] = include_bytes!("../benches/haystacks/sherlock/huge.txt")
 
 const ROUNDS: u32 = 100;
 
-fn finder(needles: &[u8]) -> Finder {
-    Bytes::from_bytes(needles).finder()
+fn finder(needles: &[u8]) -> MemchrN {
+    MemchrN::new(needles)
 }
 
 fn best<T>(rounds: u32, iters: u32, mut f: impl FnMut() -> T) -> f64 {
@@ -64,7 +64,7 @@ fn find_header() {
     );
 }
 
-fn offset_sum(finder: &Finder, haystack: &[u8]) -> usize {
+fn offset_sum(finder: &MemchrN, haystack: &[u8]) -> usize {
     let mut sum = 0usize;
     for offset in finder.iter(haystack) {
         sum = sum.wrapping_add(offset);

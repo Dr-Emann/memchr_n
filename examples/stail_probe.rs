@@ -6,7 +6,7 @@
 //! The `memchr` rows are a reference point only: that crate always uses the widest
 //! backend the CPU has, so it is not scanning these tails the same way.
 
-use memchr_n::{Backend, Bytes};
+use memchr_n::{Backend, MemchrN};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -41,8 +41,8 @@ fn row(name: &str, mut f: impl FnMut(&[u8]) -> Option<usize>) {
 }
 
 fn main() {
-    let onebyte = Bytes::from_bytes(b"<").finder_with(Backend::Scalar);
-    let threebyte = Bytes::from_bytes(b"<>@").finder_with(Backend::Scalar);
+    let onebyte = MemchrN::new_with(b"<", Backend::Scalar);
+    let threebyte = MemchrN::new_with(b"<>@", Backend::Scalar);
 
     row("onebyte", |hay| onebyte.iter(hay).next());
     row("onebyte memchr", |hay| memchr::memchr(b'<', hay));

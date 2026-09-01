@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use memchr_n::{Backend, Bytes, Finder};
+use memchr_n::{Backend, MemchrN};
 use std::hint::black_box;
 
 const SHERLOCK_TINY: &[u8] = include_bytes!("haystacks/sherlock/tiny.txt");
@@ -18,7 +18,7 @@ const HEX_LOWER: &[u8] = b"0123456789abcdef";
 const OURS: &str = "memchr_n";
 const THEIRS: &str = "memchr";
 
-/// The families a [`Finder`] can be built from. `memchr` has no counterpart to this axis, so
+/// The families a [`MemchrN`] can be built from. `memchr` has no counterpart to this axis, so
 /// its entries are emitted once per set rather than once per family.
 const BACKENDS: &[(&str, Backend)] = &[("auto", Backend::Auto), ("scalar", Backend::Scalar)];
 
@@ -36,24 +36,23 @@ enum ByteSet {
 }
 
 impl ByteSet {
-    fn finder(self, backend: Backend) -> Finder {
-        let bitset = match self {
-            ByteSet::List(bytes) => Bytes::from_bytes(bytes),
-            ByteSet::Range(start, end) => Bytes::from_range(start..=end),
+    fn finder(self, backend: Backend) -> MemchrN {
+        match self {
+            ByteSet::List(bytes) => MemchrN::new_with(bytes, backend),
+            ByteSet::Range(start, end) => MemchrN::from_range_with(start..=end, backend),
             ByteSet::Stride { start, last, step } => {
-                let mut bytes = Bytes::new();
+                let mut bytes = Vec::new();
                 let mut byte = start;
                 while byte <= last {
-                    bytes.add(byte);
+                    bytes.push(byte);
                     let Some(next) = byte.checked_add(step) else {
                         break;
                     };
                     byte = next;
                 }
-                bytes
+                MemchrN::new_with(&bytes, backend)
             }
-        };
-        bitset.finder_with(backend)
+        }
     }
 
     fn contains(self, byte: u8) -> bool {
@@ -141,7 +140,7 @@ const DENSITY_SETS: &[(&str, ByteSet)] = &[
     ("verycommon1", ByteSet::List(b" ")),
 ];
 
-/// One byte set per vector [`Finder`] specialization, so each SIMD kernel is measured directly.
+/// One byte set per vector [`MemchrN`] specialization, so each SIMD kernel is measured directly.
 ///
 /// Under [`Backend::Scalar`] the shuffle-based kinds are unreachable, so `small-set`,
 /// `single-nibble` and both `any-byte` entries all resolve to the byte-at-a-time kernel. They
@@ -154,18 +153,6 @@ const KIND_SETS: &[(&str, ByteSet)] = &[
     ("single-nibble", ByteSet::List(b"abcdefghjl")),
     ("any-byte-16", ByteSet::List(HEX_LOWER)),
     ("any-byte-62", ByteSet::List(ALNUM)),
-];
-
-/// The [`KIND_SETS`] sets again, resolved at compile time, to separate the two halves of
-/// building a finder: these pay only for choosing a kernel, not for collecting the bytes.
-const KIND_BYTES: &[(&str, Bytes)] = &[
-    ("never", Bytes::from_bytes(b"")),
-    ("one-byte", Bytes::from_bytes(b"z")),
-    ("one-range", Bytes::from_range(b'0'..=b'9')),
-    ("small-set", Bytes::from_bytes(b"aeiouAEI")),
-    ("single-nibble", Bytes::from_bytes(b"abcdefghjl")),
-    ("any-byte-16", Bytes::from_bytes(HEX_LOWER)),
-    ("any-byte-62", Bytes::from_bytes(ALNUM)),
 ];
 
 const CORPORA: &[(&str, &[u8])] = &[
@@ -254,7 +241,7 @@ fn naive_first(set: ByteSet, haystack: &[u8]) -> Option<usize> {
     None
 }
 
-fn offset_sum(finder: &Finder, haystack: &[u8]) -> usize {
+fn offset_sum(finder: &MemchrN, haystack: &[u8]) -> usize {
     let mut sum = 0usize;
     for offset in finder.iter(haystack) {
         sum = sum.wrapping_add(offset);
@@ -264,7 +251,7 @@ fn offset_sum(finder: &Finder, haystack: &[u8]) -> usize {
 
 /// Guards against benchmarking a broken implementation, which would otherwise show up
 /// as a suspiciously fast result rather than a failure.
-fn verified_finder(set: ByteSet, backend: Backend, haystack: &[u8], label: &str) -> Finder {
+fn verified_finder(set: ByteSet, backend: Backend, haystack: &[u8], label: &str) -> MemchrN {
     let finder = set.finder(backend);
     assert_eq!(
         finder.iter(haystack).count(),
@@ -364,7 +351,7 @@ fn bench_iterate(c: &mut Criterion) {
     group.finish();
 }
 
-/// Byte sets with no `memchr` counterpart, so this group measures each [`Finder`]
+/// Byte sets with no `memchr` counterpart, so this group measures each [`MemchrN`]
 /// specialization on its own.
 fn bench_kinds(c: &mut Criterion) {
     let mut group = c.benchmark_group("kind/sherlock");
@@ -460,11 +447,6 @@ fn bench_build(c: &mut Criterion) {
     for &(name, set) in KIND_SETS {
         group.bench_function(BenchmarkId::new(name, "from-bytes"), |b| {
             b.iter(|| black_box(set).finder(Backend::Auto))
-        });
-    }
-    for (name, bytes) in KIND_BYTES {
-        group.bench_function(BenchmarkId::new(*name, "from-set"), |b| {
-            b.iter(|| black_box(bytes).finder_with(Backend::Auto))
         });
     }
     group.finish();
