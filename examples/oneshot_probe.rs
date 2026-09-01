@@ -1,0 +1,95 @@
+//! Splits a one-shot search into the two things it pays for that a prebuilt one does not.
+//!
+//! `build` is a construction with nothing done to it. `prebuilt` is one search through a
+//! `MemchrN` that already exists, which is the floor. `oneshot` is construction and search
+//! together, so `oneshot - prebuilt - build` is what the two cost when neither can be
+//! optimised against the other — mostly the indirect call standing between them.
+//!
+//! Two haystacks per length: `hit` matches at offset 0, so the search returns as early as it
+//! can and the row is almost all fixed cost; `miss` never matches, so the row is the whole
+//! scan.
+
+use memchr_n::MemchrN;
+use std::hint::black_box;
+use std::time::Instant;
+
+const ROUNDS: u32 = 200;
+const ITERS: u32 = 500;
+
+const LENS: [usize; 9] = [8, 16, 32, 64, 128, 512, 4096, 65536, 1 << 20];
+
+/// The kinds a set can resolve to, one set each.
+const SETS: [(&str, &[u8]); 6] = [
+    ("one-byte", b"z"),
+    ("three-bytes", b"xyz"),
+    ("one-range", b"0123456789"),
+    ("small-set", b"aeiouAEI"),
+    ("single-nibble", b"abcdefghjl"),
+    ("any-byte", b"0123456789abcdef"),
+];
+
+fn best<T>(mut f: impl FnMut() -> T) -> f64 {
+    let mut best = f64::MAX;
+    for _ in 0..ROUNDS {
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            black_box(f());
+        }
+        best = best.min(start.elapsed().as_secs_f64() / f64::from(ITERS));
+    }
+    best
+}
+
+/// A haystack of `len` bytes that no set above matches, with `needles[0]` planted at offset 0
+/// when `hit`.
+fn haystack(len: usize, needles: &[u8], hit: bool) -> Vec<u8> {
+    let mut hay = vec![b'.'; len];
+    if hit && !hay.is_empty() {
+        hay[0] = needles[0];
+    }
+    hay
+}
+
+fn main() {
+    println!(
+        "{:>14} {:>12} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "set", "len", "build", "via-iter", "find", "oneshot", "overhead", "memchr"
+    );
+
+    for (name, needles) in SETS {
+        let build = best(|| MemchrN::new(black_box(needles)));
+        let prebuilt_finder = MemchrN::new(needles);
+
+        for hit in [true, false] {
+            for len in LENS {
+                let hay = haystack(len, needles, hit);
+                let hay = hay.as_slice();
+
+                let prebuilt = best(|| black_box(&prebuilt_finder).iter(black_box(hay)).next());
+                let direct = best(|| black_box(&prebuilt_finder).find(black_box(hay)));
+                let oneshot = best(|| MemchrN::new(black_box(needles)).find(black_box(hay)));
+                // `memchr` only spells the one-byte set, and spells it one-shot; the other
+                // rows have no counterpart to print.
+                let theirs = if needles.len() == 1 {
+                    best(|| memchr::memchr(black_box(needles[0]), black_box(hay)))
+                } else {
+                    f64::NAN
+                };
+
+                let label = if hit { "hit" } else { "miss" };
+                println!(
+                    "{:>14} {:>7}/{:<4} {:>7.1} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>9.1}",
+                    name,
+                    len,
+                    label,
+                    build * 1e9,
+                    prebuilt * 1e9,
+                    direct * 1e9,
+                    oneshot * 1e9,
+                    (oneshot - direct - build) * 1e9,
+                    theirs * 1e9,
+                );
+            }
+        }
+    }
+}

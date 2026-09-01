@@ -130,6 +130,52 @@ pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
     total
 }
 
+/// Returns the offset of the first matching byte of `haystack`.
+///
+/// The counterpart of [`crate::vector::find_first`], and the same saving over
+/// [`find_next`]. A mark sits at bit 7 of its own byte, so the first matching lane is
+/// `trailing_zeros() / 8` — [`movemask`]'s multiply is only worth paying where every bit is
+/// wanted, and here only the lowest is.
+#[inline]
+pub(crate) fn find_first<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize> {
+    /// The offset within a word of its first marked byte.
+    #[inline]
+    fn first_lane(marks: u64) -> usize {
+        debug_assert!(marks != 0);
+        marks.trailing_zeros() as usize / 8
+    }
+
+    let (words, tail) = haystack.as_chunks::<WORD_BYTES>();
+    let (pairs, words) = words.as_chunks::<2>();
+
+    let mut from = 0;
+    for [first_word, second_word] in pairs {
+        let first_match = kernel.matches(u64::from_le_bytes(*first_word));
+        let second_match = kernel.matches(u64::from_le_bytes(*second_word));
+        if (first_match | second_match) != 0 {
+            return Some(if first_match != 0 {
+                from + first_lane(first_match)
+            } else {
+                from + WORD_BYTES + first_lane(second_match)
+            });
+        }
+        from += 2 * WORD_BYTES;
+    }
+    for word in words {
+        let matches = kernel.matches(u64::from_le_bytes(*word));
+        if matches != 0 {
+            return Some(from + first_lane(matches));
+        }
+        from += WORD_BYTES;
+    }
+
+    if tail.is_empty() {
+        return None;
+    }
+    let bits = tail_bits(&kernel, haystack, tail);
+    (bits != 0).then(|| haystack.len() - tail.len() + bits.trailing_zeros() as usize)
+}
+
 #[inline]
 pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {
     let (haystack, mut from) = (state.haystack, state.pos);

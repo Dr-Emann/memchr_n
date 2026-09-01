@@ -176,7 +176,8 @@ impl MemchrN {
     /// Returns the offset of the first matching byte in `haystack`.
     #[inline]
     pub fn find(&self, haystack: &[u8]) -> Option<usize> {
-        self.iter(haystack).next()
+        // SAFETY: as in `Iter::next`.
+        unsafe { (self.scan.find_first)(&self.data, haystack) }
     }
 
     /// Returns an iterator over the offsets of every matching byte in `haystack`.
@@ -334,6 +335,14 @@ impl KernelData {
 struct Scan {
     find_next: unsafe fn(&KernelData, &mut IterState<'_>) -> MatchedBitset,
     count_all: unsafe fn(&KernelData, &mut IterState<'_>) -> usize,
+    /// [`MemchrN::find`]'s whole search, rather than the first refill of an iteration.
+    ///
+    /// Both of the above are shaped for an iterator that will call them again: they take the
+    /// [`IterState`] by pointer, which forces it to memory across the call, and they answer
+    /// in a [`MatchedBitset`] the caller has to unpack. A search that stops at the first
+    /// match wants neither, and pays for both — which on a short haystack is most of the
+    /// call.
+    find_first: unsafe fn(&KernelData, &[u8]) -> Option<usize>,
 }
 
 /// Builds the [`Scan`] for a vector kernel at one SIMD level.
@@ -399,12 +408,30 @@ fn vector_scan<S: Simd, K: vector::Kernel<S>>(simd: S) -> Scan {
         )
     }
 
-    // By taking a simd, we prove that it's safe for find_next/count_all to create one from thin
-    // air when they are called.
+    unsafe fn find_first<S: Simd, K: vector::Kernel<S>>(
+        data: &KernelData,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        // SAFETY: as above.
+        let simd = unsafe { token::<S>() };
+        simd.vectorize(
+            #[inline(always)]
+            move || {
+                // SAFETY: the `Scan` below stores this function only for the kind whose
+                // `KernelData` field `K` reads.
+                let kernel = unsafe { K::from_data(simd, data) };
+                vector::find_first(simd, haystack, kernel)
+            },
+        )
+    }
+
+    // By taking a simd, we prove that it's safe for the entry points above to create one from
+    // thin air when they are called.
     _ = simd;
     Scan {
         find_next: find_next::<S, K>,
         count_all: count_all::<S, K>,
+        find_first: find_first::<S, K>,
     }
 }
 
@@ -427,9 +454,16 @@ fn swar_scan<K: swar::Kernel>() -> Scan {
         total
     }
 
+    unsafe fn find_first<K: swar::Kernel>(data: &KernelData, haystack: &[u8]) -> Option<usize> {
+        // SAFETY: as above.
+        let kernel = unsafe { K::from_data(data) };
+        swar::find_first(haystack, kernel)
+    }
+
     Scan {
         find_next: find_next::<K>,
         count_all: count_all::<K>,
+        find_first: find_first::<K>,
     }
 }
 
@@ -456,9 +490,19 @@ fn bytewise_scan<K: bytewise::Kernel>() -> Scan {
         total
     }
 
+    unsafe fn find_first<K: bytewise::Kernel>(
+        data: &KernelData,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        // SAFETY: as above.
+        let kernel = unsafe { K::from_data(data) };
+        bytewise::find_first(haystack, kernel)
+    }
+
     Scan {
         find_next: find_next::<K>,
         count_all: count_all::<K>,
+        find_first: find_first::<K>,
     }
 }
 
@@ -474,9 +518,14 @@ fn never_scan() -> Scan {
         0
     }
 
+    fn find_first(_data: &KernelData, _haystack: &[u8]) -> Option<usize> {
+        None
+    }
+
     Scan {
         find_next,
         count_all,
+        find_first,
     }
 }
 
@@ -995,6 +1044,32 @@ mod tests {
                         vec![offset],
                         "len {len} offset {offset}"
                     );
+                    // `find` walks the pair itself rather than unpacking the iterator's
+                    // bits, so it has to pick the right half of one on its own.
+                    assert_eq!(
+                        searcher.find(&haystack),
+                        Some(offset),
+                        "find, len {len} offset {offset}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `find` duplicates the walk `Iter` does rather than driving it, so the two have to
+    /// agree everywhere — including on the tails, where each family reads bytes it has
+    /// already reported on.
+    #[test]
+    fn find_agrees_with_the_iterator() {
+        for set in sets() {
+            for (name, searcher) in [("vector", build(&set)), ("word", build_word(&set))] {
+                for len in (0..=80).chain([127, 128, 129, 191, 192, 255, 256, 1000]) {
+                    let haystack = haystack(len);
+                    assert_eq!(
+                        searcher.find(&haystack),
+                        searcher.iter(&haystack).next(),
+                        "{name} set {set:?} len {len}"
+                    );
                 }
             }
         }
@@ -1010,3 +1085,4 @@ mod tests {
         assert_eq!(searcher.iter(&haystack).count(), len);
     }
 }
+
