@@ -156,6 +156,18 @@ const KIND_SETS: &[(&str, ByteSet)] = &[
     ("any-byte-62", ByteSet::List(ALNUM)),
 ];
 
+/// The [`KIND_SETS`] sets again, resolved at compile time, to separate the two halves of
+/// building a finder: these pay only for choosing a kernel, not for collecting the bytes.
+const KIND_BYTES: &[(&str, Bytes)] = &[
+    ("never", Bytes::from_bytes(b"")),
+    ("one-byte", Bytes::from_bytes(b"z")),
+    ("one-range", Bytes::from_range(b'0'..=b'9')),
+    ("small-set", Bytes::from_bytes(b"aeiouAEI")),
+    ("single-nibble", Bytes::from_bytes(b"abcdefghjl")),
+    ("any-byte-16", Bytes::from_bytes(HEX_LOWER)),
+    ("any-byte-62", Bytes::from_bytes(ALNUM)),
+];
+
 const CORPORA: &[(&str, &[u8])] = &[
     ("sherlock", SHERLOCK_HUGE),
     ("subtitles-en", SUBTITLES_EN),
@@ -446,7 +458,14 @@ fn bench_find_first_sizes(c: &mut Criterion) {
 fn bench_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("build");
     for &(name, set) in KIND_SETS {
-        group.bench_function(name, |b| b.iter(|| black_box(set).finder(Backend::Auto)));
+        group.bench_function(BenchmarkId::new(name, "from-bytes"), |b| {
+            b.iter(|| black_box(set).finder(Backend::Auto))
+        });
+    }
+    for (name, bytes) in KIND_BYTES {
+        group.bench_function(BenchmarkId::new(*name, "from-set"), |b| {
+            b.iter(|| black_box(bytes).finder_with(Backend::Auto))
+        });
     }
     group.finish();
 }

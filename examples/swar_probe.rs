@@ -144,6 +144,11 @@ fn main() {
         ("common1 a", b"a"),
         ("common3 ato", b"ato"),
         ("verycommon1 sp", b" "),
+        ("never4 <>{}", b"<>{}"),
+        ("rare4 zQXJ", b"zQXJ"),
+        ("uncommon4 qjkx", b"qjkx"),
+        ("common4 atob", b"atob"),
+        ("verycommon5 sp+aeto", b" aeto"),
     ];
 
     println!("== iterate (sum of offsets)");
@@ -192,6 +197,14 @@ fn main() {
         let ours = best(ROUNDS, 2000, || f.iter(black_box(&hay[..])).next());
         let theirs = best(ROUNDS, 2000, || theirs_z.find(black_box(&hay[..])));
         ns_row(&format!("len {len}"), ours, theirs);
+    }
+
+    println!("== anybyte full scan, no match, by length (ns)");
+    for len in [4usize, 8, 16, 32, 64, 65, 72, 88, 96, 127, 128, 1024] {
+        let f = finder(b"<>{}");
+        let hay = &HAYSTACK[..len];
+        let ours = best(ROUNDS, 2000, || f.iter(black_box(hay)).next());
+        find_row(&format!("len {len}"), ours, None, len);
     }
 
     println!("== find first at a known early offset (ns)");

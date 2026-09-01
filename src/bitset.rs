@@ -62,23 +62,37 @@ impl Bitset {
         self.0[word_idx] & (1 << bit_idx) != 0
     }
 
-    pub(crate) fn extract_range(&self) -> Option<RangeInclusive<u8>> {
+    pub(crate) const fn count(&self) -> u32 {
+        let mut count = 0;
+        let mut i = 0;
+        while i < TABLE_BYTES {
+            count += self.0[i].count_ones();
+            i += 1;
+        }
+        count
+    }
+
+    pub(crate) const fn extract_range(&self) -> Option<RangeInclusive<u8>> {
         let mut first = None;
         let mut last = 0;
         let mut count = 0;
-        for (i, word) in self.as_u64s().enumerate() {
-            if word == 0 {
-                continue;
+        let mut i = 0;
+        while i < TABLE_BYTES / 8 {
+            let word = self.word(i);
+            if word != 0 {
+                let base = (i * 64) as u32;
+                if first.is_none() {
+                    first = Some(base + word.trailing_zeros());
+                }
+                last = base + 64 - 1 - word.leading_zeros();
+                count += word.count_ones();
             }
-            let base = (i * 64) as u32;
-            if first.is_none() {
-                first = Some(base + word.trailing_zeros());
-            }
-            last = base + 64 - 1 - word.leading_zeros();
-            count += word.count_ones();
+            i += 1;
         }
 
-        let first = first?;
+        let Some(first) = first else {
+            return None;
+        };
         // The set is a range exactly when its members fill the whole span they cover.
         if count != last - first + 1 {
             return None;
@@ -89,11 +103,19 @@ impl Bitset {
         })
     }
 
-    fn as_u64s(&self) -> impl Iterator<Item = u64> + use<'_> {
-        let (words, []) = self.0.as_chunks::<8>() else {
-            unreachable!()
-        };
-        words.iter().map(move |word| u64::from_le_bytes(*word))
+    /// The `i`th 64-bit word, assembled by hand because `as_chunks` is not `const`.
+    const fn word(&self, i: usize) -> u64 {
+        let b = i * 8;
+        u64::from_le_bytes([
+            self.0[b],
+            self.0[b + 1],
+            self.0[b + 2],
+            self.0[b + 3],
+            self.0[b + 4],
+            self.0[b + 5],
+            self.0[b + 6],
+            self.0[b + 7],
+        ])
     }
 }
 
