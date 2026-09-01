@@ -126,6 +126,36 @@ pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
     total
 }
 
+/// Returns the offset of the first matching byte of `haystack`.
+///
+/// The counterpart of [`crate::vector::find_first`]. A chunk's marks stay spread a byte
+/// apart, so the first match is read straight off the accumulator that holds it: the union
+/// already says which word to look in, and within a word a mark is at bit 7 of its own byte.
+/// [`pack_marks`] never runs.
+#[inline]
+pub(crate) fn find_first<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize> {
+    /// The offset within a chunk of its first marked byte.
+    #[inline]
+    fn first_mark(marks: [u64; WORDS]) -> usize {
+        for (i, word) in marks.into_iter().enumerate() {
+            if word != 0 {
+                return i * WORD_BYTES + word.trailing_zeros() as usize / 8;
+            }
+        }
+        unreachable!("only called for a chunk whose union is non-zero")
+    }
+
+    let (chunks, tail) = haystack.as_chunks::<CHUNK>();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let (marks, any) = chunk_marks(&kernel, chunk);
+        if any != 0 {
+            return Some(i * CHUNK + first_mark(marks));
+        }
+    }
+    let bits = tail_bits(&kernel, tail);
+    (bits != 0).then(|| haystack.len() - tail.len() + bits.trailing_zeros() as usize)
+}
+
 /// Scans from `from` for the first [`CHUNK`] that contains a match.
 #[inline]
 pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {

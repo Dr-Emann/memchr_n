@@ -2,76 +2,29 @@ use crate::bitset::Bitset;
 use crate::{ConstantNibble, Kind, NibbleLookup};
 use core::range::RangeInclusive;
 
-const ARRAY_MAX: usize = 24;
+/// The most bytes any [`Kind`] names one at a time. Past this a set is only ever a range or
+/// a bitset, neither of which needs its members listed.
+const MEMBERS_MAX: usize = 16;
 
-/// A set of bytes, kept in whichever of three representations the bytes added so far fit.
+/// A set of bytes, on the way to becoming a [`Kind`].
 ///
 /// Only a building block: [`MemchrN`](crate::MemchrN) collects a caller's bytes into one of
-/// these, asks it for a [`Kind`], and drops it. Nothing here survives into the
-/// searcher, so the representations exist purely to make collection cheap and to make
-/// [`kind`](Self::kind) able to tell a range or a small set from a scattered one.
+/// these, asks it for a [`Kind`], and drops it.
+///
+/// A bitset is the whole representation. It is what [`Kind::AnyByte`] wants as it stands,
+/// what a range check reads, and what makes collection a probe per byte with no branch on
+/// the answer — and the kinds that do want their bytes listed want at most sixteen of them,
+/// which [`Bitset::members`] walks out in one pass over the set bits.
 #[derive(Debug, Copy, Clone)]
-pub(crate) struct ByteSet(Repr);
-
-#[derive(Debug, Copy, Clone)]
-enum Repr {
-    Array { count: u8, arr: [u8; ARRAY_MAX] },
-    Range(RangeInclusive<u8>),
-    Bitset(Bitset),
-}
+pub(crate) struct ByteSet(Bitset);
 
 impl ByteSet {
     pub(crate) const fn new() -> Self {
-        Self(Repr::Array {
-            count: 0,
-            arr: [0; ARRAY_MAX],
-        })
+        Self(Bitset::new())
     }
 
     pub(crate) const fn from_bytes(bytes: &[u8]) -> Self {
-        // `add` dedups by scanning the array it has already filled, which is quadratic in
-        // the input. That is cheapest for an input the array could hold, and increasingly
-        // wasteful past it, so longer inputs dedup through a bitset instead.
-        if bytes.len() <= ARRAY_MAX {
-            let mut res = Self::new();
-            let mut i = 0;
-            while i < bytes.len() {
-                res.add(bytes[i]);
-                i += 1;
-            }
-            return res;
-        }
-
-        let mut seen = Bitset::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            seen.add(bytes[i]);
-            i += 1;
-        }
-
-        if seen.count() as usize > ARRAY_MAX {
-            return Self(match seen.extract_range() {
-                Some(range) => Repr::Range(range),
-                None => Repr::Bitset(seen),
-            });
-        }
-
-        // Few enough distinct bytes to keep the array representation, and with it the kinds
-        // only the array reaches. Refill it in first-appearance order, as `add` would have.
-        let mut arr = [0; ARRAY_MAX];
-        let mut count = 0;
-        let mut emitted = Bitset::new();
-        let mut i = 0;
-        while i < bytes.len() {
-            let byte = bytes[i];
-            if !emitted.contains(byte) {
-                emitted.add(byte);
-                arr[count as usize] = byte;
-                count += 1;
-            }
-            i += 1;
-        }
-        Self(Repr::Array { count, arr })
+        Self(Bitset::from_bytes(bytes))
     }
 
     // Intentionally take a ops::RangeInclusive rather than a range::RangeInclusive.
@@ -86,112 +39,14 @@ impl ByteSet {
     }
 
     pub(crate) const fn add(&mut self, item: u8) {
-        match &mut self.0 {
-            Repr::Array { count, arr } => {
-                let len = *count as usize;
-                // Not worth keeping sorted/binary searching vs linear search on 24 items
-                let mut i = 0;
-                while i < len {
-                    if arr[i] == item {
-                        return;
-                    }
-                    i += 1;
-                }
-                if len < ARRAY_MAX {
-                    arr[len] = item;
-                    *count += 1;
-                } else {
-                    self.0 = if let Some(range) = disjoint_items_to_range(item, arr) {
-                        Repr::Range(range)
-                    } else {
-                        let mut bitset = Bitset::from_bytes(arr);
-                        bitset.add(item);
-                        Repr::Bitset(bitset)
-                    };
-                }
-            }
-            Repr::Range(range) => {
-                if let Some(x) = range.start.checked_sub(1)
-                    && x == item
-                {
-                    range.start = item;
-                } else if let Some(x) = range.last.checked_add(1)
-                    && x == item
-                {
-                    range.last = item;
-                } else if item < range.start || item > range.last {
-                    let mut bitset = Bitset::new();
-                    bitset.add_range(*range);
-                    bitset.add(item);
-                    self.0 = Repr::Bitset(bitset);
-                }
-            }
-            Repr::Bitset(bitset) => {
-                bitset.add(item);
-            }
-        }
+        self.0.add(item);
     }
 
     /// Adds every byte from `range.start` through `range.last`, inclusive.
     ///
     /// An empty range (one whose `start` is past its `last`) adds nothing.
     pub(crate) const fn add_range(&mut self, range: RangeInclusive<u8>) {
-        let RangeInclusive { start, last } = range;
-        if start > last {
-            return;
-        }
-        match self.0 {
-            // A range too wide to fit the array cannot end up in it, so adding it a byte at
-            // a time would only rediscover that after up to 256 inserts.
-            Repr::Array { count, arr } if (last - start) as usize >= ARRAY_MAX => {
-                let mut bitset = Bitset::from_bytes(arr.split_at(count as usize).0);
-                bitset.add_range(range);
-                self.0 = match bitset.extract_range() {
-                    Some(range) => Repr::Range(range),
-                    None => Repr::Bitset(bitset),
-                };
-            }
-            // One at a time, so a range small enough to stay in the array keeps the
-            // representations only the array can reach.
-            Repr::Array { .. } => {
-                let mut item = start;
-                loop {
-                    self.add(item);
-                    if item == last {
-                        return;
-                    }
-                    item += 1;
-                }
-            }
-            Repr::Range(existing) => {
-                // Two ranges stay one range only if they overlap or touch.
-                if start <= existing.last.saturating_add(1)
-                    && existing.start <= last.saturating_add(1)
-                {
-                    self.0 = Repr::Range(RangeInclusive {
-                        start: if start < existing.start {
-                            start
-                        } else {
-                            existing.start
-                        },
-                        last: if last > existing.last {
-                            last
-                        } else {
-                            existing.last
-                        },
-                    });
-                } else {
-                    let mut bitset = Bitset::new();
-                    bitset.add_range(existing);
-                    bitset.add_range(range);
-                    self.0 = Repr::Bitset(bitset);
-                }
-            }
-            Repr::Bitset(mut bitset) => {
-                bitset.add_range(range);
-                self.0 = Repr::Bitset(bitset);
-            }
-        }
+        self.0.add_range(range);
     }
 
     /// Picks the kind that matches this set most cheaply.
@@ -199,43 +54,36 @@ impl ByteSet {
     /// `fast_shuffles` gates the kinds a kernel can only scan by shuffling bytes within a
     /// vector: unset for a target whose shuffles are slow, and for the word kernels, which
     /// have none.
+    ///
+    /// The order is by preference, not by cost to test: the earlier arms match fewer sets
+    /// but scan faster, so a set that reaches one has already been ruled out of everything
+    /// above it.
     pub(crate) fn kind(&self, fast_shuffles: bool) -> Kind {
-        match self.0 {
-            Repr::Array { count: 0, arr: _ } => Kind::Never,
+        let mut members = [0; MEMBERS_MAX];
+        let Some(count) = self.0.members(&mut members) else {
+            // Too many members for any kind that names them. A range is still worth
+            // recognising: it is two comparisons per byte however wide it is.
+            return match self.0.extract_range() {
+                Some(range) => Kind::OneRange(range),
+                None => Kind::AnyByte(self.0),
+            };
+        };
+        let members = &members[..usize::from(count)];
 
-            // 1-3 bytes
-            Repr::Array {
-                count: 1,
-                arr: [item1, ..],
-            } => Kind::OneByte(item1),
-            Repr::Array {
-                count: 2,
-                arr: [item1, item2, ..],
-            } => Kind::TwoBytes([item1, item2]),
-            Repr::Array {
-                count: 3,
-                arr: [item1, item2, item3, ..],
-            } => Kind::ThreeBytes([item1, item2, item3]),
-
-            // Ranges
-            Repr::Array { count, ref arr }
-                if let Some(range) = disjoint_slice_to_range(&arr[..usize::from(count)]) =>
-            {
-                Kind::OneRange(range)
+        match *members {
+            [] => Kind::Never,
+            [item] => Kind::OneByte(item),
+            [first, last] => Kind::TwoBytes([first, last]),
+            [first, second, third] => Kind::ThreeBytes([first, second, third]),
+            // `members` is ascending and distinct, so the set is contiguous exactly when it
+            // fills the span from its first to its last.
+            [first, .., last] if usize::from(last - first) + 1 == members.len() => {
+                Kind::OneRange(RangeInclusive { start: first, last })
             }
-            Repr::Range(range) => Kind::OneRange(range),
-            Repr::Bitset(bitset) if let Some(range) = bitset.extract_range() => {
-                Kind::OneRange(range)
-            }
-
-            // Small set
-            Repr::Array {
-                count: count @ ..=8,
-                ref arr,
-            } if fast_shuffles => {
+            _ if fast_shuffles && members.len() <= 8 => {
                 let mut lo_lookup = NibbleLookup::default();
                 let mut hi_lookup = NibbleLookup::default();
-                for (i, &item) in arr[..usize::from(count)].iter().enumerate() {
+                for (i, &item) in members.iter().enumerate() {
                     lo_lookup.set(item & 0x0F, i as u8);
                     hi_lookup.set(item >> 4, i as u8);
                 }
@@ -244,116 +92,53 @@ impl ByteSet {
                     hi_lookup,
                 }
             }
-
-            // Constant Nibble
-            Repr::Array {
-                count: count @ ..=16,
-                ref arr,
-            } if fast_shuffles
-                && let Some((nibble, lookup)) = constant_nibble(&arr[..usize::from(count)]) =>
+            _ if fast_shuffles
+                && let Some((nibble, lookup)) = constant_nibble(members) =>
             {
                 Kind::ConstantNibble(nibble, lookup)
             }
-
-            // Bitset-based any byte
-            Repr::Array { count, ref arr } => {
-                Kind::AnyByte(Bitset::from_bytes(&arr[..usize::from(count)]))
-            }
-            Repr::Bitset(bitset) => Kind::AnyByte(bitset),
+            _ => Kind::AnyByte(self.0),
         }
     }
 }
 
-const fn disjoint_slice_to_range(arr: &[u8]) -> Option<RangeInclusive<u8>> {
-    let Some((&first, rest)) = arr.split_first() else {
-        return None;
-    };
-    disjoint_items_to_range(first, rest)
-}
-
-const fn disjoint_items_to_range(first_item: u8, arr: &[u8]) -> Option<RangeInclusive<u8>> {
-    // All items must be unique.
-    if cfg!(debug_assertions) {
-        let mut i = 0;
-        while i < arr.len() {
-            assert!(arr[i] != first_item, "items must be disjoint");
-            i += 1;
-        }
-
-        let mut i = 0;
-
-        while i < arr.len() {
-            let mut j = i + 1;
-            while j < arr.len() {
-                assert!(arr[i] != arr[j], "items must be disjoint");
-                j += 1;
-            }
-            i += 1;
-        }
-    }
-    let mut min = first_item;
-    let mut max = first_item;
-
-    let mut i = 0;
-    while i < arr.len() {
-        let item = arr[i];
-        if item < min {
-            min = item;
-        }
-        if item > max {
-            max = item;
-        }
-        i += 1;
-    }
-    // Since all items are unique, this is a contiguous range if the distance between min and max
-    // is equal to the number of items - 1
-    if (max - min) as usize == arr.len() {
-        Some(RangeInclusive {
-            start: min,
-            last: max,
-        })
-    } else {
-        None
-    }
-}
-
+/// The table [`crate::vector::kernels::SingleNibble`] shuffles, if every byte of `items`
+/// agrees on one of its nibbles.
+///
+/// Deciding costs one pass with no branch on the answer, and only the winning table is then
+/// filled — testing and building together, as this used to, meant carrying two half-built
+/// tables through the loop and a branch per item per table.
 fn constant_nibble(items: &[u8]) -> Option<(ConstantNibble, [u8; 16])> {
     let first = *items.first()?;
-    let lo_nibble = first & 0x0F;
-    let hi_nibble = first >> 4;
-    // Unfilled slots need a sentinel that can never match: slot `i` is only ever
-    // compared against bytes whose variable nibble is `i`, so the sentinel's own
-    // variable nibble must differ from its index. 0x00 satisfies that everywhere
-    // except slot 0, hence the special case — the variable nibble is the high one
-    // for lo_table and the low one for hi_table.
-    let mut lo_table: Option<[u8; 16]> = Some(core::array::from_fn(|i| u8::from(i == 0) << 4));
-    let mut hi_table: Option<[u8; 16]> = Some(core::array::from_fn(|i| u8::from(i == 0)));
+    let (lo_nibble, hi_nibble) = (first & 0x0F, first >> 4);
 
+    let (mut lo_constant, mut hi_constant) = (true, true);
     for &item in items {
-        let lo = item & 0x0F;
-        let hi = item >> 4;
-        if let Some(table) = &mut lo_table
-            && lo == lo_nibble
-        {
-            table[hi as usize] = item;
-        } else {
-            lo_table = None;
-        }
-        if let Some(table) = &mut hi_table
-            && hi == hi_nibble
-        {
-            table[lo as usize] = item;
-        } else {
-            hi_table = None;
-        }
-        if lo_table.is_none() && hi_table.is_none() {
-            return None;
-        }
+        lo_constant &= item & 0x0F == lo_nibble;
+        hi_constant &= item >> 4 == hi_nibble;
     }
-    if let Some(table) = lo_table {
+
+    // Unfilled slots need a sentinel that can never match: slot `i` is only ever compared
+    // against bytes whose variable nibble is `i`, so the sentinel's own variable nibble must
+    // differ from its index. 0x00 satisfies that everywhere except slot 0, hence the one
+    // filled slot below — the variable nibble is the high one for a constant low nibble, and
+    // the low one for a constant high one.
+    if lo_constant {
+        let mut table = [0; 16];
+        table[0] = 0x10;
+        for &item in items {
+            table[usize::from(item >> 4)] = item;
+        }
         Some((ConstantNibble::Lo, table))
+    } else if hi_constant {
+        let mut table = [0; 16];
+        table[0] = 0x01;
+        for &item in items {
+            table[usize::from(item & 0x0F)] = item;
+        }
+        Some((ConstantNibble::Hi, table))
     } else {
-        hi_table.map(|table| (ConstantNibble::Hi, table))
+        None
     }
 }
 

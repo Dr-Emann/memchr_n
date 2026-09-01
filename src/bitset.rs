@@ -62,16 +62,6 @@ impl Bitset {
         self.0[word_idx] & (1 << bit_idx) != 0
     }
 
-    pub(crate) const fn count(&self) -> u32 {
-        let mut count = 0;
-        let mut i = 0;
-        while i < TABLE_BYTES {
-            count += self.0[i].count_ones();
-            i += 1;
-        }
-        count
-    }
-
     pub(crate) const fn extract_range(&self) -> Option<RangeInclusive<u8>> {
         let mut first = None;
         let mut last = 0;
@@ -101,6 +91,29 @@ impl Bitset {
             start: first as u8,
             last: last as u8,
         })
+    }
+
+    /// Writes this set's members, ascending, into the front of `out`, and returns how many
+    /// there were. Nothing is written past `out`, and `None` says the set does not fit.
+    ///
+    /// Walks set bits rather than byte values, so the cost is the membership rather than the
+    /// 256 values it is drawn from.
+    pub(crate) const fn members<const N: usize>(&self, out: &mut [u8; N]) -> Option<u8> {
+        let mut count = 0;
+        let mut i = 0;
+        while i < TABLE_BYTES / 8 {
+            let mut word = self.word(i);
+            while word != 0 {
+                if count == N {
+                    return None;
+                }
+                out[count] = (i * 64) as u8 + word.trailing_zeros() as u8;
+                word &= word - 1;
+                count += 1;
+            }
+            i += 1;
+        }
+        Some(count as u8)
     }
 
     /// The `i`th 64-bit word, assembled by hand because `as_chunks` is not `const`.

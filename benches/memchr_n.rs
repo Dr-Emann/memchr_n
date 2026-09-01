@@ -321,7 +321,7 @@ fn bench_find_first(c: &mut Criterion) {
     for &(name, set) in DENSITY_SETS {
         let finder = verified_finder(set, Backend::Auto, SHERLOCK_HUGE, name);
         group.bench_with_input(BenchmarkId::new(OURS, name), &finder, |b, finder| {
-            b.iter(|| black_box(finder).iter(black_box(SHERLOCK_HUGE)).next())
+            b.iter(|| black_box(finder).find(black_box(SHERLOCK_HUGE)))
         });
         let Some(needles) = verified_needles(set, SHERLOCK_HUGE, name) else {
             continue;
@@ -329,6 +329,30 @@ fn bench_find_first(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new(THEIRS, name), &needles, |b, &needles| {
             b.iter(|| black_box(needles).first(black_box(SHERLOCK_HUGE)))
         });
+    }
+    group.finish();
+}
+
+/// `find` against the iterator it used to be, on haystacks short enough that the per-call
+/// cost is the whole measurement.
+///
+/// This is where the two differ: `Iter::next` hands its state to the scan by pointer and
+/// takes back a bitmask to unpack, both of which a search that stops at the first match
+/// pays for and does not use.
+fn bench_first_call(c: &mut Criterion) {
+    let mut group = c.benchmark_group("first-call");
+    for &(name, set) in KIND_SETS {
+        let finder = set.finder(Backend::Auto);
+        for len in [8usize, 16, 64, 256] {
+            let haystack = &SHERLOCK_HUGE[..len];
+            let param = format!("{name}/{len}");
+            group.bench_with_input(BenchmarkId::new("find", &param), &finder, |b, finder| {
+                b.iter(|| black_box(finder).find(black_box(haystack)))
+            });
+            group.bench_with_input(BenchmarkId::new("iter-next", &param), &finder, |b, finder| {
+                b.iter(|| black_box(finder).iter(black_box(haystack)).next())
+            });
+        }
     }
     group.finish();
 }
@@ -462,5 +486,6 @@ criterion_group!(
     bench_sizes,
     bench_find_first_sizes,
     bench_build,
+    bench_first_call,
 );
 criterion_main!(benches);

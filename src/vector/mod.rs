@@ -108,6 +108,59 @@ pub(crate) fn find_next<S: Simd, K: Kernel<S>>(
     }
 }
 
+/// Returns the offset of the first matching byte of `haystack`.
+///
+/// The same walk as [`find_next`], with everything an iterator would need afterwards left
+/// out: no [`IterState`] to write back, and a bitmask extracted only for the one unit that
+/// matched, whose lowest set bit is the answer. Both halves of a matching pair still share
+/// one [`any_true`](fearless_simd::SimdMask::any_true), for the reason [`find_next`] gives.
+#[inline(always)]
+pub(crate) fn find_first<S: Simd, K: Kernel<S>>(
+    simd: S,
+    haystack: &[u8],
+    kernel: K,
+) -> Option<usize> {
+    let (chunks, tail) = haystack.as_chunks::<CHUNK_BYTES>();
+    let (pairs, rest) = chunks.as_chunks::<2>();
+
+    let mut from = 0;
+    for [first, second] in pairs {
+        let matched_first = kernel.matches(u8x64::load_array_ref(simd, first));
+        let matched_second = kernel.matches(u8x64::load_array_ref(simd, second));
+        if (matched_first | matched_second).any_true() {
+            let bits = matched_first.to_bitmask();
+            return Some(if bits != 0 {
+                from + bits.trailing_zeros() as usize
+            } else {
+                from + CHUNK_BYTES + matched_second.to_bitmask().trailing_zeros() as usize
+            });
+        }
+        from += 2 * CHUNK_BYTES;
+    }
+
+    if let [chunk] = rest {
+        let matched = kernel.matches(u8x64::load_array_ref(simd, chunk));
+        if matched.any_true() {
+            return Some(from + matched.to_bitmask().trailing_zeros() as usize);
+        }
+        from += CHUNK_BYTES;
+    }
+
+    let (blocks, tail) = tail.as_chunks::<BLOCK_BYTES>();
+    for block in blocks {
+        let matched = kernel.matches(u8x16::load_array_ref(simd, block));
+        if matched.any_true() {
+            return Some(from + matched.to_bitmask().trailing_zeros() as usize);
+        }
+        from += BLOCK_BYTES;
+    }
+    if tail.is_empty() {
+        return None;
+    }
+    let bits = tail_bits(simd, &kernel, haystack, tail);
+    (bits != 0).then(|| haystack.len() - tail.len() + bits.trailing_zeros() as usize)
+}
+
 /// Counts every matching byte of `haystack`.
 #[inline(always)]
 pub(crate) fn count<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) -> usize {
