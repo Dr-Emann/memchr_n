@@ -30,13 +30,49 @@ impl Bytes {
     }
 
     pub const fn from_bytes(bytes: &[u8]) -> Self {
-        let mut res = Self::new();
+        // `add` dedups by scanning the array it has already filled, which is quadratic in
+        // the input. That is cheapest for an input the array could hold, and increasingly
+        // wasteful past it, so longer inputs dedup through a bitset instead.
+        if bytes.len() <= ARRAY_MAX {
+            let mut res = Self::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                res.add(bytes[i]);
+                i += 1;
+            }
+            return res;
+        }
+
+        let mut seen = Bitset::new();
         let mut i = 0;
         while i < bytes.len() {
-            res.add(bytes[i]);
+            seen.add(bytes[i]);
             i += 1;
         }
-        res
+
+        if seen.count() as usize > ARRAY_MAX {
+            return Self(match seen.extract_range() {
+                Some(range) => BytesRepr::Range(range),
+                None => BytesRepr::Bitset(seen),
+            });
+        }
+
+        // Few enough distinct bytes to keep the array representation, and with it the kinds
+        // only the array reaches. Refill it in first-appearance order, as `add` would have.
+        let mut arr = [0; ARRAY_MAX];
+        let mut count = 0;
+        let mut emitted = Bitset::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if !emitted.contains(byte) {
+                emitted.add(byte);
+                arr[count as usize] = byte;
+                count += 1;
+            }
+            i += 1;
+        }
+        Self(BytesRepr::Array { count, arr })
     }
 
     // Intentionally take a ops::RangeInclusive rather than a range::RangeInclusive.
@@ -106,6 +142,16 @@ impl Bytes {
             return;
         }
         match self.0 {
+            // A range too wide to fit the array cannot end up in it, so adding it a byte at
+            // a time would only rediscover that after up to 256 inserts.
+            BytesRepr::Array { count, arr } if (last - start) as usize >= ARRAY_MAX => {
+                let mut bitset = Bitset::from_bytes(arr.split_at(count as usize).0);
+                bitset.add_range(range);
+                self.0 = match bitset.extract_range() {
+                    Some(range) => BytesRepr::Range(range),
+                    None => BytesRepr::Bitset(bitset),
+                };
+            }
             // One at a time, so a range small enough to stay in the array keeps the
             // representations only the array can reach.
             BytesRepr::Array { .. } => {

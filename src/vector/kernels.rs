@@ -1,4 +1,4 @@
-use super::{aarch64_swizzle_32_to_16, Kernel};
+use super::Kernel;
 use crate::bitset::Bitset;
 use crate::{ConstantNibble, KernelData, NibbleLookup};
 use fearless_simd::prelude::*;
@@ -157,7 +157,7 @@ fn membership_bits<S: Simd, V: SimdInt<S, Element = u8, ByteVector = V>>(
             // TODO: When concat_swizzle_dyn is available, use it
             #[cfg(target_arch = "aarch64")]
             if let Some(neon) = simd.level().as_neon() {
-                let res = aarch64_swizzle_32_to_16(neon, table.into(), indices.into());
+                let res = super::aarch64_swizzle_32_to_16(neon, table.into(), indices.into());
                 return V::from_slice(simd, &res);
             }
             let res = table.swizzle_dyn(indices.combine(indices)).split().0;

@@ -1,8 +1,11 @@
 pub(crate) mod kernels;
 
-use crate::{CHUNK_BYTES, IterState, KernelData, MatchedBitset};
+use crate::{IterState, KernelData, MatchedBitset};
 use fearless_simd::prelude::*;
 use fearless_simd::{Level, i8x16, i8x64, kernel, u8x16, u8x32, u8x64};
+
+const CHUNK_BYTES: usize = 64;
+const _: () = assert!(MatchedBitset::BITS as usize >= CHUNK_BYTES * 2);
 
 const BLOCK_BYTES: usize = 16;
 

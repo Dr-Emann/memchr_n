@@ -14,15 +14,10 @@ use core::mem::transmute_copy;
 use core::range::RangeInclusive;
 use fearless_simd::{Level, Simd, dispatch};
 
-/// Bytes matched per kernel invocation.
-const CHUNK_BYTES: usize = 64;
-
 /// Matches of one scan, the `i`th bit (numbered from lsb to msb) is 1 if the `i`th byte matched
 ///
 /// Wide enough for the two [`CHUNK_BYTES`]s that [`vector::find_next`] scans per iteration.
 type MatchedBitset = u128;
-
-const _: () = assert!(MatchedBitset::BITS as usize >= CHUNK_BYTES * 2);
 
 /// Which family of kernels a [`Finder`] is built from.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
@@ -605,6 +600,73 @@ mod tests {
             .collect()
     }
 
+    /// Both halves must agree on the kernel, not just the set: a bitset that covers a span
+    /// exactly still has to reach [`FinderKind::OneRange`], and few enough distinct bytes
+    /// still have to reach the kinds only the array representation can name.
+    fn assert_same_set_and_kernel(bulk: &Bytes, one_at_a_time: &Bytes, case: &str) {
+        assert_eq!(members(bulk), members(one_at_a_time), "{case}");
+        for backend in [Backend::Auto, Backend::Scalar] {
+            assert_eq!(
+                format!("{:?}", bulk.finder_with(backend)),
+                format!("{:?}", one_at_a_time.finder_with(backend)),
+                "{case} on {backend:?}"
+            );
+        }
+    }
+
+    /// Past `ARRAY_MAX`, `from_bytes` dedups through a bitset rather than by rescanning the
+    /// array, and has to land where the byte-at-a-time insert would.
+    #[test]
+    fn from_bytes_matches_adding_each_byte() {
+        let alnum: Vec<u8> = (b'0'..=b'9')
+            .chain(b'a'..=b'z')
+            .chain(b'A'..=b'Z')
+            .collect();
+        let mut contiguous_out_of_order: Vec<u8> = (0..=23).collect();
+        contiguous_out_of_order.push(100);
+        contiguous_out_of_order.extend(24..=99);
+
+        let cases: &[(&str, Vec<u8>)] = &[
+            ("62 alnum, scattered", alnum),
+            ("0..=200 contiguous", (0..=200).collect()),
+            ("every byte", (0..=u8::MAX).collect()),
+            ("60 bytes, 3 distinct", b"cba".repeat(20)),
+            ("60 bytes, 1 distinct", b"z".repeat(60)),
+            ("100 bytes, 24 distinct", (0..100).map(|i| i % 24).collect()),
+            ("100 bytes, 25 distinct", (0..100).map(|i| i % 25).collect()),
+            ("contiguous, out of order", contiguous_out_of_order),
+            ("25 scattered", (0..25).map(|i: u8| i.wrapping_mul(7)).collect()),
+            ("exactly ARRAY_MAX + 1", (0..25).collect()),
+        ];
+
+        for (case, bytes) in cases {
+            let mut one_at_a_time = Bytes::new();
+            for &byte in bytes {
+                one_at_a_time.add(byte);
+            }
+            assert_same_set_and_kernel(&Bytes::from_bytes(bytes), &one_at_a_time, case);
+        }
+    }
+
+    /// The same, for the range fast path taken when the array already holds something.
+    #[test]
+    fn add_wide_range_to_non_empty_matches_adding_each_byte() {
+        let seeds: &[&[u8]] = &[b"", b"z", b"\x00", b"\x7f", b"az", b"\x00\xff", b"aeiouAEI"];
+        for seed in seeds {
+            for (start, last) in [(0u8, 255u8), (0x80, 0xFF), (10, 40), (100, 124), (60, 200)] {
+                let mut ranged = Bytes::from_bytes(seed);
+                ranged.add_range(RangeInclusive { start, last });
+
+                let mut one_at_a_time = Bytes::from_bytes(seed);
+                for byte in start..=last {
+                    one_at_a_time.add(byte);
+                }
+                let case = format!("{seed:?} + {start}..={last}");
+                assert_same_set_and_kernel(&ranged, &one_at_a_time, &case);
+            }
+        }
+    }
+
     #[test]
     fn bytes_add_range_matches_adding_each_byte() {
         for start in 0..=u8::MAX {
@@ -888,7 +950,7 @@ mod tests {
     #[test]
     fn counts_do_not_overflow_the_accumulator() {
         let finder = build(b"x");
-        let len = CHUNK_BYTES * (512 + 3);
+        let len = 64 * (512 + 3);
         let haystack = vec![b'x'; len];
         assert_eq!(finder.iter(&haystack).count(), len);
     }

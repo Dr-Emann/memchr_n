@@ -17,19 +17,6 @@ pub(crate) mod kernels;
 use crate::swar::{WORD_BYTES, movemask};
 use crate::{IterState, KernelData, MatchedBitset};
 
-/// Bytes marked between one gate check and the next.
-///
-/// Deliberately not [`crate::CHUNK_BYTES`]. The wide families chunk at their vector width
-/// because that is what one kernel call covers; this one has no width to match, so the size is
-/// a tuning knob, and 64 is not where it belongs.
-///
-/// Two costs pull against each other. Marking runs past the first match to the end of the
-/// chunk, and a search that stops at that match throws the rest away, so `Finder::find` costs
-/// roughly 0.4ns per byte of chunk. Against that, `Iter::next` refills once per chunk through a
-/// function pointer it cannot inline, so a dense haystack pays about 10ns of call overhead per
-/// chunk. Measured on sherlock, 64 is the best size for iterating a dense byte class and the
-/// worst for finding one match; 8 inverts both. 32 gives up a quarter of the dense-iteration
-/// throughput to halve the cost of a find, and has the lowest full-scan latency of any size.
 const CHUNK: usize = 32;
 
 /// Accumulators one chunk's marks are spread across.
@@ -142,7 +129,7 @@ pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
 /// Scans from `from` for the first [`CHUNK`] that contains a match.
 #[inline]
 pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {
-    let (haystack, from) = (state.haystack, state.pos);
+    let (haystack, mut from) = (state.haystack, state.pos);
     // SAFETY: as in `crate::vector::find_next`.
     let unscanned = unsafe { haystack.get_unchecked(from..) };
     let (chunks, tail) = unscanned.as_chunks::<CHUNK>();
@@ -159,6 +146,7 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> Matc
             state.pos = from + CHUNK;
             return pack_marks(marks).into();
         }
+        from += CHUNK;
     }
 
     for (i, chunk) in chunks {
