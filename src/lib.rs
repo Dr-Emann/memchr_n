@@ -1,14 +1,13 @@
 #![deny(unnameable_types, unreachable_pub)]
 
 mod bitset;
-mod bytes;
+mod byte_set;
 mod bytewise;
 mod swar;
 mod vector;
 
-pub use bytes::Bytes;
-
 use crate::bitset::Bitset;
+use crate::byte_set::ByteSet;
 use core::fmt;
 use core::mem::transmute_copy;
 use core::range::RangeInclusive;
@@ -19,7 +18,7 @@ use fearless_simd::{Level, Simd, dispatch};
 /// Wide enough for the two [`CHUNK_BYTES`]s that [`vector::find_next`] scans per iteration.
 type MatchedBitset = u128;
 
-/// Which family of kernels a [`Finder`] is built from.
+/// Which family of kernels a [`MemchrN`] is built from.
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Backend {
@@ -33,11 +32,17 @@ pub enum Backend {
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     // Part of the public contract, and cheap to keep from regressing.
-    assert_send_sync::<Finder>();
+    assert_send_sync::<MemchrN>();
 };
 
+/// A searcher for a fixed set of bytes.
+///
+/// The set is fixed at construction, which is what lets everything about the search be
+/// decided there too: the representation the bytes are collected into, the kernel that
+/// matches them, and the data that kernel reads. Nothing about the set is recoverable
+/// afterwards, and nothing can be added to it.
 #[derive(Clone)]
-pub struct Finder {
+pub struct MemchrN {
     /// Kept, with `family` and `kind`, only for [`Debug`]; `data` and `scan` are what
     /// searching goes through.
     level: Level,
@@ -47,9 +52,9 @@ pub struct Finder {
     scan: Scan,
 }
 
-impl fmt::Debug for Finder {
+impl fmt::Debug for MemchrN {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Finder")
+        f.debug_struct("MemchrN")
             .field("level", &self.level)
             .field("family", &self.family)
             .field("kind", &self.kind)
@@ -58,7 +63,7 @@ impl fmt::Debug for Finder {
 }
 
 #[derive(Copy, Clone, Debug)]
-enum FinderKind {
+enum Kind {
     AnyByte(Bitset),
     SmallSet {
         lo_lookup: NibbleLookup,
@@ -72,7 +77,7 @@ enum FinderKind {
     Never,
 }
 
-/// Which [`FinderKind`] a [`Finder`] was built from, less the payload that [`KernelData`]
+/// Which [`Kind`] a [`MemchrN`] was built from, less the payload that [`KernelData`]
 /// holds in the shape its kernel wants.
 ///
 /// The payload cannot be recovered from [`KernelData`] in every case — `swar`'s `OneRange`
@@ -92,29 +97,73 @@ enum KindTag {
 }
 
 impl KindTag {
-    fn of(kind: FinderKind) -> Self {
+    fn of(kind: Kind) -> Self {
         match kind {
-            FinderKind::AnyByte(_) => Self::AnyByte,
-            FinderKind::SmallSet { .. } => Self::SmallSet,
-            FinderKind::ConstantNibble(..) => Self::ConstantNibble,
-            FinderKind::OneByte(_) => Self::OneByte,
-            FinderKind::TwoBytes(_) => Self::TwoBytes,
-            FinderKind::ThreeBytes(_) => Self::ThreeBytes,
-            FinderKind::OneRange(_) => Self::OneRange,
-            FinderKind::Never => Self::Never,
+            Kind::AnyByte(_) => Self::AnyByte,
+            Kind::SmallSet { .. } => Self::SmallSet,
+            Kind::ConstantNibble(..) => Self::ConstantNibble,
+            Kind::OneByte(_) => Self::OneByte,
+            Kind::TwoBytes(_) => Self::TwoBytes,
+            Kind::ThreeBytes(_) => Self::ThreeBytes,
+            Kind::OneRange(_) => Self::OneRange,
+            Kind::Never => Self::Never,
         }
     }
 }
 
-/// Which kernels a [`Finder`] runs, resolved from [`Backend`] and the level.
+/// Which kernels a [`MemchrN`] runs, resolved from [`Backend`] and the level.
 #[derive(Copy, Clone, Debug)]
 enum Family {
     Vector,
     Word,
 }
 
-impl Finder {
-    fn new(level: Level, family: Family, kind: FinderKind) -> Self {
+impl MemchrN {
+    /// Builds a searcher for the distinct bytes of `bytes`, on the best kernels the running
+    /// CPU supports.
+    ///
+    /// Repeats are ignored, so the set is the bytes present, not how many times each
+    /// appears.
+    #[inline]
+    pub fn new(bytes: &[u8]) -> Self {
+        Self::new_with(bytes, Backend::Auto)
+    }
+
+    /// [`new`](Self::new), on a chosen [`Backend`].
+    pub fn new_with(bytes: &[u8], backend: Backend) -> Self {
+        Self::from_set(ByteSet::from_bytes(bytes), backend)
+    }
+
+    /// Builds a searcher for every byte from the start of `range` through its end,
+    /// inclusive.
+    ///
+    /// An empty range matches nothing.
+    #[inline]
+    pub fn from_range(range: core::ops::RangeInclusive<u8>) -> Self {
+        Self::from_range_with(range, Backend::Auto)
+    }
+
+    /// [`from_range`](Self::from_range), on a chosen [`Backend`].
+    pub fn from_range_with(range: core::ops::RangeInclusive<u8>, backend: Backend) -> Self {
+        Self::from_set(ByteSet::from_range(range), backend)
+    }
+
+    /// Resolves a collected set down to the one kernel that will scan for it.
+    ///
+    /// Every choice the search depends on is made here: the family, whether the target's
+    /// byte shuffles are worth the kinds that need them, the kind itself, and from that
+    /// pair the kernel's data and its entry points.
+    fn from_set(set: ByteSet, backend: Backend) -> Self {
+        let level = Level::new();
+        let family = match backend {
+            Backend::Scalar => Family::Word,
+            Backend::Auto if level.is_fallback() => Family::Word,
+            Backend::Auto => Family::Vector,
+        };
+        // A word kernel has no shuffle to reach for, so it classifies as a vector target
+        // without fast ones does.
+        let fast_shuffles = matches!(family, Family::Vector) && vector::has_byte_shuffle(level);
+        let kind = set.kind(fast_shuffles);
         Self {
             level,
             family,
@@ -134,7 +183,7 @@ impl Finder {
     #[inline]
     pub fn iter<'a>(&'a self, haystack: &'a [u8]) -> Iter<'a> {
         Iter {
-            finder: self,
+            memchr_n: self,
             state: IterState {
                 haystack,
                 pos: 0,
@@ -145,8 +194,15 @@ impl Finder {
     }
 }
 
+/// Collects the bytes, then builds the searcher for them, on [`Backend::Auto`].
+impl FromIterator<u8> for MemchrN {
+    fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
+        Self::from_set(ByteSet::from_iter(iter), Backend::Auto)
+    }
+}
+
 pub struct Iter<'a> {
-    finder: &'a Finder,
+    memchr_n: &'a MemchrN,
     state: IterState<'a>,
     /// Matches of the most recently scanned run that have not been yielded yet.
     ///
@@ -166,17 +222,17 @@ struct IterState<'a> {
 }
 
 /// Everything a kernel needs, in the shape that kernel reads it, built once when the
-/// [`Finder`] is.
+/// [`MemchrN`] is.
 ///
 /// Rebuilding the kernel per call — splatting needles across a block, re-deriving a range's
 /// four masks — was pure overhead on a search that refills often, and reading it back out of
-/// [`FinderKind`] cost an unaligned load at the enum's payload offset. A union pays neither:
+/// [`Kind`] cost an unaligned load at the enum's payload offset. A union pays neither:
 /// the live field is decided once, by the same [`build_scan`] call that installs the [`Scan`]
 /// beside it, and the alignment lets a whole block come back in one load.
 ///
 /// # Safety
 ///
-/// Which field is live is fixed for a [`Finder`]'s lifetime by its [`FinderKind`], as
+/// Which field is live is fixed for a [`MemchrN`]'s lifetime by its [`Kind`], as
 /// [`KernelData::new`] lays out. Nothing but the [`Scan`] built from that same kind may read
 /// it.
 #[derive(Copy, Clone)]
@@ -210,7 +266,7 @@ struct NibbleTable {
 impl KernelData {
     /// Builds the field the kernels for `family` and `kind` read. The arms line up
     /// one-for-one with [`vector_build`] and [`word_build`], which pick those kernels.
-    fn new(family: Family, kind: FinderKind) -> Self {
+    fn new(family: Family, kind: Kind) -> Self {
         /// Splats one to three needles across whichever unit `family` scans in, leaving
         /// the slots past `N` zeroed for a kernel that will not read them.
         fn splat_needles<const N: usize>(family: Family, needles: [u8; N]) -> KernelData {
@@ -238,12 +294,12 @@ impl KernelData {
         }
 
         match kind {
-            FinderKind::OneByte(needle) => splat_needles(family, [needle]),
-            FinderKind::TwoBytes(needles) => splat_needles(family, needles),
-            FinderKind::ThreeBytes(needles) => splat_needles(family, needles),
+            Kind::OneByte(needle) => splat_needles(family, [needle]),
+            Kind::TwoBytes(needles) => splat_needles(family, needles),
+            Kind::ThreeBytes(needles) => splat_needles(family, needles),
             // The other kind both families reach, and the only one where they want
             // different shapes: one splats the endpoints, the other derives masks from them.
-            FinderKind::OneRange(range) => match family {
+            Kind::OneRange(range) => match family {
                 Family::Vector => Self {
                     splatted_range: [[range.start; 16], [range.last; 16]],
                 },
@@ -251,27 +307,27 @@ impl KernelData {
                     range_masks: swar::kernels::OneRange::new(range),
                 },
             },
-            FinderKind::SmallSet {
+            Kind::SmallSet {
                 lo_lookup,
                 hi_lookup,
             } => Self {
                 nibble_lookups: [lo_lookup, hi_lookup],
             },
-            FinderKind::ConstantNibble(which, table) => Self {
+            Kind::ConstantNibble(which, table) => Self {
                 nibble_table: NibbleTable { which, table },
             },
-            FinderKind::AnyByte(bitset) => Self { bitset },
-            FinderKind::Never => Self { never: () },
+            Kind::AnyByte(bitset) => Self { bitset },
+            Kind::Never => Self { never: () },
         }
     }
 }
 
-/// The search loops for one level-and-kernel pair, chosen when the [`Finder`] is built.
+/// The search loops for one level-and-kernel pair, chosen when the [`MemchrN`] is built.
 ///
 /// This is a `Box<dyn Scan>` written out by hand, to keep the allocation off callers that
-/// build a [`Finder`] per search.
+/// build a [`MemchrN`] per search.
 ///
-/// The level and the [`FinderKind`] are both fixed for a [`Finder`]'s lifetime, so resolving
+/// The level and the [`Kind`] are both fixed for a [`MemchrN`]'s lifetime, so resolving
 /// them here also removes the two matches every refill used to run, and keeps `levels * kinds`
 /// copies of the loop body out of [`Iter::next`].
 #[derive(Copy, Clone)]
@@ -424,7 +480,7 @@ fn never_scan() -> Scan {
     }
 }
 
-fn build_scan(level: Level, family: Family, kind: FinderKind) -> Scan {
+fn build_scan(level: Level, family: Family, kind: Kind) -> Scan {
     match family {
         Family::Vector => dispatch!(level, simd => vector_build(simd, kind)),
         Family::Word => word_build(kind),
@@ -433,32 +489,32 @@ fn build_scan(level: Level, family: Family, kind: FinderKind) -> Scan {
 
 /// Picks the vector kernel for a kind. Each arm's kernel reads that same arm back in its
 /// [`vector::Kernel`] impl.
-fn vector_build<S: Simd>(simd: S, kind: FinderKind) -> Scan {
+fn vector_build<S: Simd>(simd: S, kind: Kind) -> Scan {
     match kind {
-        FinderKind::OneByte(_) => vector_scan::<S, vector::kernels::AnyOf<S, 1>>(simd),
-        FinderKind::TwoBytes(_) => vector_scan::<S, vector::kernels::AnyOf<S, 2>>(simd),
-        FinderKind::ThreeBytes(_) => vector_scan::<S, vector::kernels::AnyOf<S, 3>>(simd),
-        FinderKind::OneRange(_) => vector_scan::<S, vector::kernels::OneRange<S>>(simd),
-        FinderKind::SmallSet { .. } => vector_scan::<S, vector::kernels::SmallSet>(simd),
-        FinderKind::ConstantNibble(..) => vector_scan::<S, vector::kernels::SingleNibble>(simd),
-        FinderKind::AnyByte(_) => vector_scan::<S, vector::kernels::AnyByte>(simd),
-        FinderKind::Never => never_scan(),
+        Kind::OneByte(_) => vector_scan::<S, vector::kernels::AnyOf<S, 1>>(simd),
+        Kind::TwoBytes(_) => vector_scan::<S, vector::kernels::AnyOf<S, 2>>(simd),
+        Kind::ThreeBytes(_) => vector_scan::<S, vector::kernels::AnyOf<S, 3>>(simd),
+        Kind::OneRange(_) => vector_scan::<S, vector::kernels::OneRange<S>>(simd),
+        Kind::SmallSet { .. } => vector_scan::<S, vector::kernels::SmallSet>(simd),
+        Kind::ConstantNibble(..) => vector_scan::<S, vector::kernels::SingleNibble>(simd),
+        Kind::AnyByte(_) => vector_scan::<S, vector::kernels::AnyByte>(simd),
+        Kind::Never => never_scan(),
     }
 }
 
 /// The word-at-a-time counterpart of [`vector_build`].
-fn word_build(kind: FinderKind) -> Scan {
+fn word_build(kind: Kind) -> Scan {
     match kind {
-        FinderKind::OneByte(_) => swar_scan::<swar::kernels::AnyOf<1>>(),
-        FinderKind::TwoBytes(_) => swar_scan::<swar::kernels::AnyOf<2>>(),
-        FinderKind::ThreeBytes(_) => swar_scan::<swar::kernels::AnyOf<3>>(),
-        FinderKind::OneRange(_) => swar_scan::<swar::kernels::OneRange>(),
-        FinderKind::AnyByte(_) => bytewise_scan::<bytewise::kernels::AnyByte>(),
-        FinderKind::Never => never_scan(),
+        Kind::OneByte(_) => swar_scan::<swar::kernels::AnyOf<1>>(),
+        Kind::TwoBytes(_) => swar_scan::<swar::kernels::AnyOf<2>>(),
+        Kind::ThreeBytes(_) => swar_scan::<swar::kernels::AnyOf<3>>(),
+        Kind::OneRange(_) => swar_scan::<swar::kernels::OneRange>(),
+        Kind::AnyByte(_) => bytewise_scan::<bytewise::kernels::AnyByte>(),
+        Kind::Never => never_scan(),
         // Both scan by shuffling bytes within a vector, which is what picks them over
-        // `AnyByte` in the first place; `Bytes::kind` only builds them for a family that has
-        // shuffles to spend.
-        FinderKind::SmallSet { .. } | FinderKind::ConstantNibble(..) => {
+        // `AnyByte` in the first place; `ByteSet::kind` only builds them for a family that
+        // has shuffles to spend.
+        Kind::SmallSet { .. } | Kind::ConstantNibble(..) => {
             unreachable!("shuffle kinds need vectors")
         }
     }
@@ -475,7 +531,7 @@ impl<'a> Iterator for Iter<'a> {
             }
             // SAFETY: `build_scan` installs each function for the kind passed back to it
             // here, and the `Level` that chose it proves the target has its features.
-            self.bits = unsafe { (self.finder.scan.find_next)(&self.finder.data, &mut self.state) };
+            self.bits = unsafe { (self.memchr_n.scan.find_next)(&self.memchr_n.data, &mut self.state) };
             if self.bits == 0 {
                 return None;
             }
@@ -494,9 +550,9 @@ impl<'a> Iterator for Iter<'a> {
     fn count(mut self) -> usize {
         let mut total = self.bits.count_ones() as usize;
         if self.state.pos != self.state.haystack.len() {
-            let finder = self.finder;
+            let memchr_n = self.memchr_n;
             // SAFETY: as in `next`.
-            total += unsafe { (finder.scan.count_all)(&finder.data, &mut self.state) };
+            total += unsafe { (memchr_n.scan.count_all)(&memchr_n.data, &mut self.state) };
         }
         total
     }
@@ -511,7 +567,7 @@ impl<'a> Iterator for Iter<'a> {
                 return None;
             }
             // SAFETY: as in `next`.
-            self.bits = unsafe { (self.finder.scan.find_next)(&self.finder.data, &mut self.state) };
+            self.bits = unsafe { (self.memchr_n.scan.find_next)(&self.memchr_n.data, &mut self.state) };
             if self.bits == 0 {
                 return None;
             }
@@ -547,21 +603,21 @@ impl NibbleLookup {
 mod tests {
     use super::*;
 
-    /// A `Finder` is built per search often enough that its size is worth keeping honest.
+    /// A `MemchrN` is built per search often enough that its size is worth keeping honest.
     /// `KernelData` is the bulk of it, and everything else fits in the padding its
     /// alignment leaves behind.
     #[test]
-    fn finder_stays_small() {
+    fn memchr_n_stays_small() {
         assert!(
-            size_of::<Finder>() <= 80,
-            "Finder is {} bytes",
-            size_of::<Finder>()
+            size_of::<MemchrN>() <= 80,
+            "MemchrN is {} bytes",
+            size_of::<MemchrN>()
         );
     }
 
     #[test]
     fn debug_names_the_chosen_kernel() {
-        let debug = format!("{:?}", Bytes::from_bytes(b"az").finder());
+        let debug = format!("{:?}", MemchrN::new(b"az"));
         assert!(debug.contains("TwoBytes"), "{debug}");
     }
 
@@ -590,25 +646,24 @@ mod tests {
         assert_eq!(set, before);
     }
 
-    /// Every byte in `bytes`, recovered by searching a haystack of all 256 byte values.
-    fn members(bytes: &Bytes) -> Vec<u8> {
+    /// Every byte in `set`, recovered by searching a haystack of all 256 byte values.
+    fn members(set: &ByteSet) -> Vec<u8> {
         let all: Vec<u8> = (0..=u8::MAX).collect();
-        bytes
-            .finder()
+        MemchrN::from_set(*set, Backend::Auto)
             .iter(&all)
             .map(|offset| all[offset])
             .collect()
     }
 
     /// Both halves must agree on the kernel, not just the set: a bitset that covers a span
-    /// exactly still has to reach [`FinderKind::OneRange`], and few enough distinct bytes
+    /// exactly still has to reach [`Kind::OneRange`], and few enough distinct bytes
     /// still have to reach the kinds only the array representation can name.
-    fn assert_same_set_and_kernel(bulk: &Bytes, one_at_a_time: &Bytes, case: &str) {
+    fn assert_same_set_and_kernel(bulk: &ByteSet, one_at_a_time: &ByteSet, case: &str) {
         assert_eq!(members(bulk), members(one_at_a_time), "{case}");
         for backend in [Backend::Auto, Backend::Scalar] {
             assert_eq!(
-                format!("{:?}", bulk.finder_with(backend)),
-                format!("{:?}", one_at_a_time.finder_with(backend)),
+                format!("{:?}", MemchrN::from_set(*bulk, backend)),
+                format!("{:?}", MemchrN::from_set(*one_at_a_time, backend)),
                 "{case} on {backend:?}"
             );
         }
@@ -640,11 +695,11 @@ mod tests {
         ];
 
         for (case, bytes) in cases {
-            let mut one_at_a_time = Bytes::new();
+            let mut one_at_a_time = ByteSet::new();
             for &byte in bytes {
                 one_at_a_time.add(byte);
             }
-            assert_same_set_and_kernel(&Bytes::from_bytes(bytes), &one_at_a_time, case);
+            assert_same_set_and_kernel(&ByteSet::from_bytes(bytes), &one_at_a_time, case);
         }
     }
 
@@ -654,10 +709,10 @@ mod tests {
         let seeds: &[&[u8]] = &[b"", b"z", b"\x00", b"\x7f", b"az", b"\x00\xff", b"aeiouAEI"];
         for seed in seeds {
             for (start, last) in [(0u8, 255u8), (0x80, 0xFF), (10, 40), (100, 124), (60, 200)] {
-                let mut ranged = Bytes::from_bytes(seed);
+                let mut ranged = ByteSet::from_bytes(seed);
                 ranged.add_range(RangeInclusive { start, last });
 
-                let mut one_at_a_time = Bytes::from_bytes(seed);
+                let mut one_at_a_time = ByteSet::from_bytes(seed);
                 for byte in start..=last {
                     one_at_a_time.add(byte);
                 }
@@ -668,13 +723,13 @@ mod tests {
     }
 
     #[test]
-    fn bytes_add_range_matches_adding_each_byte() {
+    fn byte_set_add_range_matches_adding_each_byte() {
         for start in 0..=u8::MAX {
             for last in start..=u8::MAX {
-                let mut ranged = Bytes::new();
+                let mut ranged = ByteSet::new();
                 ranged.add_range(RangeInclusive { start, last });
 
-                let mut one_at_a_time = Bytes::new();
+                let mut one_at_a_time = ByteSet::new();
                 for byte in start..=last {
                     one_at_a_time.add(byte);
                 }
@@ -689,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn bytes_add_two_ranges_matches_adding_each_byte() {
+    fn byte_set_add_two_ranges_matches_adding_each_byte() {
         // Bounds that straddle every representation change: the array filling up, a bitset
         // word boundary, and the ends of the byte range.
         let bounds = [0u8, 1, 7, 23, 24, 25, 63, 64, 127, 128, 200, 254, 255];
@@ -697,7 +752,7 @@ mod tests {
             for &first_last in bounds.iter().filter(|&&b| b >= first_start) {
                 for &second_start in &bounds {
                     for &second_last in bounds.iter().filter(|&&b| b >= second_start) {
-                        let mut ranged = Bytes::new();
+                        let mut ranged = ByteSet::new();
                         ranged.add_range(RangeInclusive {
                             start: first_start,
                             last: first_last,
@@ -707,7 +762,7 @@ mod tests {
                             last: second_last,
                         });
 
-                        let mut one_at_a_time = Bytes::new();
+                        let mut one_at_a_time = ByteSet::new();
                         for byte in first_start..=first_last {
                             one_at_a_time.add(byte);
                         }
@@ -727,42 +782,42 @@ mod tests {
     }
 
     #[test]
-    fn bytes_add_range_of_empty_range_adds_nothing() {
-        let mut bytes = Bytes::from_bytes(b"abc");
-        bytes.add_range(RangeInclusive { start: 10, last: 9 });
-        assert_eq!(members(&bytes), b"abc");
+    fn byte_set_add_range_of_empty_range_adds_nothing() {
+        let mut set = ByteSet::from_bytes(b"abc");
+        set.add_range(RangeInclusive { start: 10, last: 9 });
+        assert_eq!(members(&set), b"abc");
     }
 
     #[test]
-    fn bytes_add_keeps_a_byte_disjoint_from_an_existing_range() {
-        let mut bytes = Bytes::new();
-        bytes.add_range(RangeInclusive {
+    fn byte_set_add_keeps_a_byte_disjoint_from_an_existing_range() {
+        let mut set = ByteSet::new();
+        set.add_range(RangeInclusive {
             start: 0,
             last: 100,
         });
-        bytes.add(200);
-        assert_eq!(members(&bytes), (0..=100).chain([200]).collect::<Vec<u8>>());
+        set.add(200);
+        assert_eq!(members(&set), (0..=100).chain([200]).collect::<Vec<u8>>());
     }
 
     #[test]
-    fn bytes_add_range_works_in_const_context() {
-        const DIGITS: Bytes = {
-            let mut bytes = Bytes::new();
-            bytes.add_range(RangeInclusive {
+    fn byte_set_add_range_works_in_const_context() {
+        const DIGITS: ByteSet = {
+            let mut set = ByteSet::new();
+            set.add_range(RangeInclusive {
                 start: b'0',
                 last: b'9',
             });
-            bytes
+            set
         };
         assert_eq!(members(&DIGITS), b"0123456789");
     }
 
-    fn build_word(bytes: &[u8]) -> Finder {
-        Bytes::from_bytes(bytes).finder_with(Backend::Scalar)
+    fn build_word(bytes: &[u8]) -> MemchrN {
+        MemchrN::new_with(bytes, Backend::Scalar)
     }
 
-    fn build(bytes: &[u8]) -> Finder {
-        Bytes::from_bytes(bytes).finder()
+    fn build(bytes: &[u8]) -> MemchrN {
+        MemchrN::new(bytes)
     }
 
     fn naive(set: &[u8], haystack: &[u8]) -> Vec<usize> {
@@ -775,7 +830,7 @@ mod tests {
         offsets
     }
 
-    /// One byte set per [`FinderKind`], so every kernel is exercised.
+    /// One byte set per [`Kind`], so every kernel is exercised.
     fn sets() -> Vec<Vec<u8>> {
         vec![
             vec![],
@@ -800,7 +855,7 @@ mod tests {
     #[test]
     fn matches_naive_across_lengths() {
         for set in sets() {
-            for (name, finder) in [("vector", build(&set)), ("word", build_word(&set))] {
+            for (name, searcher) in [("vector", build(&set)), ("word", build_word(&set))] {
                 // Every length up to a chunk-and-change, so each way the tail can split
                 // into whole words and a short remainder is covered, then the pair and
                 // multi-chunk boundaries.
@@ -808,10 +863,10 @@ mod tests {
                 for len in lens {
                     let haystack = haystack(len);
                     let expected = naive(&set, &haystack);
-                    let got: Vec<usize> = finder.iter(&haystack).collect();
+                    let got: Vec<usize> = searcher.iter(&haystack).collect();
                     assert_eq!(got, expected, "{name} set {set:?} len {len}");
                     assert_eq!(
-                        finder.iter(&haystack).count(),
+                        searcher.iter(&haystack).count(),
                         expected.len(),
                         "{name} count for set {set:?} len {len}"
                     );
@@ -823,7 +878,7 @@ mod tests {
     #[test]
     fn find_matches_naive() {
         for set in sets() {
-            for (name, finder) in [("vector", build(&set)), ("word", build_word(&set))] {
+            for (name, searcher) in [("vector", build(&set)), ("word", build_word(&set))] {
                 // Every length up to a chunk-and-change, so each way the tail can split
                 // into whole words and a short remainder is covered, then the pair and
                 // multi-chunk boundaries.
@@ -832,7 +887,7 @@ mod tests {
                     let haystack = haystack(len);
                     let expected = naive(&set, &haystack).first().copied();
                     assert_eq!(
-                        finder.find(&haystack),
+                        searcher.find(&haystack),
                         expected,
                         "{name} set {set:?} len {len}"
                     );
@@ -849,16 +904,16 @@ mod tests {
     fn overlapping_tail_does_not_repeat_matches() {
         // The third set is large enough to reach `AnyByte`, and contains `x`.
         let dense: Vec<u8> = (0..=u8::MAX).step_by(3).collect();
-        for finder in [build(b"x"), build_word(b"x"), build_word(&dense)] {
+        for searcher in [build(b"x"), build_word(b"x"), build_word(&dense)] {
             for len in 0..192 {
                 let haystack = vec![b'x'; len];
                 let expected: Vec<usize> = (0..len).collect();
                 assert_eq!(
-                    finder.iter(&haystack).collect::<Vec<_>>(),
+                    searcher.iter(&haystack).collect::<Vec<_>>(),
                     expected,
                     "{len}"
                 );
-                assert_eq!(finder.iter(&haystack).count(), len, "{len}");
+                assert_eq!(searcher.iter(&haystack).count(), len, "{len}");
             }
         }
     }
@@ -866,13 +921,13 @@ mod tests {
     #[test]
     fn nth_matches_naive() {
         for set in sets() {
-            for (name, finder) in [("vector", build(&set)), ("word", build_word(&set))] {
+            for (name, searcher) in [("vector", build(&set)), ("word", build_word(&set))] {
                 for len in (0..=80).chain([127, 128, 129, 255, 256, 1000]) {
                     let haystack = haystack(len);
                     let expected = naive(&set, &haystack);
                     for n in [0, 1, 2, 3, 7, 63, 64, 65, 100] {
                         assert_eq!(
-                            finder.iter(&haystack).nth(n),
+                            searcher.iter(&haystack).nth(n),
                             expected.get(n).copied(),
                             "{name} set {set:?} len {len} nth {n}"
                         );
@@ -887,11 +942,11 @@ mod tests {
     #[test]
     fn nth_advances_like_repeated_next() {
         let set = b"aeiouAEI";
-        let finder = build(set);
+        let searcher = build(set);
         let haystack = haystack(1000);
         let expected = naive(set, &haystack);
         for step in [0, 1, 5, 64, 200] {
-            let mut iter = finder.iter(&haystack);
+            let mut iter = searcher.iter(&haystack);
             let mut index = 0;
             let mut got = Vec::new();
             while let Some(offset) = iter.nth(step) {
@@ -911,10 +966,10 @@ mod tests {
 
     #[test]
     fn count_matches_iteration_after_partial_consumption() {
-        let finder = build(b"aeiouAEI");
+        let searcher = build(b"aeiouAEI");
         let haystack = haystack(1000);
         for skip in [0, 1, 2, 7, 40] {
-            let mut iter = finder.iter(&haystack);
+            let mut iter = searcher.iter(&haystack);
             let mut taken = 0;
             for _ in 0..skip {
                 if iter.next().is_some() {
@@ -930,13 +985,13 @@ mod tests {
     /// half packed at the wrong end.
     #[test]
     fn reports_a_match_from_either_half_of_a_pair() {
-        for finder in [build(b"x"), build_word(b"x")] {
+        for searcher in [build(b"x"), build_word(b"x")] {
             for len in [128, 192, 256, 300] {
                 for offset in 0..len {
                     let mut haystack = vec![b'.'; len];
                     haystack[offset] = b'x';
                     assert_eq!(
-                        finder.iter(&haystack).collect::<Vec<_>>(),
+                        searcher.iter(&haystack).collect::<Vec<_>>(),
                         vec![offset],
                         "len {len} offset {offset}"
                     );
@@ -949,9 +1004,9 @@ mod tests {
     /// a lane can wrap.
     #[test]
     fn counts_do_not_overflow_the_accumulator() {
-        let finder = build(b"x");
+        let searcher = build(b"x");
         let len = 64 * (512 + 3);
         let haystack = vec![b'x'; len];
-        assert_eq!(finder.iter(&haystack).count(), len);
+        assert_eq!(searcher.iter(&haystack).count(), len);
     }
 }

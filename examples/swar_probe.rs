@@ -6,7 +6,7 @@
 //! vector of lanes rather than one side using SIMD.
 
 use memchr::arch::all::memchr::{One, Three, Two};
-use memchr_n::{Backend, Bytes, Finder};
+use memchr_n::{Backend, MemchrN};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -14,8 +14,8 @@ const HAYSTACK: &[u8] = include_bytes!("../benches/haystacks/sherlock/huge.txt")
 
 const ROUNDS: u32 = 100;
 
-fn finder(needles: &[u8]) -> Finder {
-    Bytes::from_bytes(needles).finder_with(Backend::Scalar)
+fn finder(needles: &[u8]) -> MemchrN {
+    MemchrN::new_with(needles, Backend::Scalar)
 }
 
 fn best<T>(rounds: u32, iters: u32, mut f: impl FnMut() -> T) -> f64 {

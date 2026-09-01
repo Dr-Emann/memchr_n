@@ -5,7 +5,7 @@
 //! `find_next` that a haystack of that length can take. Together they separate the fixed
 //! per-call cost from the work the scan does before it can answer.
 
-use memchr_n::Bytes;
+use memchr_n::MemchrN;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -25,8 +25,8 @@ fn best(mut f: impl FnMut() -> Option<usize>) -> f64 {
 }
 
 fn main() {
-    let one = Bytes::from_bytes(b"x").finder();
-    let three = Bytes::from_bytes(b"xyz").finder();
+    let one = MemchrN::new(b"x");
+    let three = MemchrN::new(b"xyz");
 
     println!("== match offset swept, 1MiB haystack");
     println!(

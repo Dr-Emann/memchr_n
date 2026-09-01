@@ -36,17 +36,17 @@ fn target(simd: bool, bitset: Bitset, data: &[u8]) {
     assert_eq!(finder.iter(data).count(), count);
 }
 
-fn finder_for_bitset(simd: bool, bitset: &Bitset) -> memchr_n::Finder {
-    let mut b = memchr_n::Bytes::new();
+fn finder_for_bitset(simd: bool, bitset: &Bitset) -> memchr_n::MemchrN {
+    let mut bytes = Vec::new();
     for (i, mut chunk) in bitset.0.iter().copied().enumerate() {
         let base = (i * 64) as u8;
         while chunk != 0 {
             let bit = chunk.trailing_zeros() as u8;
 
-            b.add(base + bit);
+            bytes.push(base + bit);
 
             chunk &= chunk - 1;
         }
     }
-    b.finder_with(if simd { Backend::Auto } else { Backend::Scalar })
+    memchr_n::MemchrN::new_with(&bytes, if simd { Backend::Auto } else { Backend::Scalar })
 }

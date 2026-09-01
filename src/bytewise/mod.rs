@@ -129,7 +129,7 @@ pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
 /// Scans from `from` for the first [`CHUNK`] that contains a match.
 #[inline]
 pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {
-    let (haystack, mut from) = (state.haystack, state.pos);
+    let (haystack, from) = (state.haystack, state.pos);
     // SAFETY: as in `crate::vector::find_next`.
     let unscanned = unsafe { haystack.get_unchecked(from..) };
     let (chunks, tail) = unscanned.as_chunks::<CHUNK>();
@@ -146,9 +146,10 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> Matc
             state.pos = from + CHUNK;
             return pack_marks(marks).into();
         }
-        from += CHUNK;
     }
 
+    // `from` stays at the start of the run: the enumeration was not restarted after the
+    // chunk above, so `i` already counts it.
     for (i, chunk) in chunks {
         let (marks, any) = chunk_marks(&kernel, chunk);
         if any != 0 {

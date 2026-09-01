@@ -4,7 +4,7 @@
 //! haystack lives; `bench_probe`'s haystack is cache-resident, so this covers the other
 //! end.
 
-use memchr_n::{Bytes, Finder};
+use memchr_n::MemchrN;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -14,8 +14,8 @@ const SEED: &[u8] = include_bytes!("../benches/haystacks/sherlock/huge.txt");
 const NEVER: u8 = b'<';
 const RARE: u8 = b'z';
 
-fn finder(needles: &[u8]) -> Finder {
-    Bytes::from_bytes(needles).finder()
+fn finder(needles: &[u8]) -> MemchrN {
+    MemchrN::new(needles)
 }
 
 const ROUNDS: u32 = 100;

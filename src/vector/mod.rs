@@ -16,7 +16,7 @@ pub(crate) trait Kernel<S: Simd>: Copy {
     /// # Safety
     ///
     /// `data`'s live field must be the one this kernel reads, as [`KernelData::new`] and
-    /// [`crate::vector_build`] agree on for a [`crate::FinderKind`].
+    /// [`crate::vector_build`] agree on for a [`crate::Kind`].
     unsafe fn from_data(simd: S, data: &KernelData) -> Self;
 
     fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(

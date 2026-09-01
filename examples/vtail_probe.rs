@@ -2,7 +2,7 @@
 //!
 //! `anybyte` has no `memchr` counterpart: that crate tops out at three needles.
 
-use memchr_n::{Backend, Bytes};
+use memchr_n::{Backend, MemchrN};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -37,9 +37,8 @@ fn row(name: &str, mut f: impl FnMut(&[u8]) -> Option<usize>) {
 }
 
 fn main() {
-    let anybyte: Bytes = (0x80u8..=0xFF).step_by(6).collect();
-    let anybyte = anybyte.finder_with(Backend::Auto);
-    let onebyte = Bytes::from_bytes(b"<").finder_with(Backend::Auto);
+    let anybyte: MemchrN = (0x80u8..=0xFF).step_by(6).collect();
+    let onebyte = MemchrN::new_with(b"<", Backend::Auto);
 
     row("anybyte", |hay| anybyte.iter(hay).next());
     row("onebyte", |hay| onebyte.iter(hay).next());
