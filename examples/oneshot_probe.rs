@@ -16,7 +16,7 @@ use std::time::Instant;
 const ROUNDS: u32 = 200;
 const ITERS: u32 = 500;
 
-const LENS: [usize; 9] = [8, 16, 32, 64, 128, 512, 4096, 65536, 1 << 20];
+const LENS: [usize; 12] = [1, 4, 8, 12, 16, 32, 64, 128, 512, 4096, 65536, 1 << 20];
 
 /// The kinds a set can resolve to, one set each.
 const SETS: [(&str, &[u8]); 6] = [

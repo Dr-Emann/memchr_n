@@ -13,3 +13,4 @@ memchr = "2.8"
 [[bench]]
 name = "memchr_n"
 harness = false
+
