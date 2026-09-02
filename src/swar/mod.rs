@@ -232,7 +232,7 @@ mod tests {
 }
 
 /// The [`Scan`] whose entry points run `K`.
-pub(crate) fn scan<K: Kernel>() -> Scan {
+pub(crate) fn scan<K: Kernel>() -> &'static Scan {
     unsafe fn find_next<K: Kernel>(
         data: &KernelData,
         state: &mut IterState<'_>,
@@ -255,9 +255,11 @@ pub(crate) fn scan<K: Kernel>() -> Scan {
         self::find_first(haystack, kernel)
     }
 
-    Scan {
-        find_next: find_next::<K>,
-        count_all: count_all::<K>,
-        find_first: find_first::<K>,
+    &const {
+        Scan {
+            find_next: find_next::<K>,
+            count_all: count_all::<K>,
+            find_first: find_first::<K>,
+        }
     }
 }

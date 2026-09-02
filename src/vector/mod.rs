@@ -491,17 +491,19 @@ macro_rules! level_scans {
                 }
             }
 
-            fn scan<K: Kernel<Token>>() -> Scan {
-                Scan {
-                    find_next: find_next::<K>,
-                    count_all: count_all::<K>,
-                    find_first: find_first::<K>,
+            fn scan<K: Kernel<Token>>() -> &'static Scan {
+                &const {
+                    Scan {
+                        find_next: find_next::<K>,
+                        count_all: count_all::<K>,
+                        find_first: find_first::<K>,
+                    }
                 }
             }
 
             /// Picks the vector kernel for a kind. Each arm's kernel reads that same arm back
             /// in its [`Kernel`] impl.
-            pub(super) fn build(kind: Kind) -> Scan {
+            pub(super) fn build(kind: Kind) -> &'static Scan {
                 match kind {
                     Kind::OneByte(_) => scan::<kernels::AnyOf<Token, 1>>(),
                     Kind::TwoBytes(_) => scan::<kernels::AnyOf<Token, 2>>(),
@@ -537,7 +539,7 @@ level_scans! {
 ///
 /// Also what decides [`Family`](crate::Family), so a level without vector entry points
 /// cannot be handed a [`Kind`] only a vector kernel can scan.
-pub(crate) fn builder(level: Level) -> Option<fn(Kind) -> Scan> {
+pub(crate) fn builder(level: Level) -> Option<fn(Kind) -> &'static Scan> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         // Strongest first: each accessor answers for its own level and every level above it.

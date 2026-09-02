@@ -48,7 +48,11 @@ pub struct MemchrN {
     family: Family,
     kind: KindTag,
     data: KernelData,
-    scan: Scan,
+    /// Shared rather than held: every [`MemchrN`] of one level and kind wants the same three
+    /// pointers, and a reference to them is 8 bytes where the table is 24. That is what
+    /// brings the whole struct inside one cache line, which a refill needs, since it reaches
+    /// both this and `data` on every call.
+    scan: &'static Scan,
 }
 
 impl fmt::Debug for MemchrN {
@@ -208,11 +212,16 @@ struct IterState<'a> {
 /// same to within noise, because building is dominated by collecting the set and choosing the
 /// kernel, not by writing this out.
 ///
-/// What splatting does cost is size — `[[u8; 16]; 3]` is what holds this union at 48 bytes,
-/// and a [`MemchrN`] at 80 rather than 64. That is worth a second look, because a smaller one
-/// measured 5-12% faster on dense iteration, where every refill touches both this and the
-/// [`Scan`]. But it is a [`Scan`] problem rather than a splatting one: the win held even for a
-/// single needle, where splatting on load is the *more* expensive of the two.
+/// What splatting costs is size: `[[u8; 16]; 3]` is what holds this union at 48 bytes. That
+/// looked like it mattered — storing the needles raw shrank a [`MemchrN`] from 80 bytes to 64
+/// and measured 5-12% faster on dense iteration, which a refill straddling one cache line
+/// instead of two would explain, since it reaches both this and the [`Scan`].
+///
+/// It does not. The [`Scan`] moved behind a reference afterwards, which gets to 64 bytes on
+/// its own and changes nothing else, and that measured no faster than 80 did. So whatever the
+/// raw-needle reading was, it was not the size — and it was taken with benchmark means, which
+/// `examples/iter_probe.rs` was written because this host is too noisy for. Re-measure before
+/// building anything on it.
 ///
 /// # Safety
 ///
@@ -334,8 +343,8 @@ struct Scan {
     find_first: unsafe fn(&KernelData, &[u8]) -> Option<usize>,
 }
 
-/// Builds the [`Scan`] for a byte set that nothing can match.
-pub(crate) fn never_scan() -> Scan {
+/// The [`Scan`] for a byte set that nothing can match.
+pub(crate) fn never_scan() -> &'static Scan {
     fn find_next(_data: &KernelData, state: &mut IterState<'_>) -> MatchedBitset {
         state.pos = state.haystack.len();
         0
@@ -349,10 +358,12 @@ pub(crate) fn never_scan() -> Scan {
         None
     }
 
-    Scan {
-        find_next,
-        count_all,
-        find_first,
+    &const {
+        Scan {
+            find_next,
+            count_all,
+            find_first,
+        }
     }
 }
 
@@ -361,7 +372,7 @@ pub(crate) fn never_scan() -> Scan {
 /// It stays here, where [`vector::builder`] does not, because it is the one build that spans
 /// two modules: `swar`'s arithmetic covers the kinds it has a trick for, and the rest fall
 /// through to `bytewise`'s table probe. Neither module chooses that; this is where they meet.
-fn word_build(kind: Kind) -> Scan {
+fn word_build(kind: Kind) -> &'static Scan {
     match kind {
         Kind::OneByte(_) => swar::scan::<swar::kernels::AnyOf<1>>(),
         Kind::TwoBytes(_) => swar::scan::<swar::kernels::AnyOf<2>>(),
@@ -445,13 +456,13 @@ impl<'a> Iterator for Iter<'a> {
 mod tests {
     use super::*;
 
-    /// A `MemchrN` is built per search often enough that its size is worth keeping honest.
-    /// `KernelData` is the bulk of it, and everything else fits in the padding its
-    /// alignment leaves behind.
+    /// A `MemchrN` is built per search often enough that its size is worth keeping honest,
+    /// and one cache line is the round number to hold it to. `KernelData` is three quarters
+    /// of that, and the rest fits in the padding its alignment leaves behind.
     #[test]
     fn memchr_n_stays_small() {
         assert!(
-            size_of::<MemchrN>() <= 80,
+            size_of::<MemchrN>() <= 64,
             "MemchrN is {} bytes",
             size_of::<MemchrN>()
         );
