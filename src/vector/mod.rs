@@ -1,6 +1,7 @@
 pub(crate) mod kernels;
 
-use crate::{IterState, KernelData, MatchedBitset};
+use crate::{IterState, KernelData, Kind, MatchedBitset, Scan, never_scan};
+use core::mem::transmute_copy;
 use fearless_simd::prelude::*;
 use fearless_simd::{Level, i8x16, i8x64, kernel, u8x16, u8x64, u64x2};
 
@@ -16,7 +17,7 @@ pub(crate) trait Kernel<S: Simd>: Copy {
     /// # Safety
     ///
     /// `data`'s live field must be the one this kernel reads, as [`KernelData::new`] and
-    /// the per-level `build` that `crate::level_scans!` writes agree on for a [`crate::Kind`].
+    /// the per-level `build` that `level_scans!` writes agree on for a [`Kind`].
     unsafe fn from_data(simd: S, data: &KernelData) -> Self;
 
     fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
@@ -45,7 +46,7 @@ pub(crate) fn has_byte_shuffle(level: Level) -> bool {
 
 /// Scans from `from` for the first pair of [`CHUNK_BYTES`]s that contains a match.
 ///
-/// Extracting the bitmask is the expensive half of a scan, so [`any_lane_set`] skips it
+/// Extracting the bitmask is the expensive half of a scan, so [`any_true`](fearless_simd::SimdMask::any_true) skips it
 /// for the chunks that did not match at all. The check reduces to a general-purpose
 /// register and feeds a branch, which is the loop's longest serial dependency, so two
 /// chunks share one.
@@ -396,4 +397,171 @@ kernel! {
         let res = vqtbl2q_u8(table.into(), idx.into());
         u8x16::simd_from(simd, res).into()
     }
+}
+
+/// Rebuilds a SIMD token, which holds no data beyond the support it proves.
+///
+/// # Safety
+///
+/// The running target must support `S`'s level.
+#[inline(always)]
+unsafe fn token<S: Simd>() -> S {
+    const {
+        assert!(size_of::<S>() == 0);
+        assert!(align_of::<S>() == 1);
+    };
+    // SAFETY: the assertion above makes this a zero-byte copy, and a zero-sized type has
+    // exactly one value; the caller guarantees the support that value stands for.
+    unsafe { transmute_copy(&()) }
+}
+
+/// Writes one level's [`Scan`] entry points, and the [`Kind`] match that picks between them.
+///
+/// The point of the target-feature attributes is that the pointers a [`Scan`] stores name the
+/// scans themselves. [`Simd::vectorize`] would establish the same context, but only by calling
+/// into it: the stored pointer would name a trampoline that spills the kernel data and the
+/// haystack into a closure environment on the stack, calls through, and leaves the scan to
+/// load them back — about a third of a short [`MemchrN::find`](crate::MemchrN::find).
+///
+/// The attribute is written by `fearless_simd` from the level's name, rather than by this
+/// crate from a list of its own that would have to be kept in step. The macro that does it is
+/// the one behind `fearless_simd::kernel!`, reached directly because `kernel!` itself takes
+/// only non-generic functions, and these are generic over the kernel. It is `doc(hidden)`, so
+/// this is a reach into another crate's internals — but a checked one: it is exported, it
+/// accepts only the six levels it has audited, and if it ever changes shape this stops
+/// compiling rather than quietly losing its features.
+macro_rules! level_scans {
+    ($($(#[$cfg:meta])* $module:ident => $level:ident;)*) => {$(
+        $(#[$cfg])*
+        mod $module {
+            use super::*;
+            use fearless_simd::$level as Token;
+
+            fearless_simd::__fearless_simd_kernel_target_fn! {
+                $level,
+                /// # Safety
+                ///
+                /// The running target must support this module's level, and `data`'s live
+                /// field must be the one `K` reads.
+                unsafe fn find_next<K: Kernel<Token>>(
+                    data: &KernelData,
+                    state: &mut IterState<'_>,
+                ) -> MatchedBitset {
+                    // SAFETY: the caller's obligations, both of which `build` below
+                    // discharges: it is reached only through a `Level` that proves the
+                    // support, and each arm pairs a kernel with the kind whose `KernelData`
+                    // field that kernel reads.
+                    let simd = unsafe { token::<Token>() };
+                    let kernel = unsafe { K::from_data(simd, data) };
+                    super::find_next(simd, state, kernel)
+                }
+            }
+
+            fearless_simd::__fearless_simd_kernel_target_fn! {
+                $level,
+                /// # Safety
+                ///
+                /// As in [`find_next`].
+                unsafe fn count_all<K: Kernel<Token>>(
+                    data: &KernelData,
+                    unscanned: &[u8],
+                ) -> usize {
+                    // SAFETY: as in `find_next`.
+                    let simd = unsafe { token::<Token>() };
+                    // SAFETY: as in `find_next`.
+                    let kernel = unsafe { K::from_data(simd, data) };
+                    super::count(simd, unscanned, kernel)
+                }
+            }
+
+            fearless_simd::__fearless_simd_kernel_target_fn! {
+                $level,
+                /// # Safety
+                ///
+                /// As in [`find_next`].
+                unsafe fn find_first<K: Kernel<Token>>(
+                    data: &KernelData,
+                    haystack: &[u8],
+                ) -> Option<usize> {
+                    // SAFETY: as in `find_next`.
+                    let simd = unsafe { token::<Token>() };
+                    // SAFETY: as in `find_next`.
+                    let kernel = unsafe { K::from_data(simd, data) };
+                    super::find_first(simd, haystack, kernel)
+                }
+            }
+
+            fn scan<K: Kernel<Token>>() -> Scan {
+                Scan {
+                    find_next: find_next::<K>,
+                    count_all: count_all::<K>,
+                    find_first: find_first::<K>,
+                }
+            }
+
+            /// Picks the vector kernel for a kind. Each arm's kernel reads that same arm back
+            /// in its [`Kernel`] impl.
+            pub(super) fn build(kind: Kind) -> Scan {
+                match kind {
+                    Kind::OneByte(_) => scan::<kernels::AnyOf<Token, 1>>(),
+                    Kind::TwoBytes(_) => scan::<kernels::AnyOf<Token, 2>>(),
+                    Kind::ThreeBytes(_) => scan::<kernels::AnyOf<Token, 3>>(),
+                    Kind::OneRange(_) => scan::<kernels::OneRange<Token>>(),
+                    Kind::SmallSet { .. } => scan::<kernels::SmallSet>(),
+                    Kind::ConstantNibble(..) => scan::<kernels::SingleNibble>(),
+                    Kind::AnyByte(_) => scan::<kernels::AnyByte>(),
+                    Kind::Never => never_scan(),
+                }
+            }
+        }
+    )*};
+}
+
+level_scans! {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    sse2 => Sse2;
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    sse4_2 => Sse4_2;
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    avx2 => Avx2;
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    avx512 => Avx512;
+    #[cfg(target_arch = "aarch64")]
+    neon => Neon;
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    wasm_simd128 => WasmSimd128;
+}
+
+/// The entry points for `level`'s vector kernels, or `None` for a level that has none: the
+/// fallback level, and any level `level_scans!` has not been given.
+///
+/// Also what decides [`Family`](crate::Family), so a level without vector entry points
+/// cannot be handed a [`Kind`] only a vector kernel can scan.
+pub(crate) fn builder(level: Level) -> Option<fn(Kind) -> Scan> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        // Strongest first: each accessor answers for its own level and every level above it.
+        if level.as_avx512().is_some() {
+            return Some(avx512::build);
+        }
+        if level.as_avx2().is_some() {
+            return Some(avx2::build);
+        }
+        if level.as_sse4_2().is_some() {
+            return Some(sse4_2::build);
+        }
+        if level.as_sse2().is_some() {
+            return Some(sse2::build);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if level.as_neon().is_some() {
+        return Some(neon::build);
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if level.as_wasm_simd128().is_some() {
+        return Some(wasm_simd128::build);
+    }
+    let _ = level;
+    None
 }
