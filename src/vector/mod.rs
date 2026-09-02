@@ -1,6 +1,6 @@
 pub(crate) mod kernels;
 
-use crate::{IterState, KernelData, Kind, MatchedBitset, Scan, never_scan};
+use crate::{IterState, KernelData, Kind, MatchedBitset, Scan, Search, never_scan};
 use core::mem::transmute_copy;
 use fearless_simd::prelude::*;
 use fearless_simd::{Level, i8x16, i8x64, kernel, u8x16, u8x64, u64x2};
@@ -417,78 +417,91 @@ unsafe fn token<S: Simd>() -> S {
 
 /// Writes one level's [`Scan`] entry points, and the [`Kind`] match that picks between them.
 ///
-/// The point of the target-feature attributes is that the pointers a [`Scan`] stores name the
-/// scans themselves. [`Simd::vectorize`] would establish the same context, but only by calling
-/// into it: the stored pointer would name a trampoline that spills the kernel data and the
-/// haystack into a closure environment on the stack, calls through, and leaves the scan to
-/// load them back — about a third of a short [`MemchrN::find`](crate::MemchrN::find).
+/// Every entry point reaches its scan through [`Simd::vectorize`], which is what establishes
+/// the target-feature context, and does it by calling into that context rather than by
+/// putting the features on the entry point. So each of these is a trampoline, and what
+/// matters is that it be a bare `jmp` and not a stack frame: a closure of more than two words
+/// is passed indirectly, so it lands in the trampoline's own frame, which the call then has
+/// to outlive.
 ///
-/// The attribute is written by `fearless_simd` from the level's name, rather than by this
-/// crate from a list of its own that would have to be kept in step. The macro that does it is
-/// the one behind `fearless_simd::kernel!`, reached directly because `kernel!` itself takes
-/// only non-generic functions, and these are generic over the kernel. It is `doc(hidden)`, so
-/// this is a reach into another crate's internals — but a checked one: it is exported, it
-/// accepts only the six levels it has audited, and if it ever changes shape this stops
-/// compiling rather than quietly losing its features.
+/// Two words is why [`Search`] exists, and why `find_next` does not need it. Both leave these
+/// carrying one or two pointers, all of them into the caller's memory, and all three come out
+/// as `jmp`.
+///
+/// # What this costs
+///
+/// Putting the level's `#[target_feature]` on the entry point instead removes the trampoline
+/// altogether, and lets its three arguments stay in registers rather than going through
+/// [`Search`]. That is worth 1.13-1.30x on a short [`MemchrN::find`](crate::MemchrN::find)
+/// and nothing at all on iteration or counting, where the arguments are memory the caller
+/// keeps anyway.
+///
+/// It is not taken, because there is no way to write that attribute from public API. Spelling
+/// the feature list out here means keeping a copy of `fearless_simd`'s in step, silently
+/// losing every lane operation to a call if it drifts; `fearless_simd::kernel!` writes it
+/// correctly but takes only non-generic functions, so it would want one of these per kind as
+/// well as per level. The remaining way in is the macro behind `kernel!`, which is exported
+/// but `doc(hidden)`.
 macro_rules! level_scans {
+
     ($($(#[$cfg:meta])* $module:ident => $level:ident;)*) => {$(
         $(#[$cfg])*
         mod $module {
             use super::*;
             use fearless_simd::$level as Token;
 
-            fearless_simd::__fearless_simd_kernel_target_fn! {
-                $level,
-                /// # Safety
-                ///
-                /// The running target must support this module's level, and `data`'s live
-                /// field must be the one `K` reads.
-                unsafe fn find_next<K: Kernel<Token>>(
-                    data: &KernelData,
-                    state: &mut IterState<'_>,
-                ) -> MatchedBitset {
-                    // SAFETY: the caller's obligations, both of which `build` below
-                    // discharges: it is reached only through a `Level` that proves the
-                    // support, and each arm pairs a kernel with the kind whose `KernelData`
-                    // field that kernel reads.
-                    let simd = unsafe { token::<Token>() };
-                    let kernel = unsafe { K::from_data(simd, data) };
-                    super::find_next(simd, state, kernel)
-                }
+            /// # Safety
+            ///
+            /// The running target must support this module's level, and `data`'s live field
+            /// must be the one `K` reads.
+            unsafe fn find_next<K: Kernel<Token>>(
+                data: &KernelData,
+                state: &mut IterState<'_>,
+            ) -> MatchedBitset {
+                // SAFETY: the caller's obligations, both of which `build` below discharges:
+                // it is reached only through a `Level` that proves the support, and each arm
+                // pairs a kernel with the kind whose `KernelData` field that kernel reads.
+                let simd = unsafe { token::<Token>() };
+                simd.vectorize(
+                    #[inline(always)]
+                    move || {
+                        // SAFETY: as above.
+                        let kernel = unsafe { K::from_data(simd, data) };
+                        super::find_next(simd, state, kernel)
+                    },
+                )
             }
 
-            fearless_simd::__fearless_simd_kernel_target_fn! {
-                $level,
-                /// # Safety
-                ///
-                /// As in [`find_next`].
-                unsafe fn count_all<K: Kernel<Token>>(
-                    data: &KernelData,
-                    unscanned: &[u8],
-                ) -> usize {
-                    // SAFETY: as in `find_next`.
-                    let simd = unsafe { token::<Token>() };
-                    // SAFETY: as in `find_next`.
-                    let kernel = unsafe { K::from_data(simd, data) };
-                    super::count(simd, unscanned, kernel)
-                }
+            /// # Safety
+            ///
+            /// As in [`find_next`].
+            unsafe fn count_all<K: Kernel<Token>>(search: &Search<'_>) -> usize {
+                // SAFETY: as in `find_next`.
+                let simd = unsafe { token::<Token>() };
+                simd.vectorize(
+                    #[inline(always)]
+                    move || {
+                        // SAFETY: as above.
+                        let kernel = unsafe { K::from_data(simd, search.data) };
+                        super::count(simd, search.haystack, kernel)
+                    },
+                )
             }
 
-            fearless_simd::__fearless_simd_kernel_target_fn! {
-                $level,
-                /// # Safety
-                ///
-                /// As in [`find_next`].
-                unsafe fn find_first<K: Kernel<Token>>(
-                    data: &KernelData,
-                    haystack: &[u8],
-                ) -> Option<usize> {
-                    // SAFETY: as in `find_next`.
-                    let simd = unsafe { token::<Token>() };
-                    // SAFETY: as in `find_next`.
-                    let kernel = unsafe { K::from_data(simd, data) };
-                    super::find_first(simd, haystack, kernel)
-                }
+            /// # Safety
+            ///
+            /// As in [`find_next`].
+            unsafe fn find_first<K: Kernel<Token>>(search: &Search<'_>) -> Option<usize> {
+                // SAFETY: as in `find_next`.
+                let simd = unsafe { token::<Token>() };
+                simd.vectorize(
+                    #[inline(always)]
+                    move || {
+                        // SAFETY: as above.
+                        let kernel = unsafe { K::from_data(simd, search.data) };
+                        super::find_first(simd, search.haystack, kernel)
+                    },
+                )
             }
 
             fn scan<K: Kernel<Token>>() -> &'static Scan {

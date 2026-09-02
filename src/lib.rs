@@ -146,8 +146,12 @@ impl MemchrN {
     /// Returns the offset of the first matching byte in `haystack`.
     #[inline]
     pub fn find(&self, haystack: &[u8]) -> Option<usize> {
+        let search = Search {
+            data: &self.data,
+            haystack,
+        };
         // SAFETY: as in `Iter::next`.
-        unsafe { (self.scan.find_first)(&self.data, haystack) }
+        unsafe { (self.scan.find_first)(&search) }
     }
 
     /// Returns an iterator over the offsets of every matching byte in `haystack`.
@@ -316,6 +320,21 @@ impl KernelData {
     }
 }
 
+/// A kernel and the bytes to run it over.
+///
+/// Bundled so that a [`Scan`] entry point taking both has one pointer to pass on rather than
+/// three words. That is not about the words: it is that a `vectorize` closure carrying three
+/// of them lands in the entry point's own stack frame, which the call must then outlive, so
+/// the entry point cannot tail-call into the target-feature context and has to build a frame
+/// to hold it. Handed one pointer into the caller's frame instead, it is a `jmp`.
+///
+/// [`Scan::find_next`] needs no equivalent: an [`IterState`] is already one pointer, and one
+/// the caller owns.
+struct Search<'a> {
+    data: &'a KernelData,
+    haystack: &'a [u8],
+}
+
 /// The search loops for one level-and-kernel pair, chosen when the [`MemchrN`] is built.
 ///
 /// This is a `Box<dyn Scan>` written out by hand, to keep the allocation off callers that
@@ -332,7 +351,7 @@ struct Scan {
     /// Takes that remainder rather than the [`IterState`] it comes from: counting reads the
     /// haystack once and never resumes, so a scan has nothing to write back, and the state
     /// need not go to memory across the call the way [`find_next`](Scan::find_next)'s does.
-    count_all: unsafe fn(&KernelData, &[u8]) -> usize,
+    count_all: unsafe fn(&Search<'_>) -> usize,
     /// [`MemchrN::find`]'s whole search, rather than the first refill of an iteration.
     ///
     /// Both of the above are shaped for an iterator that will call them again: they take the
@@ -340,7 +359,7 @@ struct Scan {
     /// in a [`MatchedBitset`] the caller has to unpack. A search that stops at the first
     /// match wants neither, and pays for both — which on a short haystack is most of the
     /// call.
-    find_first: unsafe fn(&KernelData, &[u8]) -> Option<usize>,
+    find_first: unsafe fn(&Search<'_>) -> Option<usize>,
 }
 
 /// The [`Scan`] for a byte set that nothing can match.
@@ -350,11 +369,11 @@ pub(crate) fn never_scan() -> &'static Scan {
         0
     }
 
-    fn count_all(_data: &KernelData, _unscanned: &[u8]) -> usize {
+    fn count_all(_search: &Search<'_>) -> usize {
         0
     }
 
-    fn find_first(_data: &KernelData, _haystack: &[u8]) -> Option<usize> {
+    fn find_first(_search: &Search<'_>) -> Option<usize> {
         None
     }
 
@@ -421,9 +440,12 @@ impl<'a> Iterator for Iter<'a> {
         // SAFETY: `pos` only ever moves to an offset a scan reached, so it is in bounds.
         let unscanned = unsafe { self.state.haystack.get_unchecked(self.state.pos..) };
         if !unscanned.is_empty() {
-            let memchr_n = self.memchr_n;
+            let search = Search {
+                data: &self.memchr_n.data,
+                haystack: unscanned,
+            };
             // SAFETY: as in `next`.
-            total += unsafe { (memchr_n.scan.count_all)(&memchr_n.data, unscanned) };
+            total += unsafe { (self.memchr_n.scan.count_all)(&search) };
         }
         total
     }
