@@ -192,11 +192,28 @@ struct IterState<'a> {
 /// Everything a kernel needs, in the shape that kernel reads it, built once when the
 /// [`MemchrN`] is.
 ///
-/// Rebuilding the kernel per call — splatting needles across a block, re-deriving a range's
-/// four masks — was pure overhead on a search that refills often, and reading it back out of
-/// [`Kind`] cost an unaligned load at the enum's payload offset. A union pays neither:
-/// the live field is decided once, by the same [`build_scan`] call that installs the [`Scan`]
-/// beside it, and the alignment lets a whole block come back in one load.
+/// Reading it back out of a [`Kind`] would cost an unaligned load at the enum's payload
+/// offset. A union does not: the live field is decided once, by the same `build` that
+/// installs the [`Scan`] beside it, and the alignment lets a whole block come back in one
+/// load.
+///
+/// # Why the needles and range endpoints are splatted here
+///
+/// Storing them raw and splatting when the kernel loads was measured, and is the better
+/// trade only for a single needle. Beyond that it costs two instructions per needle — a byte
+/// into a general-purpose register, that register into a vector, then the broadcast — where a
+/// pre-splatted block is one aligned load. On a short [`MemchrN::find`] that showed up as
+/// 0.7-1.5ns of a ~4ns call for three needles and for a range.
+///
+/// It is not about build cost, which the original note here claimed: the two measured the
+/// same to within noise, because building is dominated by collecting the set and choosing the
+/// kernel, not by writing this out.
+///
+/// What splatting does cost is size — `[[u8; 16]; 3]` is what holds this union at 48 bytes,
+/// and a [`MemchrN`] at 80 rather than 64. That is worth a second look, because a smaller one
+/// measured 5-12% faster on dense iteration, where every refill touches both this and the
+/// [`Scan`]. But it is a [`Scan`] problem rather than a splatting one: the win held even for a
+/// single needle, where splatting on load is the *more* expensive of the two.
 ///
 /// # Safety
 ///
@@ -302,7 +319,12 @@ impl KernelData {
 #[derive(Copy, Clone)]
 struct Scan {
     find_next: unsafe fn(&KernelData, &mut IterState<'_>) -> MatchedBitset,
-    count_all: unsafe fn(&KernelData, &mut IterState<'_>) -> usize,
+    /// Counts every match in what is left of a haystack.
+    ///
+    /// Takes that remainder rather than the [`IterState`] it comes from: counting reads the
+    /// haystack once and never resumes, so a scan has nothing to write back, and the state
+    /// need not go to memory across the call the way [`find_next`](Scan::find_next)'s does.
+    count_all: unsafe fn(&KernelData, &[u8]) -> usize,
     /// [`MemchrN::find`]'s whole search, rather than the first refill of an iteration.
     ///
     /// Both of the above are shaped for an iterator that will call them again: they take the
@@ -378,18 +400,13 @@ macro_rules! level_scans {
                 /// As in [`find_next`].
                 unsafe fn count_all<K: vector::Kernel<Token>>(
                     data: &KernelData,
-                    state: &mut IterState<'_>,
+                    unscanned: &[u8],
                 ) -> usize {
                     // SAFETY: as in `find_next`.
                     let simd = unsafe { token::<Token>() };
                     // SAFETY: as in `find_next`.
                     let kernel = unsafe { K::from_data(simd, data) };
-                    // SAFETY: `pos` only ever moves to an offset a scan reached, so it is in
-                    // bounds.
-                    let unscanned = unsafe { state.haystack.get_unchecked(state.pos..) };
-                    let total = vector::count(simd, unscanned, kernel);
-                    state.pos = state.haystack.len();
-                    total
+                    vector::count(simd, unscanned, kernel)
                 }
             }
 
@@ -497,12 +514,10 @@ fn swar_scan<K: swar::Kernel>() -> Scan {
         swar::find_next(state, kernel)
     }
 
-    unsafe fn count_all<K: swar::Kernel>(data: &KernelData, state: &mut IterState<'_>) -> usize {
+    unsafe fn count_all<K: swar::Kernel>(data: &KernelData, unscanned: &[u8]) -> usize {
         // SAFETY: as above.
         let kernel = unsafe { K::from_data(data) };
-        let total = swar::count(unsafe { state.haystack.get_unchecked(state.pos..) }, kernel);
-        state.pos = state.haystack.len();
-        total
+        swar::count(unscanned, kernel)
     }
 
     unsafe fn find_first<K: swar::Kernel>(data: &KernelData, haystack: &[u8]) -> Option<usize> {
@@ -530,15 +545,10 @@ fn bytewise_scan<K: bytewise::Kernel>() -> Scan {
         bytewise::find_next(state, kernel)
     }
 
-    unsafe fn count_all<K: bytewise::Kernel>(
-        data: &KernelData,
-        state: &mut IterState<'_>,
-    ) -> usize {
+    unsafe fn count_all<K: bytewise::Kernel>(data: &KernelData, unscanned: &[u8]) -> usize {
         // SAFETY: as above.
         let kernel = unsafe { K::from_data(data) };
-        let total = bytewise::count(unsafe { state.haystack.get_unchecked(state.pos..) }, kernel);
-        state.pos = state.haystack.len();
-        total
+        bytewise::count(unscanned, kernel)
     }
 
     unsafe fn find_first<K: bytewise::Kernel>(
@@ -564,8 +574,7 @@ fn never_scan() -> Scan {
         0
     }
 
-    fn count_all(_data: &KernelData, state: &mut IterState<'_>) -> usize {
-        state.pos = state.haystack.len();
+    fn count_all(_data: &KernelData, _unscanned: &[u8]) -> usize {
         0
     }
 
@@ -625,12 +634,14 @@ impl<'a> Iterator for Iter<'a> {
         (min, max)
     }
 
-    fn count(mut self) -> usize {
+    fn count(self) -> usize {
         let mut total = self.bits.count_ones() as usize;
-        if self.state.pos != self.state.haystack.len() {
+        // SAFETY: `pos` only ever moves to an offset a scan reached, so it is in bounds.
+        let unscanned = unsafe { self.state.haystack.get_unchecked(self.state.pos..) };
+        if !unscanned.is_empty() {
             let memchr_n = self.memchr_n;
             // SAFETY: as in `next`.
-            total += unsafe { (memchr_n.scan.count_all)(&memchr_n.data, &mut self.state) };
+            total += unsafe { (memchr_n.scan.count_all)(&memchr_n.data, unscanned) };
         }
         total
     }
