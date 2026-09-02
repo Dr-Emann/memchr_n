@@ -65,7 +65,7 @@ pub(crate) trait Kernel: Copy {
 /// Whole words are marked from the start of the tail, and whatever is left over is picked up
 /// by re-reading the last whole word of the haystack, so a tail costs one word per eight bytes
 /// rather than a whole chunk however short it is. Only a haystack too short to hold a whole
-/// word has to be staged, which [`short_haystack_bits`] does.
+/// word has to be staged, which [`short_tail_bits`] does.
 #[inline]
 fn tail_bits<K: Kernel>(kernel: &K, haystack: &[u8], tail: &[u8]) -> u64 {
     debug_assert!(0 < tail.len() && tail.len() < WORD_BYTES);
