@@ -9,6 +9,7 @@ mod vector;
 use crate::bitset::Bitset;
 use crate::byte_set::ByteSet;
 use core::fmt;
+use core::marker::PhantomData;
 use core::mem::transmute_copy;
 use core::range::RangeInclusive;
 use fearless_simd::{Level, Simd};
@@ -369,97 +370,174 @@ unsafe fn token<S: Simd>() -> S {
     unsafe { transmute_copy(&()) }
 }
 
-/// Writes one level's [`Scan`] entry points, and the [`Kind`] match that picks between them.
+/// A [`KernelData`] together with the kernel that reads it.
 ///
-/// The point of the target-feature attributes is that the pointers a [`Scan`] stores name the
-/// scans themselves. [`Simd::vectorize`] would establish the same context, but only by calling
-/// into it: the stored pointer would name a trampoline that spills the kernel data and the
-/// haystack into a closure environment on the stack, calls through, and leaves the scan to
-/// load them back — about a third of a short [`MemchrN::find`].
+/// Building one is the unsafe step, and reading the kernel back out of it is safe. That split
+/// is what lets the scans below be written as [`kernel!`]s: the macro takes only safe
+/// functions, because the `unsafe` that enters the target-feature context is its own.
+struct Paired<'a, S: Simd, K: vector::Kernel<S>> {
+    data: &'a KernelData,
+    kernel: PhantomData<fn(S) -> K>,
+}
+
+impl<'a, S: Simd, K: vector::Kernel<S>> Paired<'a, S, K> {
+    /// # Safety
+    ///
+    /// `data`'s live field must be the one `K` reads, as [`KernelData::new`] and the arms of
+    /// the `build` below agree on for each [`Kind`].
+    unsafe fn new(data: &'a KernelData) -> Self {
+        Self {
+            data,
+            kernel: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    fn load(self, simd: S) -> K {
+        // SAFETY: the pairing `new` was given.
+        unsafe { K::from_data(simd, self.data) }
+    }
+}
+
+/// Writes one kind's three scans for one level, and the [`Scan`] that names them.
 ///
-/// # Keeping the feature lists honest
-///
-/// Each list must stay a superset of what `fearless_simd` enables for the same level, in its
-/// `__fearless_simd_kernel_target_fn!` macro. Fall behind and its per-operation inner
-/// functions stop inlining into these, so every lane operation becomes a call — much slower
-/// than the trampoline this replaces, and silent. `examples/tf_probe.rs` and the `first-call`
-/// benchmark group are what would notice.
-///
-/// Nothing here rests on the lists for soundness. What makes a lane operation sound is the
-/// token, and the only way to obtain one is [`Level::new`], which detects what the CPU
-/// actually has.
+/// Each is a [`kernel!`], so `fearless_simd` writes the `#[target_feature]` attribute from
+/// the level's name rather than this crate spelling the list out and having to keep it in
+/// step. The point of the attribute is that the pointers a [`Scan`] stores reach the scan
+/// without passing through [`Simd::vectorize`], which establishes the same context only by
+/// calling into it: the stored pointer would name a trampoline that spills the kernel data
+/// and the haystack into a closure environment on the stack, calls through, and leaves the
+/// scan to load them back — about a third of a short [`MemchrN::find`]. `kernel!` interposes
+/// a call of its own, but one that passes its arguments in registers, and it measures the
+/// same as the attribute written by hand (`examples/entry_probe.rs`).
+macro_rules! kind_scans {
+    ($level:ident; $($module:ident => $pat:pat, $kernel:ty;)*) => {
+        $(
+            mod $module {
+                use super::*;
+
+                type K = $kernel;
+                type Pair<'a> = Paired<'a, $level, K>;
+
+                kernel! {
+                    #[inline(always)]
+                    fn find_next(
+                        simd: $level,
+                        paired: Pair<'_>,
+                        state: &mut IterState<'_>,
+                    ) -> MatchedBitset {
+                        vector::find_next(simd, state, paired.load(simd))
+                    }
+                }
+
+                kernel! {
+                    #[inline(always)]
+                    fn count_all(
+                        simd: $level,
+                        paired: Pair<'_>,
+                        state: &mut IterState<'_>,
+                    ) -> usize {
+                        // SAFETY: `pos` only ever moves to an offset a scan reached, so it
+                        // is in bounds.
+                        let unscanned = unsafe { state.haystack.get_unchecked(state.pos..) };
+                        let total = vector::count(simd, unscanned, paired.load(simd));
+                        state.pos = state.haystack.len();
+                        total
+                    }
+                }
+
+                kernel! {
+                    #[inline(always)]
+                    fn find_first(
+                        simd: $level,
+                        paired: Pair<'_>,
+                        haystack: &[u8],
+                    ) -> Option<usize> {
+                        vector::find_first(simd, haystack, paired.load(simd))
+                    }
+                }
+
+                /// The pairing every entry point below starts from.
+                ///
+                /// # Safety
+                ///
+                /// `data`'s live field must be `K`'s, which is what the `build` arm that
+                /// stores these guarantees.
+                #[inline(always)]
+                unsafe fn enter(data: &KernelData) -> ($level, Pair<'_>) {
+                    // SAFETY: `build` is only reached through a `Level` that proves the
+                    // target supports this one.
+                    let simd = unsafe { token::<$level>() };
+                    // SAFETY: the caller's obligation, passed straight through.
+                    let paired = unsafe { Paired::new(data) };
+                    (simd, paired)
+                }
+
+                unsafe fn entry_find_next(
+                    data: &KernelData,
+                    state: &mut IterState<'_>,
+                ) -> MatchedBitset {
+                    // SAFETY: the caller's obligation.
+                    let (simd, paired) = unsafe { enter(data) };
+                    find_next(simd, paired, state)
+                }
+
+                unsafe fn entry_count_all(
+                    data: &KernelData,
+                    state: &mut IterState<'_>,
+                ) -> usize {
+                    // SAFETY: as above.
+                    let (simd, paired) = unsafe { enter(data) };
+                    count_all(simd, paired, state)
+                }
+
+                unsafe fn entry_find_first(
+                    data: &KernelData,
+                    haystack: &[u8],
+                ) -> Option<usize> {
+                    // SAFETY: as above.
+                    let (simd, paired) = unsafe { enter(data) };
+                    find_first(simd, paired, haystack)
+                }
+
+                pub(super) fn scan() -> Scan {
+                    Scan {
+                        find_next: entry_find_next,
+                        count_all: entry_count_all,
+                        find_first: entry_find_first,
+                    }
+                }
+            }
+        )*
+
+        /// Picks the vector kernel for a kind. Each arm's kernel reads that same arm back in
+        /// its [`vector::Kernel`] impl, which is the pairing [`Paired::new`] rests on.
+        pub(super) fn build(kind: Kind) -> Scan {
+            match kind {
+                $($pat => $module::scan(),)*
+                Kind::Never => never_scan(),
+            }
+        }
+    };
+}
+
+/// Writes one module of [`kind_scans!`] per SIMD level.
 macro_rules! level_scans {
-    ($($(#[$cfg:meta])* $module:ident => $level:ident, $features:literal;)*) => {$(
+    ($($(#[$cfg:meta])* $module:ident => $level:ident;)*) => {$(
         $(#[$cfg])*
         mod $module {
             use super::*;
-            use fearless_simd::$level as Token;
+            use fearless_simd::{$level, kernel};
 
-            #[target_feature(enable = $features)]
-            unsafe fn find_next<K: vector::Kernel<Token>>(
-                data: &KernelData,
-                state: &mut IterState<'_>,
-            ) -> MatchedBitset {
-                // SAFETY: this level's `build` is only reached through a `Level` that proves
-                // the target supports it.
-                let simd = unsafe { token::<Token>() };
-                // SAFETY: `build` below pairs each kernel with the kind whose `KernelData`
-                // field that kernel reads.
-                let kernel = unsafe { K::from_data(simd, data) };
-                vector::find_next(simd, state, kernel)
-            }
-
-            #[target_feature(enable = $features)]
-            unsafe fn count_all<K: vector::Kernel<Token>>(
-                data: &KernelData,
-                state: &mut IterState<'_>,
-            ) -> usize {
-                // SAFETY: as above.
-                let simd = unsafe { token::<Token>() };
-                // SAFETY: as above.
-                let kernel = unsafe { K::from_data(simd, data) };
-                // SAFETY: `pos` only ever moves to an offset a scan reached, so it is in
-                // bounds.
-                let unscanned = unsafe { state.haystack.get_unchecked(state.pos..) };
-                let total = vector::count(simd, unscanned, kernel);
-                state.pos = state.haystack.len();
-                total
-            }
-
-            #[target_feature(enable = $features)]
-            unsafe fn find_first<K: vector::Kernel<Token>>(
-                data: &KernelData,
-                haystack: &[u8],
-            ) -> Option<usize> {
-                // SAFETY: as above.
-                let simd = unsafe { token::<Token>() };
-                // SAFETY: as above.
-                let kernel = unsafe { K::from_data(simd, data) };
-                vector::find_first(simd, haystack, kernel)
-            }
-
-            fn scan<K: vector::Kernel<Token>>() -> Scan {
-                Scan {
-                    find_next: find_next::<K>,
-                    count_all: count_all::<K>,
-                    find_first: find_first::<K>,
-                }
-            }
-
-            /// Picks the vector kernel for a kind. Each arm's kernel reads that same arm back
-            /// in its [`vector::Kernel`] impl.
-            pub(super) fn build(kind: Kind) -> Scan {
-                use vector::kernels;
-                match kind {
-                    Kind::OneByte(_) => scan::<kernels::AnyOf<Token, 1>>(),
-                    Kind::TwoBytes(_) => scan::<kernels::AnyOf<Token, 2>>(),
-                    Kind::ThreeBytes(_) => scan::<kernels::AnyOf<Token, 3>>(),
-                    Kind::OneRange(_) => scan::<kernels::OneRange<Token>>(),
-                    Kind::SmallSet { .. } => scan::<kernels::SmallSet>(),
-                    Kind::ConstantNibble(..) => scan::<kernels::SingleNibble>(),
-                    Kind::AnyByte(_) => scan::<kernels::AnyByte>(),
-                    Kind::Never => never_scan(),
-                }
+            kind_scans! {
+                $level;
+                one_byte => Kind::OneByte(_), vector::kernels::AnyOf<$level, 1>;
+                two_bytes => Kind::TwoBytes(_), vector::kernels::AnyOf<$level, 2>;
+                three_bytes => Kind::ThreeBytes(_), vector::kernels::AnyOf<$level, 3>;
+                one_range => Kind::OneRange(_), vector::kernels::OneRange<$level>;
+                small_set => Kind::SmallSet { .. }, vector::kernels::SmallSet;
+                constant_nibble => Kind::ConstantNibble(..), vector::kernels::SingleNibble;
+                any_byte => Kind::AnyByte(_), vector::kernels::AnyByte;
             }
         }
     )*};
@@ -467,17 +545,17 @@ macro_rules! level_scans {
 
 level_scans! {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    sse2 => Sse2, "fxsr,sse,sse2";
+    sse2 => Sse2;
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    sse4_2 => Sse4_2, "fxsr,sse4.2,cmpxchg16b,popcnt";
+    sse4_2 => Sse4_2;
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    avx2 => Avx2, "fxsr,avx2,bmi1,bmi2,cmpxchg16b,f16c,fma,lzcnt,movbe,popcnt,xsave";
+    avx2 => Avx2;
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    avx512 => Avx512, "fxsr,adx,aes,avx512bitalg,avx512bw,avx512cd,avx512dq,avx512f,avx512ifma,avx512vbmi,avx512vbmi2,avx512vl,avx512vnni,avx512vpopcntdq,bmi1,bmi2,cmpxchg16b,fma,gfni,lzcnt,movbe,pclmulqdq,popcnt,rdrand,rdseed,sha,vaes,vpclmulqdq,xsave,xsavec,xsaveopt,xsaves";
+    avx512 => Avx512;
     #[cfg(target_arch = "aarch64")]
-    neon => Neon, "neon";
+    neon => Neon;
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    wasm_simd128 => WasmSimd128, "simd128";
+    wasm_simd128 => WasmSimd128;
 }
 
 /// The entry points for `level`'s vector kernels, or `None` for a level that has none: the
@@ -1142,5 +1220,6 @@ mod tests {
         assert_eq!(searcher.iter(&haystack).count(), len);
     }
 }
+
 
 
