@@ -343,7 +343,8 @@ fn bench_first_call(c: &mut Criterion) {
     let mut group = c.benchmark_group("first-call");
     for &(name, set) in KIND_SETS {
         let finder = set.finder(Backend::Auto);
-        for len in [8usize, 16, 64, 256] {
+        let needles = Needles::from_set(set);
+        for len in [1usize, 4, 8, 16, 32, 64, 256] {
             let haystack = &SHERLOCK_HUGE[..len];
             let param = format!("{name}/{len}");
             group.bench_with_input(BenchmarkId::new("find", &param), &finder, |b, finder| {
@@ -352,6 +353,13 @@ fn bench_first_call(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new("iter-next", &param), &finder, |b, finder| {
                 b.iter(|| black_box(finder).iter(black_box(haystack)).next())
             });
+            if let Some(needles) = needles {
+                group.bench_with_input(
+                    BenchmarkId::new(THEIRS, &param),
+                    &needles,
+                    |b, &needles| b.iter(|| black_box(needles).first(black_box(haystack))),
+                );
+            }
         }
     }
     group.finish();
