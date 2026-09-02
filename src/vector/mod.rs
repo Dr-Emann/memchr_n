@@ -3,7 +3,7 @@ pub(crate) mod kernels;
 use crate::{IterState, KernelData, Kind, MatchedBitset, Scan, Search, never_scan};
 use core::mem::transmute_copy;
 use fearless_simd::prelude::*;
-use fearless_simd::{Level, i8x16, i8x64, kernel, u8x16, u8x64, u64x2};
+use fearless_simd::{Level, i8x16, i8x64, kernel, u8x16, u8x32, u8x64, u64x2};
 
 const CHUNK_BYTES: usize = 64;
 const _: () = assert!(MatchedBitset::BITS as usize >= CHUNK_BYTES * 2);
@@ -135,7 +135,7 @@ pub(crate) fn find_first<S: Simd, K: Kernel<S>>(
         return find_first_short(simd, haystack, kernel);
     }
 
-    let (chunks, tail) = haystack.as_chunks::<CHUNK_BYTES>();
+    let (chunks, _) = haystack.as_chunks::<CHUNK_BYTES>();
 
     // The first chunk on its own, ahead of the pairing below. Pairing buys one `any_true`
     // per two chunks, which is what carries a long scan, but it also loads a second chunk
@@ -176,25 +176,28 @@ pub(crate) fn find_first<S: Simd, K: Kernel<S>>(
         from += CHUNK_BYTES;
     }
 
-    let (blocks, tail) = tail.as_chunks::<BLOCK_BYTES>();
-    for block in blocks {
-        let matched = kernel.matches(u8x16::load_array_ref(simd, block));
-        if matched.any_true() {
-            return Some(from + matched.to_bitmask().trailing_zeros() as usize);
-        }
-        from += BLOCK_BYTES;
-    }
-    if tail.is_empty() {
+    // Whatever is left is shorter than a chunk, and the haystack is not, so one read of its
+    // last chunk covers it. That read reaches back over bytes already scanned, which costs
+    // nothing and cannot mislead: this only runs because none of them matched.
+    if from == haystack.len() {
         return None;
     }
-    let bits = tail_bits(simd, &kernel, haystack, tail);
-    (bits != 0).then(|| haystack.len() - tail.len() + bits.trailing_zeros() as usize)
+    let last = haystack
+        .last_chunk::<CHUNK_BYTES>()
+        .expect("the haystack is at least one chunk");
+    let matched = kernel.matches(u8x64::load_array_ref(simd, last));
+    matched
+        .any_true()
+        .then(|| haystack.len() - CHUNK_BYTES + matched.to_bitmask().trailing_zeros() as usize)
 }
 
 /// [`find_first`] for a haystack shorter than one [`CHUNK_BYTES`].
 ///
-/// Split out so the length ladder is one comparison deep for the two cases it can be in,
-/// rather than the three the chunk walk would take it through on the way down.
+/// Two reads that overlap in the middle cover any length between one vector and two, so this
+/// is a ladder of widths rather than a walk: at most two vector operations and no loop,
+/// where blocks and a tail would take up to four for the same bytes and branch between them.
+/// The reads may see a byte twice, which costs nothing, because the front is tested first and
+/// a match there is at the offset it reports.
 #[inline(always)]
 fn find_first_short<S: Simd, K: Kernel<S>>(
     simd: S,
@@ -202,32 +205,50 @@ fn find_first_short<S: Simd, K: Kernel<S>>(
     kernel: K,
 ) -> Option<usize> {
     debug_assert!(haystack.len() < CHUNK_BYTES);
-    let (blocks, tail) = haystack.as_chunks::<BLOCK_BYTES>();
+    let len = haystack.len();
 
-    // No whole block means the haystack is shorter than one, which is the one case
-    // [`tail_bits`] cannot serve by re-reading the last block. Going straight to the staged
-    // path spares it that test, and the tail is the whole haystack.
-    if blocks.is_empty() {
-        if haystack.is_empty() {
-            return None;
-        }
-        let bits = short_tail_bits(simd, &kernel, haystack);
-        return (bits != 0).then(|| bits.trailing_zeros() as usize);
-    }
-
-    let mut from = 0;
-    for block in blocks {
-        let matched = kernel.matches(u8x16::load_array_ref(simd, block));
+    if let (Some(front), Some(back)) = (
+        haystack.first_chunk::<{ 2 * BLOCK_BYTES }>(),
+        haystack.last_chunk::<{ 2 * BLOCK_BYTES }>(),
+    ) {
+        let matched = kernel.matches(u8x32::load_array_ref(simd, front));
         if matched.any_true() {
-            return Some(from + matched.to_bitmask().trailing_zeros() as usize);
+            return Some(matched.to_bitmask().trailing_zeros() as usize);
         }
-        from += BLOCK_BYTES;
+        let matched = kernel.matches(u8x32::load_array_ref(simd, back));
+        return matched
+            .any_true()
+            .then(|| len - 2 * BLOCK_BYTES + matched.to_bitmask().trailing_zeros() as usize);
     }
-    if tail.is_empty() {
+
+    if let (Some(front), Some(back)) = (
+        haystack.first_chunk::<BLOCK_BYTES>(),
+        haystack.last_chunk::<BLOCK_BYTES>(),
+    ) {
+        let matched = kernel.matches(u8x16::load_array_ref(simd, front));
+        if matched.any_true() {
+            return Some(matched.to_bitmask().trailing_zeros() as usize);
+        }
+        let matched = kernel.matches(u8x16::load_array_ref(simd, back));
+        return matched
+            .any_true()
+            .then(|| len - BLOCK_BYTES + matched.to_bitmask().trailing_zeros() as usize);
+    }
+
+    // Below one vector there is nothing to overlap with, so the two ends are staged into one
+    // instead — and read back as two halves rather than slid into place, since the front
+    // half answers whenever it can and the back half is only reached when it cannot.
+    if haystack.is_empty() {
         return None;
     }
-    let bits = tail_bits(simd, &kernel, haystack, tail);
-    (bits != 0).then(|| haystack.len() - tail.len() + bits.trailing_zeros() as usize)
+    let (bits, staged) = staged_ends_bits(simd, &kernel, haystack);
+    let kept = !(u64::MAX << staged);
+    let front = bits & kept;
+    if front != 0 {
+        return Some(front.trailing_zeros() as usize);
+    }
+    let back = (bits >> staged) & kept;
+    (back != 0).then(|| len - staged + back.trailing_zeros() as usize)
 }
 
 /// Counts every matching byte of `haystack`.
@@ -285,18 +306,27 @@ fn tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, haystack: &[u8], tail: 
     }
 }
 
-/// Matches a haystack shorter than one [`CHUNK_BYTES`], returning its bits at positions
-/// `0..short_haystack.len()`.
+/// Matches a haystack shorter than one [`BLOCK_BYTES`], returning the bits of its two staged
+/// ends and how many bytes each end covers.
 ///
-/// The two ends are staged through general-purpose registers rather than a `[u8; 16]` buffer.
-/// A buffer written as two narrow stores and then read back as one 16-byte vector load is the
+/// The ends are staged through general-purpose registers rather than a `[u8; 16]` buffer. A
+/// buffer written as two narrow stores and then read back as one 16-byte vector load is the
 /// shape store forwarding cannot satisfy, so the load waits for both stores to reach the cache
 /// — tens of cycles, on a path whose whole job is to be short. Assembling the same bytes in
 /// two `u64`s and handing the pair over as a value keeps it off the stack entirely, and each
 /// load is still of a constant width, which is what kept `copy_from_slice` from lowering to a
 /// `memcpy` call.
+///
+/// Bit `i` below `staged` is byte `i`; bit `staged + i` is byte `len - staged + i`. The two
+/// overlap in the middle, where they agree. Neither half means anything above its own
+/// `staged` bits: past the front's sit the back's, and past the back's sit the lanes it was
+/// duplicated into and the zero padding, which matches whenever the byte set holds zero.
 #[inline(always)]
-fn short_tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, short_haystack: &[u8]) -> u64 {
+fn staged_ends_bits<S: Simd, K: Kernel<S>>(
+    simd: S,
+    kernel: &K,
+    short_haystack: &[u8],
+) -> (u64, usize) {
     /// The first and last `N` bytes of `haystack`, as two little-endian integers of `N` bytes
     /// each, packed into the bottom of a word.
     ///
@@ -318,18 +348,6 @@ fn short_tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, short_haystack: &
         end::<N>(first) | end::<N>(last) << (N * 8)
     }
 
-    // Slides the bits of two `staged`-byte ends back to the positions they were read from,
-    // discarding everything the ends did not cover.
-    //
-    // The two overlap in the middle, where they agree. Neither half may keep more bits than it
-    // read bytes: above the front's sit the back's, and above the back's sit the lanes it was
-    // duplicated into and the zero padding, which matches whenever the byte set holds zero.
-    #[inline]
-    fn slide_ends(bits: u64, staged: usize, len: usize) -> u64 {
-        let kept = !(u64::MAX << staged);
-        (bits & kept) | (((bits >> staged) & kept) << (len - staged))
-    }
-
     let len = short_haystack.len();
     debug_assert!(0 < len && len < BLOCK_BYTES);
 
@@ -346,7 +364,17 @@ fn short_tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, short_haystack: &
         0..2 => ([ends::<1>(short_haystack), 0], 1),
     };
     let ends: u8x16<S> = u64x2::load_array(simd, words).bitcast();
-    slide_ends(kernel.matches(ends).to_bitmask(), staged, len)
+    (kernel.matches(ends).to_bitmask(), staged)
+}
+
+/// [`staged_ends_bits`] with the two ends slid back to the positions they were read from, for
+/// a caller that wants every match rather than the first.
+#[inline(always)]
+fn short_tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, short_haystack: &[u8]) -> u64 {
+    let len = short_haystack.len();
+    let (bits, staged) = staged_ends_bits(simd, kernel, short_haystack);
+    let kept = !(u64::MAX << staged);
+    (bits & kept) | (((bits >> staged) & kept) << (len - staged))
 }
 
 /// Sums every lane of a vector.
@@ -390,7 +418,6 @@ kernel! {
     #[inline(always)]
     fn aarch64_swizzle_32_to_16(simd: Neon, table: [u8; 32], idx: [u8; 16]) -> [u8; 16] {
         use core::arch::aarch64::*;
-        use fearless_simd::u8x32;
 
         let table = u8x32::load_array(simd, table);
         let idx = u8x16::load_array(simd, idx);
