@@ -1,13 +1,13 @@
 #![deny(unnameable_types, unreachable_pub)]
 
 mod bitset;
-mod byte_set;
 mod bytewise;
+mod kind;
 mod swar;
 mod vector;
 
 use crate::bitset::Bitset;
-use crate::byte_set::ByteSet;
+use crate::kind::{ConstantNibble, Kind, KindTag, NibbleLookup};
 use core::fmt;
 use core::mem::transmute_copy;
 use core::range::RangeInclusive;
@@ -62,55 +62,6 @@ impl fmt::Debug for MemchrN {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-enum Kind {
-    AnyByte(Bitset),
-    SmallSet {
-        lo_lookup: NibbleLookup,
-        hi_lookup: NibbleLookup,
-    },
-    ConstantNibble(ConstantNibble, [u8; 16]),
-    OneByte(u8),
-    TwoBytes([u8; 2]),
-    ThreeBytes([u8; 3]),
-    OneRange(RangeInclusive<u8>),
-    Never,
-}
-
-/// Which [`Kind`] a [`MemchrN`] was built from, less the payload that [`KernelData`]
-/// holds in the shape its kernel wants.
-///
-/// The payload cannot be recovered from [`KernelData`] in every case — `swar`'s `OneRange`
-/// keeps only the low seven bits of its start — so naming the kind is as much as [`Debug`]
-/// can offer without carrying a second copy of it. This costs nothing: it fits in the
-/// padding [`KernelData`]'s alignment leaves behind.
-#[derive(Copy, Clone, Debug)]
-enum KindTag {
-    AnyByte,
-    SmallSet,
-    ConstantNibble,
-    OneByte,
-    TwoBytes,
-    ThreeBytes,
-    OneRange,
-    Never,
-}
-
-impl KindTag {
-    fn of(kind: Kind) -> Self {
-        match kind {
-            Kind::AnyByte(_) => Self::AnyByte,
-            Kind::SmallSet { .. } => Self::SmallSet,
-            Kind::ConstantNibble(..) => Self::ConstantNibble,
-            Kind::OneByte(_) => Self::OneByte,
-            Kind::TwoBytes(_) => Self::TwoBytes,
-            Kind::ThreeBytes(_) => Self::ThreeBytes,
-            Kind::OneRange(_) => Self::OneRange,
-            Kind::Never => Self::Never,
-        }
-    }
-}
-
 /// Which kernels a [`MemchrN`] runs, resolved from [`Backend`] and the level.
 #[derive(Copy, Clone, Debug)]
 enum Family {
@@ -131,7 +82,7 @@ impl MemchrN {
 
     /// [`new`](Self::new), on a chosen [`Backend`].
     pub fn new_with(bytes: &[u8], backend: Backend) -> Self {
-        Self::from_set(ByteSet::from_bytes(bytes), backend)
+        Self::from_set(Bitset::from_bytes(bytes), backend)
     }
 
     /// Builds a searcher for every byte from the start of `range` through its end,
@@ -144,8 +95,17 @@ impl MemchrN {
     }
 
     /// [`from_range`](Self::from_range), on a chosen [`Backend`].
+    ///
+    /// Takes an [`ops::RangeInclusive`](core::ops::RangeInclusive) rather than the
+    /// [`range::RangeInclusive`](RangeInclusive) used throughout, because it is worth
+    /// supporting `..=` syntax at the boundary.
     pub fn from_range_with(range: core::ops::RangeInclusive<u8>, backend: Backend) -> Self {
-        Self::from_set(ByteSet::from_range(range), backend)
+        let mut set = Bitset::new();
+        set.add_range(RangeInclusive {
+            start: *range.start(),
+            last: *range.end(),
+        });
+        Self::from_set(set, backend)
     }
 
     /// Resolves a collected set down to the one kernel that will scan for it.
@@ -153,7 +113,7 @@ impl MemchrN {
     /// Every choice the search depends on is made here: the family, whether the target's
     /// byte shuffles are worth the kinds that need them, the kind itself, and from that
     /// pair the kernel's data and its entry points.
-    fn from_set(set: ByteSet, backend: Backend) -> Self {
+    fn from_set(set: Bitset, backend: Backend) -> Self {
         let level = Level::new();
         let vector = match backend {
             Backend::Scalar => None,
@@ -167,7 +127,7 @@ impl MemchrN {
         // A word kernel has no shuffle to reach for, so it classifies as a vector target
         // without fast ones does.
         let fast_shuffles = vector.is_some() && vector::has_byte_shuffle(level);
-        let kind = set.kind(fast_shuffles);
+        let kind = Kind::of(&set, fast_shuffles);
         Self {
             level,
             family,
@@ -205,7 +165,7 @@ impl MemchrN {
 /// Collects the bytes, then builds the searcher for them, on [`Backend::Auto`].
 impl FromIterator<u8> for MemchrN {
     fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
-        Self::from_set(ByteSet::from_iter(iter), Backend::Auto)
+        Self::from_set(Bitset::from_iter(iter), Backend::Auto)
     }
 }
 
@@ -630,7 +590,7 @@ fn word_build(kind: Kind) -> Scan {
         Kind::AnyByte(_) => bytewise_scan::<bytewise::kernels::AnyByte>(),
         Kind::Never => never_scan(),
         // Both scan by shuffling bytes within a vector, which is what picks them over
-        // `AnyByte` in the first place; `ByteSet::kind` only builds them for a family that
+        // `AnyByte` in the first place; `Kind::of` only builds them for a family that
         // has shuffles to spend.
         Kind::SmallSet { .. } | Kind::ConstantNibble(..) => {
             unreachable!("shuffle kinds need vectors")
@@ -699,24 +659,6 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum ConstantNibble {
-    Lo,
-    Hi,
-}
-
-#[derive(Debug, Default, Copy, Clone)]
-struct NibbleLookup([u8; 16]);
-
-impl NibbleLookup {
-    #[inline]
-    fn set(&mut self, nibble: u8, bit: u8) {
-        debug_assert!(nibble < 16);
-        debug_assert!(bit < 8);
-        self.0[usize::from(nibble)] |= 1 << bit;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,7 +707,7 @@ mod tests {
     }
 
     /// Every byte in `set`, recovered by searching a haystack of all 256 byte values.
-    fn members(set: &ByteSet) -> Vec<u8> {
+    fn members(set: &Bitset) -> Vec<u8> {
         let all: Vec<u8> = (0..=u8::MAX).collect();
         MemchrN::from_set(*set, Backend::Auto)
             .iter(&all)
@@ -776,7 +718,7 @@ mod tests {
     /// Both halves must agree on the kernel, not just the set: a bitset that covers a span
     /// exactly still has to reach [`Kind::OneRange`], and few enough distinct bytes
     /// still have to reach the kinds only the array representation can name.
-    fn assert_same_set_and_kernel(bulk: &ByteSet, one_at_a_time: &ByteSet, case: &str) {
+    fn assert_same_set_and_kernel(bulk: &Bitset, one_at_a_time: &Bitset, case: &str) {
         assert_eq!(members(bulk), members(one_at_a_time), "{case}");
         for backend in [Backend::Auto, Backend::Scalar] {
             assert_eq!(
@@ -813,11 +755,11 @@ mod tests {
         ];
 
         for (case, bytes) in cases {
-            let mut one_at_a_time = ByteSet::new();
+            let mut one_at_a_time = Bitset::new();
             for &byte in bytes {
                 one_at_a_time.add(byte);
             }
-            assert_same_set_and_kernel(&ByteSet::from_bytes(bytes), &one_at_a_time, case);
+            assert_same_set_and_kernel(&Bitset::from_bytes(bytes), &one_at_a_time, case);
         }
     }
 
@@ -827,10 +769,10 @@ mod tests {
         let seeds: &[&[u8]] = &[b"", b"z", b"\x00", b"\x7f", b"az", b"\x00\xff", b"aeiouAEI"];
         for seed in seeds {
             for (start, last) in [(0u8, 255u8), (0x80, 0xFF), (10, 40), (100, 124), (60, 200)] {
-                let mut ranged = ByteSet::from_bytes(seed);
+                let mut ranged = Bitset::from_bytes(seed);
                 ranged.add_range(RangeInclusive { start, last });
 
-                let mut one_at_a_time = ByteSet::from_bytes(seed);
+                let mut one_at_a_time = Bitset::from_bytes(seed);
                 for byte in start..=last {
                     one_at_a_time.add(byte);
                 }
@@ -841,28 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_set_add_range_matches_adding_each_byte() {
-        for start in 0..=u8::MAX {
-            for last in start..=u8::MAX {
-                let mut ranged = ByteSet::new();
-                ranged.add_range(RangeInclusive { start, last });
-
-                let mut one_at_a_time = ByteSet::new();
-                for byte in start..=last {
-                    one_at_a_time.add(byte);
-                }
-
-                assert_eq!(
-                    members(&ranged),
-                    members(&one_at_a_time),
-                    "{start}..={last}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn byte_set_add_two_ranges_matches_adding_each_byte() {
+    fn add_two_ranges_matches_adding_each_byte() {
         // Bounds that straddle every representation change: the array filling up, a bitset
         // word boundary, and the ends of the byte range.
         let bounds = [0u8, 1, 7, 23, 24, 25, 63, 64, 127, 128, 200, 254, 255];
@@ -870,7 +791,7 @@ mod tests {
             for &first_last in bounds.iter().filter(|&&b| b >= first_start) {
                 for &second_start in &bounds {
                     for &second_last in bounds.iter().filter(|&&b| b >= second_start) {
-                        let mut ranged = ByteSet::new();
+                        let mut ranged = Bitset::new();
                         ranged.add_range(RangeInclusive {
                             start: first_start,
                             last: first_last,
@@ -880,7 +801,7 @@ mod tests {
                             last: second_last,
                         });
 
-                        let mut one_at_a_time = ByteSet::new();
+                        let mut one_at_a_time = Bitset::new();
                         for byte in first_start..=first_last {
                             one_at_a_time.add(byte);
                         }
@@ -889,8 +810,7 @@ mod tests {
                         }
 
                         assert_eq!(
-                            members(&ranged),
-                            members(&one_at_a_time),
+                            ranged, one_at_a_time,
                             "{first_start}..={first_last} then {second_start}..={second_last}"
                         );
                     }
@@ -900,15 +820,8 @@ mod tests {
     }
 
     #[test]
-    fn byte_set_add_range_of_empty_range_adds_nothing() {
-        let mut set = ByteSet::from_bytes(b"abc");
-        set.add_range(RangeInclusive { start: 10, last: 9 });
-        assert_eq!(members(&set), b"abc");
-    }
-
-    #[test]
-    fn byte_set_add_keeps_a_byte_disjoint_from_an_existing_range() {
-        let mut set = ByteSet::new();
+    fn add_keeps_a_byte_disjoint_from_an_existing_range() {
+        let mut set = Bitset::new();
         set.add_range(RangeInclusive {
             start: 0,
             last: 100,
@@ -918,9 +831,9 @@ mod tests {
     }
 
     #[test]
-    fn byte_set_add_range_works_in_const_context() {
-        const DIGITS: ByteSet = {
-            let mut set = ByteSet::new();
+    fn add_range_works_in_const_context() {
+        const DIGITS: Bitset = {
+            let mut set = Bitset::new();
             set.add_range(RangeInclusive {
                 start: b'0',
                 last: b'9',
