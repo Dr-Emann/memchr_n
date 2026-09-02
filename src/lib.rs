@@ -783,6 +783,28 @@ mod tests {
         }
     }
 
+    /// `find` covers a sub-chunk haystack with two reads that overlap in the middle, so the
+    /// offset it reports depends on which of them saw the match and how far back the second
+    /// one started. Every length up to a chunk-and-change, with the one match walked across
+    /// every offset, is what pins that arithmetic down.
+    #[test]
+    fn find_reports_every_offset() {
+        for (name, searcher) in [("vector", build(b"x")), ("word", build_word(b"x"))] {
+            for len in 0..=80 {
+                for offset in 0..len {
+                    let mut haystack = vec![b'.'; len];
+                    haystack[offset] = b'x';
+                    assert_eq!(
+                        searcher.find(&haystack),
+                        Some(offset),
+                        "{name} len {len} offset {offset}"
+                    );
+                }
+                assert_eq!(searcher.find(&vec![b'.'; len]), None, "{name} miss len {len}");
+            }
+        }
+    }
+
     /// `nth` has to consume the same matches `next` would, so mixing the two must walk the
     /// haystack exactly once.
     #[test]
