@@ -334,70 +334,6 @@ struct Scan {
     find_first: unsafe fn(&KernelData, &[u8]) -> Option<usize>,
 }
 
-fn swar_scan<K: swar::Kernel>() -> Scan {
-    unsafe fn find_next<K: swar::Kernel>(
-        data: &KernelData,
-        state: &mut IterState<'_>,
-    ) -> MatchedBitset {
-        // SAFETY: as in `vector_scan`, the `Scan` below stores this function only for the
-        // kind whose `KernelData` field `K` reads.
-        let kernel = unsafe { K::from_data(data) };
-        swar::find_next(state, kernel)
-    }
-
-    unsafe fn count_all<K: swar::Kernel>(data: &KernelData, unscanned: &[u8]) -> usize {
-        // SAFETY: as above.
-        let kernel = unsafe { K::from_data(data) };
-        swar::count(unscanned, kernel)
-    }
-
-    unsafe fn find_first<K: swar::Kernel>(data: &KernelData, haystack: &[u8]) -> Option<usize> {
-        // SAFETY: as above.
-        let kernel = unsafe { K::from_data(data) };
-        swar::find_first(haystack, kernel)
-    }
-
-    Scan {
-        find_next: find_next::<K>,
-        count_all: count_all::<K>,
-        find_first: find_first::<K>,
-    }
-}
-
-/// The byte-at-a-time counterpart of [`swar_scan`].
-fn bytewise_scan<K: bytewise::Kernel>() -> Scan {
-    unsafe fn find_next<K: bytewise::Kernel>(
-        data: &KernelData,
-        state: &mut IterState<'_>,
-    ) -> MatchedBitset {
-        // SAFETY: as in `vector_scan`, the `Scan` below stores this function only for the
-        // kind whose `KernelData` field `K` reads.
-        let kernel = unsafe { K::from_data(data) };
-        bytewise::find_next(state, kernel)
-    }
-
-    unsafe fn count_all<K: bytewise::Kernel>(data: &KernelData, unscanned: &[u8]) -> usize {
-        // SAFETY: as above.
-        let kernel = unsafe { K::from_data(data) };
-        bytewise::count(unscanned, kernel)
-    }
-
-    unsafe fn find_first<K: bytewise::Kernel>(
-        data: &KernelData,
-        haystack: &[u8],
-    ) -> Option<usize> {
-        // SAFETY: as above.
-        let kernel = unsafe { K::from_data(data) };
-        bytewise::find_first(haystack, kernel)
-    }
-
-    Scan {
-        find_next: find_next::<K>,
-        count_all: count_all::<K>,
-        find_first: find_first::<K>,
-    }
-}
-
 /// Builds the [`Scan`] for a byte set that nothing can match.
 pub(crate) fn never_scan() -> Scan {
     fn find_next(_data: &KernelData, state: &mut IterState<'_>) -> MatchedBitset {
@@ -420,15 +356,18 @@ pub(crate) fn never_scan() -> Scan {
     }
 }
 
-/// The word-at-a-time counterpart of the per-level `build` that
-/// `vector::level_scans!` writes.
+/// The word-at-a-time counterpart of [`vector::builder`].
+///
+/// It stays here, where [`vector::builder`] does not, because it is the one build that spans
+/// two modules: `swar`'s arithmetic covers the kinds it has a trick for, and the rest fall
+/// through to `bytewise`'s table probe. Neither module chooses that; this is where they meet.
 fn word_build(kind: Kind) -> Scan {
     match kind {
-        Kind::OneByte(_) => swar_scan::<swar::kernels::AnyOf<1>>(),
-        Kind::TwoBytes(_) => swar_scan::<swar::kernels::AnyOf<2>>(),
-        Kind::ThreeBytes(_) => swar_scan::<swar::kernels::AnyOf<3>>(),
-        Kind::OneRange(_) => swar_scan::<swar::kernels::OneRange>(),
-        Kind::AnyByte(_) => bytewise_scan::<bytewise::kernels::AnyByte>(),
+        Kind::OneByte(_) => swar::scan::<swar::kernels::AnyOf<1>>(),
+        Kind::TwoBytes(_) => swar::scan::<swar::kernels::AnyOf<2>>(),
+        Kind::ThreeBytes(_) => swar::scan::<swar::kernels::AnyOf<3>>(),
+        Kind::OneRange(_) => swar::scan::<swar::kernels::OneRange>(),
+        Kind::AnyByte(_) => bytewise::scan::<bytewise::kernels::AnyByte>(),
         Kind::Never => never_scan(),
         // Both scan by shuffling bytes within a vector, which is what picks them over
         // `AnyByte` in the first place; `Kind::of` only builds them for a family that

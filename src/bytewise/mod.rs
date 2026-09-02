@@ -15,7 +15,7 @@
 pub(crate) mod kernels;
 
 use crate::swar::{WORD_BYTES, movemask};
-use crate::{IterState, KernelData, MatchedBitset};
+use crate::{IterState, KernelData, MatchedBitset, Scan};
 
 const CHUNK: usize = 32;
 
@@ -193,4 +193,38 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> Matc
     state.bits_offset = haystack.len() - tail.len();
     state.pos = haystack.len();
     tail_bits(&kernel, tail).into()
+}
+
+/// The [`Scan`] whose entry points run `K`.
+pub(crate) fn scan<K: Kernel>() -> Scan {
+    unsafe fn find_next<K: Kernel>(
+        data: &KernelData,
+        state: &mut IterState<'_>,
+    ) -> MatchedBitset {
+        // SAFETY: as in [`crate::swar::scan`]: the `Scan` below stores this function only
+        // for the kind whose `KernelData` field `K` reads.
+        let kernel = unsafe { K::from_data(data) };
+        self::find_next(state, kernel)
+    }
+
+    unsafe fn count_all<K: Kernel>(data: &KernelData, unscanned: &[u8]) -> usize {
+        // SAFETY: as above.
+        let kernel = unsafe { K::from_data(data) };
+        self::count(unscanned, kernel)
+    }
+
+    unsafe fn find_first<K: Kernel>(
+        data: &KernelData,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        // SAFETY: as above.
+        let kernel = unsafe { K::from_data(data) };
+        self::find_first(haystack, kernel)
+    }
+
+    Scan {
+        find_next: find_next::<K>,
+        count_all: count_all::<K>,
+        find_first: find_first::<K>,
+    }
 }
