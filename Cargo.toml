@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fearless_simd = { git = "https://github.com/linebender/fearless_simd.git" }
+# Pinned to linebender/fearless_simd#347, which makes `vectorize`'s target-feature function
+# `#[inline]`. That removes the entry-point trampoline in `vector::level_scans!` wherever the
+# level is the compile target's baseline — all of aarch64, and `sse2` on x86-64. Unpin once
+# it is on `main`; nothing here depends on the pin beyond that.
+fearless_simd = { git = "https://github.com/linebender/fearless_simd.git", rev = "e953125cb9dc6ecb9bdd088831b0d02d21e602d2" }
 
 [dev-dependencies]
 criterion = "0.8"

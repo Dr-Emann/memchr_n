@@ -506,20 +506,37 @@ unsafe fn token<S: Simd>() -> S {
 /// carrying one or two pointers, all of them into the caller's memory, and all three come out
 /// as `jmp`.
 ///
-/// # What this costs
+/// # Where there is no trampoline at all
 ///
-/// Putting the level's `#[target_feature]` on the entry point instead removes the trampoline
-/// altogether, and lets its three arguments stay in registers rather than going through
-/// [`Search`]. That is worth 1.13-1.30x on a short [`MemchrN::find`](crate::MemchrN::find)
-/// and nothing at all on iteration or counting, where the arguments are memory the caller
-/// keeps anyway.
+/// `vectorize`'s target-feature function is `#[inline]`, and a caller may inline a callee
+/// whose feature set it already covers. So wherever the level is what the crate is being
+/// compiled for anyway, LLVM folds that function into these and the entry point *is* the
+/// scan — the same code putting the attribute here by hand would give. That is every level
+/// which is baseline for its architecture: all of `aarch64`, since NEON always is, where the
+/// 42 boundaries this macro writes come out as none; `sse2` on `x86-64`; and `avx2` as well
+/// in a build that enables it.
 ///
-/// It is not taken, because there is no way to write that attribute from public API. Spelling
-/// the feature list out here means keeping a copy of `fearless_simd`'s in step, silently
-/// losing every lane operation to a call if it drifts; `fearless_simd::kernel!` writes it
-/// correctly but takes only non-generic functions, so it would want one of these per kind as
-/// well as per level. The remaining way in is the macro behind `kernel!`, which is exported
-/// but `doc(hidden)`.
+/// What still trampolines is a level above the compile-time baseline, reached by runtime
+/// dispatch — `avx2` and `avx512` in an ordinary `x86-64` build. There the caller genuinely
+/// lacks the features, and no amount of `#[inline]` may cross that.
+///
+/// # What the trampoline costs where it is left
+///
+/// Nothing that has survived measurement. Putting the level's `#[target_feature]` on the entry
+/// point instead would remove it and let the arguments stay in registers rather than going
+/// through [`Search`]; measured against that, `find` over the lengths where a `jmp` could
+/// matter came out at a mean ratio of 1.015 over eleven points, alternating direction six
+/// times. It was worth having when the closure was three words and the trampoline built a
+/// frame to hold it — 1.13-1.30x — which is what [`Search`] is for.
+///
+/// It could not be taken anyway: there is no way to write that attribute from public API.
+/// Spelling the feature list out here means keeping a copy of `fearless_simd`'s in step,
+/// silently losing every lane operation to a call if it drifts; `fearless_simd::kernel!`
+/// writes it correctly but takes only non-generic functions, so it would want one of these
+/// per kind as well as per level. The remaining way in is the macro behind `kernel!`, which
+/// is exported but `doc(hidden)`. `fearless_simd_macros::simd` is not a fourth option: it
+/// expands to exactly the `vectorize` call below, and wants the token as a parameter, which
+/// these cannot have and still share one fn-pointer type across levels.
 macro_rules! level_scans {
 
     ($($(#[$cfg:meta])* $module:ident => $level:ident;)*) => {$(
