@@ -341,12 +341,32 @@ impl KernelData {
 /// argument registers rather than six and still passes three words as a pointer, because
 /// whether an aggregate goes indirect is settled by rustc before any register is assigned.
 ///
-/// What does work is not bundling at all. Three *arguments* — a pointer and a slice — are three
-/// registers, and a closure that captures nothing is zero-sized, so a `vectorize` taking the
-/// arguments alongside the closure rather than closed over by it would leave nothing for the
-/// entry point to own and the `jmp` would stand without this type. Rust has no variadic
-/// generics, so that means one entry point per arity in `fearless_simd`, which is the shape to
-/// ask for if this is ever worth more than the 1.015 it currently measures.
+/// What does work is not bundling all three into one thing. Nothing here is too big for a
+/// register; only the aggregate holding all of it is. So a `vectorize` that took one argument
+/// beside the closure would do, with the three words split as a piece of one and a piece of
+/// two:
+///
+/// ```ignore
+/// fn vectorize1<A, R, F: FnOnce(A) -> R>(self, a: A, f: F) -> R;
+/// // …reached as, from an entry point taking the two separately:
+/// simd.vectorize1(data, move |data| find_first(simd, haystack, K::from_data(simd, data)))
+/// ```
+///
+/// The argument is one word, the closure captures the slice and is a `ScalarPair`, neither is
+/// over the limit, and the entry point comes out a bare `jmp` with nothing of its own to keep
+/// alive. Two pieces reach four words, so this needs one method and not the family per arity
+/// that variadic arguments would want. Put the smaller piece in the argument position: the
+/// other order tail-calls too, but spends four `mov`s rotating registers the entry point was
+/// already handed in the right places.
+///
+/// Chaining ordinary calls is not a way to get there. The words travel between them in
+/// registers happily enough, but the closure is built wherever `vectorize` is finally called,
+/// and that frame is the whole problem — relaying through one more function turns the entry
+/// point into a `jmp` and gives the relay the identical `sub $0x18, %rsp` and three stores.
+/// The frame moves; it does not go away.
+///
+/// All of which is the shape to ask `fearless_simd` for if this is ever worth more than the
+/// 1.015 it currently measures.
 struct Search<'a> {
     data: &'a KernelData,
     haystack: &'a [u8],
