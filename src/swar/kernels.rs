@@ -31,6 +31,14 @@ impl<const N: usize> Kernel for AnyOf<N> {
     fn matches(&self, word: u64) -> u64 {
         any_of_matches(word, self.splatted_needles)
     }
+
+    #[inline]
+    fn matches_byte(&self, byte: u8) -> bool {
+        // Every lane of a splatted needle holds it, so the lowest byte is the needle.
+        self.splatted_needles
+            .iter()
+            .any(|&needle| needle as u8 == byte)
+    }
 }
 
 /// Everything is precomputed so that `matches` stays branchless.
@@ -79,6 +87,17 @@ impl Kernel for OneRange {
         // with the span's high bit set every shifted byte below 128 fits outright, and
         // the ones above it fit when their low seven bits do; without it none of them do.
         (clear_high & low_ge) | (self.span_high & (clear_high | (shifted & low_ge)))
+    }
+
+    #[inline]
+    fn matches_byte(&self, byte: u8) -> bool {
+        // The fields are the bounds pre-arranged for a word, so the bounds come back out of
+        // them: `start` has lost bit 7 to the saturation the subtraction above needs, but
+        // `not_start` is the whole splatted start complemented, and the span is its two
+        // halves in the two fields that carry them.
+        let start = !self.not_start as u8;
+        let span = (self.span_low as u8 & !0x80) | (self.span_high as u8 & 0x80);
+        byte.wrapping_sub(start) <= span
     }
 }
 

@@ -805,6 +805,41 @@ mod tests {
         }
     }
 
+    /// Every kernel answers a short haystack a byte at a time now, through a scalar matcher
+    /// written beside its wide one. The two are separate pieces of arithmetic over the same
+    /// data — a table index against a shuffle, a compare against a splat — so they have to be
+    /// held to every byte, not just the ones a shared test haystack happens to contain.
+    #[test]
+    fn per_byte_matcher_agrees_with_the_set() {
+        for set in sets() {
+            // Something to pad with that the set does not hold, so only the planted byte can
+            // answer. Every set here leaves at least one byte over.
+            let pad = (0..=u8::MAX)
+                .find(|byte| !set.contains(byte))
+                .expect("no set here holds every byte");
+
+            for (name, searcher) in [("vector", build(&set)), ("word", build_word(&set))] {
+                for byte in 0..=u8::MAX {
+                    // Lengths either side of the scalar probe and of the staged pair's own
+                    // ladder, with the byte walked across each so a probe that stops early
+                    // and a stage that starts late both show up.
+                    for len in [1, 2, 3, 4, 5, 7, 8, 9, 15] {
+                        for offset in 0..len {
+                            let mut haystack = vec![pad; len];
+                            haystack[offset] = byte;
+                            let expected = set.contains(&byte).then_some(offset);
+                            assert_eq!(
+                                searcher.find(&haystack),
+                                expected,
+                                "{name} set {set:?} byte {byte} len {len} offset {offset}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// `nth` has to consume the same matches `next` would, so mixing the two must walk the
     /// haystack exactly once.
     #[test]

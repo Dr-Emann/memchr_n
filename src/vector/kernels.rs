@@ -9,6 +9,8 @@ use fearless_simd::{u8x16, u8x32, u8x64};
 #[derive(Copy, Clone)]
 pub(crate) struct AnyOf<S: Simd, const N: usize> {
     needles: [u8x16<S>; N],
+    /// The same needles, unsplatted, for [`Kernel::matches_byte`]. See [`plain`].
+    bytes: [u8; N],
 }
 
 impl<S: Simd, const N: usize> Kernel<S> for AnyOf<S, N> {
@@ -16,9 +18,10 @@ impl<S: Simd, const N: usize> Kernel<S> for AnyOf<S, N> {
         const { assert!(N <= 3, "`splatted_needles` holds three") }
         // SAFETY: the caller guarantees `splatted_needles` is live, and the assertion above
         // keeps the reads below inside it.
-        let splatted = unsafe { data.splatted_needles };
+        let splatted = unsafe { &data.splatted_needles };
         Self {
-            needles: core::array::from_fn(|i| u8x16::load_array(simd, splatted[i])),
+            needles: core::array::from_fn(|i| u8x16::load_array_ref(simd, &splatted[i])),
+            bytes: core::array::from_fn(|i| plain(&splatted[i])),
         }
     }
 
@@ -30,26 +33,43 @@ impl<S: Simd, const N: usize> Kernel<S> for AnyOf<S, N> {
         }
         matched
     }
+
+    #[inline(always)]
+    fn matches_byte(&self, byte: u8) -> bool {
+        self.bytes.contains(&byte)
+    }
 }
 
 #[derive(Copy, Clone)]
 pub(crate) struct OneRange<S: Simd> {
     start: u8x16<S>,
     last: u8x16<S>,
+    /// The same endpoints, unsplatted, for [`Kernel::matches_byte`]. See [`plain`].
+    bounds: (u8, u8),
 }
 
 impl<S: Simd> Kernel<S> for OneRange<S> {
     unsafe fn from_data(simd: S, data: &KernelData) -> Self {
         // SAFETY: the caller guarantees `splatted_range` is live.
-        let [start, last] = unsafe { data.splatted_range };
+        let [start, last] = unsafe { &data.splatted_range };
         Self {
-            start: u8x16::load_array(simd, start),
-            last: u8x16::load_array(simd, last),
+            start: u8x16::load_array_ref(simd, start),
+            last: u8x16::load_array_ref(simd, last),
+            bounds: (plain(start), plain(last)),
         }
     }
     #[inline(always)]
     fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
         chunk.simd_ge(V::block_splat(self.start)) & chunk.simd_le(V::block_splat(self.last))
+    }
+
+    #[inline(always)]
+    fn matches_byte(&self, byte: u8) -> bool {
+        // One subtraction would do instead of two compares, but the data here is a pair of
+        // bounds and not a start and a span, so spelling it as the pair keeps this reading
+        // like the vector kernel above.
+        let (start, last) = self.bounds;
+        start <= byte && byte <= last
     }
 }
 
@@ -83,6 +103,16 @@ impl<S: Simd> Kernel<S> for SmallSet {
 
         !(lo & hi).simd_eq(0)
     }
+
+    #[inline(always)]
+    fn matches_byte(&self, byte: u8) -> bool {
+        // The shuffle above is a table index, so a scalar one is the same index spelled with
+        // brackets. A member sets the same bit in both tables, so a shared bit means the two
+        // nibbles came from one member rather than from two different ones.
+        let lo = self.lo_lookup.0[usize::from(byte & 0x0F)];
+        let hi = self.hi_lookup.0[usize::from(byte >> 4)];
+        lo & hi != 0
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -114,6 +144,18 @@ impl<S: Simd> Kernel<S> for SingleNibble {
         let should_match = table.swizzle_dyn_within_blocks(non_const_nibbles);
         chunk.simd_eq(should_match)
     }
+
+    #[inline(always)]
+    fn matches_byte(&self, byte: u8) -> bool {
+        // As in the vector kernel: the variable nibble picks the one member it could be, and
+        // the byte matches only by being that member. An unfilled slot holds a sentinel whose
+        // own variable nibble is not its index, so it cannot be picked by the byte it holds.
+        let variable_nibble = match self.which {
+            ConstantNibble::Lo => byte >> 4,
+            ConstantNibble::Hi => byte & 0x0F,
+        };
+        self.table[usize::from(variable_nibble)] == byte
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -138,6 +180,29 @@ impl<S: Simd> Kernel<S> for AnyByte {
         let bit = bits.swizzle_dyn_within_blocks(chunk & 0b0111);
         !(bit & membership_bits(&self.bitset, chunk >> 3)).simd_eq(0)
     }
+
+    #[inline(always)]
+    fn matches_byte(&self, byte: u8) -> bool {
+        // The gather above is a bit test through two shuffles because a vector has no
+        // addressable table. One byte can just index the table it is a bit of.
+        self.bitset.contains(byte)
+    }
+}
+
+/// The byte a block of [`KernelData`] holds splatted, for [`Kernel::matches_byte`].
+///
+/// # Why this borrows
+///
+/// The block has to stay in memory, which is why every caller reaches it through
+/// `&data.<field>` and loads its vector with `load_array_ref`. Copy the block out of the union
+/// first and it becomes a value LLVM owns, and one scalar read of it is then enough for LLVM
+/// to split the whole thing into sixteen: the single aligned load that fed the broadcast turns
+/// into a byte load and fifteen `vpinsrb`s to put the vector back together, on every call at
+/// every haystack length. That is worth 3.3ns against 8.2 on a 32-byte `OneRange` search — far
+/// more than the short-haystack probe this exists for can win back.
+#[inline(always)]
+fn plain(splatted: &[u8; 16]) -> u8 {
+    splatted[0]
 }
 
 /// Looks each byte's high five bits up in the 256-bit table, giving the table byte

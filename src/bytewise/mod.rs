@@ -34,7 +34,12 @@ pub(crate) trait Kernel: Copy {
     /// As in [`crate::vector::Kernel::from_data`].
     unsafe fn from_data(data: &KernelData) -> Self;
 
-    fn matches(&self, byte: u8) -> bool;
+    /// Whether the byte set holds `byte`.
+    ///
+    /// The whole kernel here, spelled as the wider families spell the scalar half of theirs:
+    /// there a chunk-at-a-time matcher sits beside it for the haystacks that can fill a
+    /// chunk, and here there is nothing a chunk would buy.
+    fn matches_byte(&self, byte: u8) -> bool;
 }
 
 /// Marks each matching byte of a word at bit 7 of its own lane.
@@ -50,7 +55,7 @@ pub(crate) trait Kernel: Copy {
 fn word_marks<K: Kernel>(kernel: &K, word: u64) -> u64 {
     let mut marks = 0;
     for i in 0..WORD_BYTES {
-        marks |= u64::from(kernel.matches((word >> (i * 8)) as u8)) << (i * 8 + 7);
+        marks |= u64::from(kernel.matches_byte((word >> (i * 8)) as u8)) << (i * 8 + 7);
     }
     marks
 }
@@ -105,7 +110,7 @@ fn tail_bits<K: Kernel>(kernel: &K, tail: &[u8]) -> u64 {
     }
     let packed = words.len() * WORD_BYTES;
     for (i, &byte) in rest.iter().enumerate() {
-        bits |= u64::from(kernel.matches(byte)) << (packed + i);
+        bits |= u64::from(kernel.matches_byte(byte)) << (packed + i);
     }
     bits
 }
@@ -121,7 +126,7 @@ pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
         total += word_marks(&kernel, u64::from_le_bytes(*word)).count_ones() as usize;
     }
     for &byte in tail {
-        total += usize::from(kernel.matches(byte));
+        total += usize::from(kernel.matches_byte(byte));
     }
     total
 }

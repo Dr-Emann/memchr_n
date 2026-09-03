@@ -57,6 +57,13 @@ pub(crate) trait Kernel: Copy {
     unsafe fn from_data(data: &KernelData) -> Self;
 
     fn matches(&self, word: u64) -> u64;
+
+    /// Whether the byte set holds `byte`.
+    ///
+    /// As in [`crate::vector::Kernel::matches_byte`], and for the same haystack: one too
+    /// short to fill the unit the kernel works in. Here that is [`short_tail_bits`]'s two
+    /// staged ends and [`movemask`]'s multiply, against a compare per byte.
+    fn matches_byte(&self, byte: u8) -> bool;
 }
 
 /// Matches `tail`, the final bytes of `haystack`, returning their bits at positions
@@ -143,6 +150,17 @@ pub(crate) fn find_first<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize>
     fn first_lane(marks: u64) -> usize {
         debug_assert!(marks != 0);
         marks.trailing_zeros() as usize / 8
+    }
+
+    // A haystack below one word is all of [`short_tail_bits`]: a staging buffer written as two
+    // narrow stores and read back as one word, [`movemask`]'s multiply, and the slide that
+    // puts the two ends back where they came from — to answer about at most seven bytes.
+    // Asking about them one at a time is shorter than that at every one of those lengths, and
+    // for a miss as much as for a match: 2.1ns to 4.2 against 4.5 to 5.0, measured through
+    // `Backend::Scalar` on an AVX2 host. So unlike the vector family's
+    // [`crate::vector::PROBE_BYTES`], this needs no cutoff.
+    if haystack.len() < WORD_BYTES {
+        return haystack.iter().position(|&byte| kernel.matches_byte(byte));
     }
 
     let (words, tail) = haystack.as_chunks::<WORD_BYTES>();

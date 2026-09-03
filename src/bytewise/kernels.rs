@@ -20,7 +20,7 @@ impl Kernel for AnyByte {
     }
 
     #[inline]
-    fn matches(&self, byte: u8) -> bool {
+    fn matches_byte(&self, byte: u8) -> bool {
         self.bitset.contains(byte)
     }
 }
@@ -42,7 +42,7 @@ mod tests {
             let kernel = AnyByte { bitset };
             for byte in 0..=u8::MAX {
                 assert_eq!(
-                    kernel.matches(byte),
+                    kernel.matches_byte(byte),
                     set.contains(&byte),
                     "{byte} in {set:?}"
                 );
