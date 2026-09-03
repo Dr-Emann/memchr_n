@@ -10,6 +10,31 @@ const _: () = assert!(MatchedBitset::BITS as usize >= CHUNK_BYTES * 2);
 
 const BLOCK_BYTES: usize = 16;
 
+/// How many leading bytes [`find_first_short`] asks about one at a time before it stages a
+/// haystack too short to fill a vector.
+///
+/// Staging costs the same whether the answer is the first byte or the last: the two ends go
+/// through general-purpose registers into a vector, the vector produces a bitmask, and only
+/// then is there an answer. A probe with [`Kernel::matches_byte`] is a compare and a branch,
+/// so it answers its own byte in about a cycle — which is what `memchr` does below its own
+/// vector width, and the whole of what it was beating us by there.
+///
+/// # Why one
+///
+/// Every byte probed is a byte the staging behind it pays for anyway, so a probe that does not
+/// answer is wasted work. Swept over 0, 1, 2, 4, 8 and 16 on an AVX2 host, at 1, 4, 8 and 12
+/// bytes, against a match at the front, a match halfway, and no match at all:
+///
+/// - the first byte carries the whole win. A match at the front went from 3.3-4.8ns to
+///   2.7-3.3, and no longer probe beat that by more than a timer tick.
+/// - the bytes after it only cost. A miss at twelve bytes ran 4.2ns at one probe, 4.5 at two,
+///   5.0 at four, 5.9 at eight and 6.2 at sixteen — the last of which is `memchr`'s own walk,
+///   against 3.6 for staging alone.
+///
+/// A one-byte haystack is the one length where probing the lot wins outright, and one probe
+/// already covers it: it answers and returns without staging anything.
+pub(crate) const PROBE_BYTES: usize = 1;
+
 /// Tests a chunk of [`CHUNK_BYTES`] bytes against a byte set.
 pub(crate) trait Kernel<S: Simd>: Copy {
     /// Reads this kernel out of the field of `data` that holds it.
@@ -24,6 +49,18 @@ pub(crate) trait Kernel<S: Simd>: Copy {
         &self,
         chunk: V,
     ) -> V::Mask;
+
+    /// Whether the byte set holds `byte`.
+    ///
+    /// The scalar counterpart of [`matches`](Self::matches), and not a fallback for a target
+    /// that cannot run it: every kernel here is cheaper per byte in a vector, and this exists
+    /// for the haystack that cannot fill one. Below a vector's width the lanes have to be
+    /// staged before they can be tested, and staging costs the same whether the answer is the
+    /// first byte or the last, where a compare per byte answers the first byte in a compare.
+    ///
+    /// Each of these reads the same data the vector kernel does, so the two agree by
+    /// construction rather than by keeping two descriptions of one set in step.
+    fn matches_byte(&self, byte: u8) -> bool;
 }
 
 /// Whether the target has a single-instruction dynamic byte shuffle.
@@ -198,6 +235,9 @@ pub(crate) fn find_first<S: Simd, K: Kernel<S>>(
 /// where blocks and a tail would take up to four for the same bytes and branch between them.
 /// The reads may see a byte twice, which costs nothing, because the front is tested first and
 /// a match there is at the offset it reports.
+///
+/// Below the narrowest vector the ladder runs out, and the bottom rung is [`PROBE_BYTES`]
+/// scalar probes ahead of the staged pair.
 #[inline(always)]
 fn find_first_short<S: Simd, K: Kernel<S>>(
     simd: S,
@@ -235,18 +275,29 @@ fn find_first_short<S: Simd, K: Kernel<S>>(
             .then(|| len - BLOCK_BYTES + matched.to_bitmask().trailing_zeros() as usize);
     }
 
-    // Below one vector there is nothing to overlap with, so the two ends are staged into one
-    // instead — and read back as two halves rather than slid into place, since the front
-    // half answers whenever it can and the back half is only reached when it cannot.
-    if haystack.is_empty() {
+    // Below one vector there is nothing to overlap with, so the ladder runs out and the
+    // leading bytes are asked for one at a time instead. See [`PROBE_BYTES`].
+    for (offset, &byte) in haystack.iter().take(PROBE_BYTES).enumerate() {
+        if kernel.matches_byte(byte) {
+            return Some(offset);
+        }
+    }
+    if len <= PROBE_BYTES {
         return None;
     }
-    let (bits, staged) = staged_ends_bits(simd, &kernel, haystack);
+
+    // What the probe did not reach is staged into one vector as two ends — and read back as
+    // two halves rather than slid into place, since the front half answers whenever it can
+    // and the back half is only reached when it cannot.
+    let rest = &haystack[PROBE_BYTES..];
+    let (bits, staged) = staged_ends_bits(simd, &kernel, rest);
     let kept = !(u64::MAX << staged);
     let front = bits & kept;
     if front != 0 {
-        return Some(front.trailing_zeros() as usize);
+        return Some(PROBE_BYTES + front.trailing_zeros() as usize);
     }
+    // The back end was read from the end of the haystack either way, so its offsets are the
+    // ones it would have had without the probe.
     let back = (bits >> staged) & kept;
     (back != 0).then(|| len - staged + back.trailing_zeros() as usize)
 }

@@ -5,9 +5,10 @@
 //! together, so `oneshot - prebuilt - build` is what the two cost when neither can be
 //! optimised against the other — mostly the indirect call standing between them.
 //!
-//! Two haystacks per length: `hit` matches at offset 0, so the search returns as early as it
-//! can and the row is almost all fixed cost; `miss` never matches, so the row is the whole
-//! scan.
+//! Three haystacks per length. `hit` matches at offset 0, so the search returns as early as it
+//! can and the row is almost all fixed cost. `mid` matches halfway, which is what a scan that
+//! answers a byte at a time has to pay for the offsets it walks past. `miss` never matches, so
+//! the row is the whole scan.
 
 use memchr_n::MemchrN;
 use std::hint::black_box;
@@ -54,12 +55,35 @@ fn best<T>(mut f: impl FnMut() -> T) -> f64 {
     best
 }
 
-/// A haystack of `len` bytes that no set above matches, with `needles[0]` planted at offset 0
-/// when `hit`.
-fn haystack(len: usize, needles: &[u8], hit: bool) -> Vec<u8> {
+/// Where the one match in a haystack sits, if there is one.
+#[derive(Copy, Clone)]
+enum Planted {
+    Front,
+    Middle,
+    Nowhere,
+}
+
+impl Planted {
+    fn label(self) -> &'static str {
+        match self {
+            Planted::Front => "hit",
+            Planted::Middle => "mid",
+            Planted::Nowhere => "miss",
+        }
+    }
+}
+
+/// A haystack of `len` bytes that no set above matches, with `needles[0]` planted where
+/// `planted` says.
+fn haystack(len: usize, needles: &[u8], planted: Planted) -> Vec<u8> {
     let mut hay = vec![b'.'; len];
-    if hit && !hay.is_empty() {
-        hay[0] = needles[0];
+    let offset = match planted {
+        Planted::Front => 0,
+        Planted::Middle => len / 2,
+        Planted::Nowhere => return hay,
+    };
+    if offset < len {
+        hay[offset] = needles[0];
     }
     hay
 }
@@ -79,9 +103,9 @@ fn main() {
         let build = best(|| MemchrN::new(black_box(needles)));
         let prebuilt_finder = MemchrN::new(needles);
 
-        for hit in [true, false] {
+        for planted in [Planted::Front, Planted::Middle, Planted::Nowhere] {
             for len in LENS {
-                let hay = haystack(len, needles, hit);
+                let hay = haystack(len, needles, planted);
                 let hay = hay.as_slice();
 
                 let prebuilt = best(|| black_box(&prebuilt_finder).iter(black_box(hay)).next());
@@ -89,7 +113,7 @@ fn main() {
                 let oneshot = best(|| MemchrN::new(black_box(needles)).find(black_box(hay)));
                 let theirs = theirs(needles, hay);
 
-                let label = if hit { "hit" } else { "miss" };
+                let label = planted.label();
                 println!(
                     "{:>14} {:>7}/{:<4} {:>7.1} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>9.1}",
                     name,
