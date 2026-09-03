@@ -330,6 +330,23 @@ impl KernelData {
 ///
 /// [`Scan::find_next`] needs no equivalent: an [`IterState`] is already one pointer, and one
 /// the caller owns.
+///
+/// # Two words is the limit, and not because rustc is being careful
+///
+/// No calling convention avoids this. An aggregate of two words is a `ScalarPair` and rides in
+/// registers; one of three is not, and every convention rustc offers on the targets here either
+/// hands over a pointer to it or copies it to the stack — `extern "Rust"`, `"C"`, `"sysv64"`,
+/// `"win64"`, `"vectorcall"`, `"rust-cold"`, `"rust-preserve-none"`, `"tail"`, checked on
+/// `x86-64` and `aarch64`. `"rust-preserve-none"` is the instructive one: it has twelve
+/// argument registers rather than six and still passes three words as a pointer, because
+/// whether an aggregate goes indirect is settled by rustc before any register is assigned.
+///
+/// What does work is not bundling at all. Three *arguments* — a pointer and a slice — are three
+/// registers, and a closure that captures nothing is zero-sized, so a `vectorize` taking the
+/// arguments alongside the closure rather than closed over by it would leave nothing for the
+/// entry point to own and the `jmp` would stand without this type. Rust has no variadic
+/// generics, so that means one entry point per arity in `fearless_simd`, which is the shape to
+/// ask for if this is ever worth more than the 1.015 it currently measures.
 struct Search<'a> {
     data: &'a KernelData,
     haystack: &'a [u8],
