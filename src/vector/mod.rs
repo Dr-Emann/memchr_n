@@ -1,6 +1,6 @@
 pub(crate) mod kernels;
 
-use crate::{IterState, KernelData, Kind, MatchedBitset, Scan, Search, never_scan};
+use crate::{IterState, KernelData, Kind, MatchedBitset, Scan, never_scan};
 use core::mem::transmute_copy;
 use fearless_simd::prelude::*;
 use fearless_simd::{Level, i8x16, i8x64, kernel, u8x16, u8x32, u8x64, u64x2};
@@ -502,9 +502,11 @@ unsafe fn token<S: Simd>() -> S {
 /// is passed indirectly, so it lands in the trampoline's own frame, which the call then has
 /// to outlive.
 ///
-/// Two words is why [`Search`] exists, and why `find_next` does not need it. Both leave these
-/// carrying one or two pointers, all of them into the caller's memory, and all three come out
-/// as `jmp`.
+/// So a three-word argument list becomes a three-word closure, which is passed indirectly and
+/// so builds that frame. Bundling the arguments behind one pointer avoids it — but only by
+/// moving the frame into [`MemchrN::find`](crate::MemchrN::find), which then has to build the
+/// bundle and can no longer tail-call either. See [`Scan`] for what that cost and why the
+/// bundle is gone.
 ///
 /// # Where there is no trampoline at all
 ///
@@ -522,12 +524,10 @@ unsafe fn token<S: Simd>() -> S {
 ///
 /// # What the trampoline costs where it is left
 ///
-/// Nothing that has survived measurement. Putting the level's `#[target_feature]` on the entry
-/// point instead would remove it and let the arguments stay in registers rather than going
-/// through [`Search`]; measured against that, `find` over the lengths where a `jmp` could
-/// matter came out at a mean ratio of 1.015 over eleven points, alternating direction six
-/// times. It was worth having when the closure was three words and the trampoline built a
-/// frame to hold it — 1.13-1.30x — which is what [`Search`] is for.
+/// One stack frame per search, on the entry point rather than on `find`. On `x86-64` that is a
+/// `sub`, three stores and a `call` where a `jmp` would do, and it does not survive measurement
+/// against putting `#[target_feature]` here by hand: 1.004 over 252 points on an AVX-512 host,
+/// 90 faster and 108 slower. On `aarch64` there is no trampoline left to pay for at all.
 ///
 /// It could not be taken anyway: there is no way to write that attribute from public API.
 /// Spelling the feature list out here means keeping a copy of `fearless_simd`'s in step,
@@ -570,15 +570,15 @@ macro_rules! level_scans {
             /// # Safety
             ///
             /// As in [`find_next`].
-            unsafe fn count_all<K: Kernel<Token>>(search: &Search<'_>) -> usize {
+            unsafe fn count_all<K: Kernel<Token>>(data: &KernelData, haystack: &[u8]) -> usize {
                 // SAFETY: as in `find_next`.
                 let simd = unsafe { token::<Token>() };
                 simd.vectorize(
                     #[inline(always)]
                     move || {
                         // SAFETY: as above.
-                        let kernel = unsafe { K::from_data(simd, search.data) };
-                        super::count(simd, search.haystack, kernel)
+                        let kernel = unsafe { K::from_data(simd, data) };
+                        super::count(simd, haystack, kernel)
                     },
                 )
             }
@@ -586,15 +586,15 @@ macro_rules! level_scans {
             /// # Safety
             ///
             /// As in [`find_next`].
-            unsafe fn find_first<K: Kernel<Token>>(search: &Search<'_>) -> Option<usize> {
+            unsafe fn find_first<K: Kernel<Token>>(data: &KernelData, haystack: &[u8]) -> Option<usize> {
                 // SAFETY: as in `find_next`.
                 let simd = unsafe { token::<Token>() };
                 simd.vectorize(
                     #[inline(always)]
                     move || {
                         // SAFETY: as above.
-                        let kernel = unsafe { K::from_data(simd, search.data) };
-                        super::find_first(simd, search.haystack, kernel)
+                        let kernel = unsafe { K::from_data(simd, data) };
+                        super::find_first(simd, haystack, kernel)
                     },
                 )
             }

@@ -15,7 +15,7 @@
 pub(crate) mod kernels;
 
 use crate::swar::{WORD_BYTES, movemask};
-use crate::{IterState, KernelData, MatchedBitset, Scan, Search};
+use crate::{IterState, KernelData, MatchedBitset, Scan};
 
 const CHUNK: usize = 32;
 
@@ -212,16 +212,16 @@ pub(crate) fn scan<K: Kernel>() -> &'static Scan {
         self::find_next(state, kernel)
     }
 
-    unsafe fn count_all<K: Kernel>(search: &Search<'_>) -> usize {
+    unsafe fn count_all<K: Kernel>(data: &KernelData, haystack: &[u8]) -> usize {
         // SAFETY: as above.
-        let kernel = unsafe { K::from_data(search.data) };
-        self::count(search.haystack, kernel)
+        let kernel = unsafe { K::from_data(data) };
+        self::count(haystack, kernel)
     }
 
-    unsafe fn find_first<K: Kernel>(search: &Search<'_>) -> Option<usize> {
+    unsafe fn find_first<K: Kernel>(data: &KernelData, haystack: &[u8]) -> Option<usize> {
         // SAFETY: as above.
-        let kernel = unsafe { K::from_data(search.data) };
-        self::find_first(search.haystack, kernel)
+        let kernel = unsafe { K::from_data(data) };
+        self::find_first(haystack, kernel)
     }
 
     &const {

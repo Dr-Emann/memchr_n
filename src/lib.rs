@@ -146,12 +146,8 @@ impl MemchrN {
     /// Returns the offset of the first matching byte in `haystack`.
     #[inline]
     pub fn find(&self, haystack: &[u8]) -> Option<usize> {
-        let search = Search {
-            data: &self.data,
-            haystack,
-        };
         // SAFETY: as in `Iter::next`.
-        unsafe { (self.scan.find_first)(&search) }
+        unsafe { (self.scan.find_first)(&self.data, haystack) }
     }
 
     /// Returns an iterator over the offsets of every matching byte in `haystack`.
@@ -320,57 +316,6 @@ impl KernelData {
     }
 }
 
-/// A kernel and the bytes to run it over.
-///
-/// Bundled so that a [`Scan`] entry point taking both has one pointer to pass on rather than
-/// three words. That is not about the words: it is that a `vectorize` closure carrying three
-/// of them lands in the entry point's own stack frame, which the call must then outlive, so
-/// the entry point cannot tail-call into the target-feature context and has to build a frame
-/// to hold it. Handed one pointer into the caller's frame instead, it is a `jmp`.
-///
-/// [`Scan::find_next`] needs no equivalent: an [`IterState`] is already one pointer, and one
-/// the caller owns.
-///
-/// # Two words is the limit, and not because rustc is being careful
-///
-/// No calling convention avoids this. An aggregate of two words is a `ScalarPair` and rides in
-/// registers; one of three is not, and every convention rustc offers on the targets here either
-/// hands over a pointer to it or copies it to the stack — `extern "Rust"`, `"C"`, `"sysv64"`,
-/// `"win64"`, `"vectorcall"`, `"rust-cold"`, `"rust-preserve-none"`, `"tail"`, checked on
-/// `x86-64` and `aarch64`. `"rust-preserve-none"` is the instructive one: it has twelve
-/// argument registers rather than six and still passes three words as a pointer, because
-/// whether an aggregate goes indirect is settled by rustc before any register is assigned.
-///
-/// What does work is not bundling all three into one thing. Nothing here is too big for a
-/// register; only the aggregate holding all of it is. So a `vectorize` that took one argument
-/// beside the closure would do, with the three words split as a piece of one and a piece of
-/// two:
-///
-/// ```ignore
-/// fn vectorize1<A, R, F: FnOnce(A) -> R>(self, a: A, f: F) -> R;
-/// // …reached as, from an entry point taking the two separately:
-/// simd.vectorize1(data, move |data| find_first(simd, haystack, K::from_data(simd, data)))
-/// ```
-///
-/// The argument is one word, the closure captures the slice and is a `ScalarPair`, neither is
-/// over the limit, and the entry point comes out a bare `jmp` with nothing of its own to keep
-/// alive. Two pieces reach four words, so this needs one method and not the family per arity
-/// that variadic arguments would want. Put the smaller piece in the argument position: the
-/// other order tail-calls too, but spends four `mov`s rotating registers the entry point was
-/// already handed in the right places.
-///
-/// Chaining ordinary calls is not a way to get there. The words travel between them in
-/// registers happily enough, but the closure is built wherever `vectorize` is finally called,
-/// and that frame is the whole problem — relaying through one more function turns the entry
-/// point into a `jmp` and gives the relay the identical `sub $0x18, %rsp` and three stores.
-/// The frame moves; it does not go away.
-///
-/// All of which is the shape to ask `fearless_simd` for if this is ever worth more than the
-/// 1.015 it currently measures.
-struct Search<'a> {
-    data: &'a KernelData,
-    haystack: &'a [u8],
-}
 
 /// The search loops for one level-and-kernel pair, chosen when the [`MemchrN`] is built.
 ///
@@ -380,6 +325,34 @@ struct Search<'a> {
 /// The level and the [`Kind`] are both fixed for a [`MemchrN`]'s lifetime, so resolving
 /// them here also removes the two matches every refill used to run, and keeps `levels * kinds`
 /// copies of the loop body out of [`Iter::next`].
+///
+/// # Why these take their arguments loose
+///
+/// A pointer and a slice are three words, and three words are one too many to ride in
+/// registers: two are a `ScalarPair`, three are an aggregate and go indirect. So bundling them
+/// into one `&Search` argument was tried, to keep the `vectorize` trampoline in
+/// [`vector::level_scans!`] a bare `jmp` rather than a stack frame.
+///
+/// It did not remove that frame. It moved it up here, into [`MemchrN::find`], which then had to
+/// build the bundle before it could pass a pointer to it — and, holding memory the callee would
+/// read, could no longer tail-call. Inlined into its caller on `aarch64`, `find` went from
+///
+/// ```text
+/// ldr x8, [x0, #0x30]     ldr x8, [x0, #0x30]    sub  sp, sp, #0x30
+/// ldr x3, [x8, #0x10]     ldr x3, [x8, #0x10]    stp  x29, x30, [sp, #0x20]
+/// br  x3                  br  x3                 …3 stores, blr x8, restore, ret
+/// ```
+///
+/// — the left being both loose arguments and the bundle removed again, the right being the
+/// bundle. That is a fixed cost on every search, invisible in throughput and in one-shot
+/// (where a 16ns construction hides it), and it measured 2.4ns against 12.8ns of prebuilt
+/// `find` on NEON: a frame record to save and restore, three stores the callee immediately
+/// reloads, and no tail call at either end.
+///
+/// On `x86-64` the same trade is a wash — 1.004 over 252 points — because there the frame only
+/// moves between `find` and the entry point rather than disappearing, and `x86` pays less for
+/// it. `aarch64` is where it disappears, because [`Simd::vectorize`](fearless_simd::Simd)
+/// leaves no trampoline for a level that is the compile-time baseline, which NEON always is.
 #[derive(Copy, Clone)]
 struct Scan {
     find_next: unsafe fn(&KernelData, &mut IterState<'_>) -> MatchedBitset,
@@ -388,7 +361,7 @@ struct Scan {
     /// Takes that remainder rather than the [`IterState`] it comes from: counting reads the
     /// haystack once and never resumes, so a scan has nothing to write back, and the state
     /// need not go to memory across the call the way [`find_next`](Scan::find_next)'s does.
-    count_all: unsafe fn(&Search<'_>) -> usize,
+    count_all: unsafe fn(&KernelData, &[u8]) -> usize,
     /// [`MemchrN::find`]'s whole search, rather than the first refill of an iteration.
     ///
     /// Both of the above are shaped for an iterator that will call them again: they take the
@@ -396,7 +369,7 @@ struct Scan {
     /// in a [`MatchedBitset`] the caller has to unpack. A search that stops at the first
     /// match wants neither, and pays for both — which on a short haystack is most of the
     /// call.
-    find_first: unsafe fn(&Search<'_>) -> Option<usize>,
+    find_first: unsafe fn(&KernelData, &[u8]) -> Option<usize>,
 }
 
 /// The [`Scan`] for a byte set that nothing can match.
@@ -406,11 +379,11 @@ pub(crate) fn never_scan() -> &'static Scan {
         0
     }
 
-    fn count_all(_search: &Search<'_>) -> usize {
+    fn count_all(_data: &KernelData, _haystack: &[u8]) -> usize {
         0
     }
 
-    fn find_first(_search: &Search<'_>) -> Option<usize> {
+    fn find_first(_data: &KernelData, _haystack: &[u8]) -> Option<usize> {
         None
     }
 
@@ -477,12 +450,8 @@ impl<'a> Iterator for Iter<'a> {
         // SAFETY: `pos` only ever moves to an offset a scan reached, so it is in bounds.
         let unscanned = unsafe { self.state.haystack.get_unchecked(self.state.pos..) };
         if !unscanned.is_empty() {
-            let search = Search {
-                data: &self.memchr_n.data,
-                haystack: unscanned,
-            };
-            // SAFETY: as in `next`.
-            total += unsafe { (self.memchr_n.scan.count_all)(&search) };
+                        // SAFETY: as in `next`.
+            total += unsafe { (self.memchr_n.scan.count_all)(&self.memchr_n.data, unscanned) };
         }
         total
     }
@@ -976,6 +945,7 @@ mod tests {
         assert_eq!(searcher.iter(&haystack).count(), len);
     }
 }
+
 
 
 
