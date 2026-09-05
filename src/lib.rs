@@ -13,8 +13,6 @@ use core::range::RangeInclusive;
 use fearless_simd::Level;
 
 /// Matches of one scan, the `i`th bit (numbered from lsb to msb) is 1 if the `i`th byte matched
-///
-/// Wide enough for the two `CHUNK_BYTES`s that [`vector::find_next`] scans per iteration.
 type MatchedBitset = u128;
 
 /// Which family of kernels a [`MemchrN`] is built from.

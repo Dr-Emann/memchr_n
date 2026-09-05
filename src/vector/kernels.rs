@@ -215,8 +215,8 @@ fn membership_bits<S: Simd, V: SimdInt<S, Element = u8, ByteVector = V>>(
     let simd = indices.witness();
     let table = u8x32::load_array_ref(simd, bitset.as_array());
 
-    const { assert!(V::N == 16 || V::N == 32 || V::N == 64) }
-    match V::N {
+    const { assert!(V::LEN == 16 || V::LEN == 32 || V::LEN == 64) }
+    match V::LEN {
         16 => {
             let indices = u8x16::from_slice(simd, indices.as_slice());
             // TODO: When concat_swizzle_dyn is available, use it
@@ -235,7 +235,7 @@ fn membership_bits<S: Simd, V: SimdInt<S, Element = u8, ByteVector = V>>(
         }
         64 => {
             let indices = u8x64::from_slice(simd, indices.as_slice());
-            let res = if S::u8s::N >= 64 {
+            let res = if S::u8s::LEN >= 64 {
                 table.combine(table).swizzle_dyn(indices)
             } else {
                 let (lo_indices, hi_indices) = indices.split();
