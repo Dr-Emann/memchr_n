@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "memchr_n"
-version = "0.1.0"
+name = "memchr-n"
+version = "0.0.1"
