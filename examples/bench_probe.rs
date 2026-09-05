@@ -2,9 +2,11 @@
 //! without criterion's sampling in the way. Reports the best of several rounds, which
 //! is far more stable run-to-run than criterion's `--quick` estimates.
 
+mod timing;
+
 use memchr_n::MemchrN;
 use std::hint::black_box;
-use std::time::Instant;
+use timing::best;
 
 const HAYSTACK: &[u8] = include_bytes!("../benches/haystacks/sherlock/huge.txt");
 
@@ -12,19 +14,6 @@ const ROUNDS: u32 = 100;
 
 fn finder(needles: &[u8]) -> MemchrN {
     MemchrN::new(needles)
-}
-
-fn best<T>(rounds: u32, iters: u32, mut f: impl FnMut() -> T) -> f64 {
-    let mut best = f64::MAX;
-    for _ in 0..rounds {
-        let start = Instant::now();
-        for _ in 0..iters {
-            black_box(f());
-        }
-        let elapsed = start.elapsed().as_secs_f64() / f64::from(iters);
-        best = best.min(elapsed);
-    }
-    best
 }
 
 fn row(name: &str, ours: f64, theirs: Option<f64>) {

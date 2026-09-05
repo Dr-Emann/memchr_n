@@ -75,7 +75,7 @@ pub(crate) trait Kernel: Copy {
 /// word has to be staged, which [`short_tail_bits`] does.
 #[inline]
 fn tail_bits<K: Kernel>(kernel: &K, haystack: &[u8], tail: &[u8]) -> u64 {
-    debug_assert!(0 < tail.len() && tail.len() < WORD_BYTES);
+    debug_assert!(!tail.is_empty() && tail.len() < WORD_BYTES);
     if let Some(word) = haystack.last_chunk::<WORD_BYTES>() {
         let matched = kernel.matches(u64::from_le_bytes(*word));
         movemask(matched) >> (WORD_BYTES - tail.len())
@@ -113,7 +113,7 @@ fn short_tail_bits<K: Kernel>(kernel: &K, haystack: &[u8]) -> u64 {
     }
 
     let len = haystack.len();
-    debug_assert!(0 < len && len < WORD_BYTES);
+    debug_assert!(!haystack.is_empty() && len < WORD_BYTES);
     let (buf, staged) = match len {
         4.. => (stage::<4>(haystack), 4),
         2..4 => (stage::<2>(haystack), 2),
@@ -129,7 +129,7 @@ pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
 
     let mut total = 0;
     for word in words {
-        total += kernel.matches(u64::from_ne_bytes(*word)).count_ones() as usize;
+        total += kernel.matches(u64::from_le_bytes(*word)).count_ones() as usize;
     }
     if !tail.is_empty() {
         total += short_tail_bits(&kernel, tail).count_ones() as usize;
@@ -207,21 +207,21 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> Matc
         let second_match = kernel.matches(u64::from_le_bytes(*second_word));
         if (first_match | second_match) != 0 {
             state.bits_offset = from;
-            state.pos = from + first_word.len() + second_word.len();
+            state.pos = from + 2 * WORD_BYTES;
             return MatchedBitset::from(
                 movemask(first_match) | movemask(second_match) << WORD_BYTES,
             );
         }
-        from += first_word.len() + second_word.len();
+        from += 2 * WORD_BYTES;
     }
     for word in words {
         let matches = kernel.matches(u64::from_le_bytes(*word));
         if matches != 0 {
             state.bits_offset = from;
-            state.pos = from + word.len();
+            state.pos = from + WORD_BYTES;
             return MatchedBitset::from(movemask(matches));
         }
-        from += word.len();
+        from += WORD_BYTES;
     }
 
     state.bits_offset = haystack.len() - tail.len();
@@ -233,28 +233,9 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> Matc
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn movemask_gathers_high_bits() {
-        for expected in 0..256u64 {
-            let mut marks = 0;
-            for i in 0..WORD_BYTES {
-                marks |= ((expected >> i) & 1) << (i * 8 + 7);
-            }
-            assert_eq!(movemask(marks), expected, "marks {marks:#018x}");
-        }
-    }
-}
-
 /// The [`Scan`] whose entry points run `K`.
 pub(crate) fn scan<K: Kernel>() -> &'static Scan {
-    unsafe fn find_next<K: Kernel>(
-        data: &KernelData,
-        state: &mut IterState<'_>,
-    ) -> MatchedBitset {
+    unsafe fn find_next<K: Kernel>(data: &KernelData, state: &mut IterState<'_>) -> MatchedBitset {
         // SAFETY: the `Scan` below stores this function only for the kind whose
         // `KernelData` field `K` reads, which is what [`crate::word_build`] pairs them by.
         let kernel = unsafe { K::from_data(data) };
@@ -278,6 +259,22 @@ pub(crate) fn scan<K: Kernel>() -> &'static Scan {
             find_next: find_next::<K>,
             count_all: count_all::<K>,
             find_first: find_first::<K>,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn movemask_gathers_high_bits() {
+        for expected in 0..256u64 {
+            let mut marks = 0;
+            for i in 0..WORD_BYTES {
+                marks |= ((expected >> i) & 1) << (i * 8 + 7);
+            }
+            assert_eq!(movemask(marks), expected, "marks {marks:#018x}");
         }
     }
 }

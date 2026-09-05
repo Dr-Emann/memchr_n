@@ -4,9 +4,11 @@
 //! haystack lives; `bench_probe`'s haystack is cache-resident, so this covers the other
 //! end.
 
+mod timing;
+
 use memchr_n::MemchrN;
 use std::hint::black_box;
-use std::time::Instant;
+use timing::best;
 
 const SEED: &[u8] = include_bytes!("../benches/haystacks/sherlock/huge.txt");
 
@@ -20,19 +22,6 @@ fn finder(needles: &[u8]) -> MemchrN {
 
 const ROUNDS: u32 = 100;
 
-fn best<T>(rounds: u32, mut f: impl FnMut() -> T) -> f64 {
-    // The first pass over a fresh mapping pays for its page faults, and at these sizes
-    // that dwarfs the scan itself.
-    black_box(f());
-    let mut best = f64::MAX;
-    for _ in 0..rounds {
-        let start = Instant::now();
-        black_box(f());
-        best = best.min(start.elapsed().as_secs_f64());
-    }
-    best
-}
-
 fn row(label: &str, len: usize, ours: f64, theirs: f64) {
     let gbs = |t: f64| len as f64 / t / 1e9;
     println!(
@@ -43,6 +32,13 @@ fn row(label: &str, len: usize, ours: f64, theirs: f64) {
         gbs(theirs),
         theirs / ours,
     );
+}
+
+fn timed<T>(rounds: u32, mut f: impl FnMut() -> T) -> f64 {
+    // The first pass over a fresh mapping pays for its page faults, and at these sizes
+    // that dwarfs the scan itself.
+    black_box(f());
+    best(rounds, 1, f)
 }
 
 fn main() {
@@ -56,12 +52,12 @@ fn main() {
         let never = finder(&[NEVER]);
         let rare = finder(&[RARE]);
 
-        let scan = best(ROUNDS, || never.find(black_box(&haystack)));
-        let scan_theirs = best(ROUNDS, || memchr::memchr(NEVER, black_box(&haystack)));
+        let scan = timed(ROUNDS, || never.find(black_box(&haystack)));
+        let scan_theirs = timed(ROUNDS, || memchr::memchr(NEVER, black_box(&haystack)));
         // `count` does not go through the widened loop, so it holds still between builds
         // and shows how much of any difference is the machine rather than the code.
-        let count = best(ROUNDS, || rare.iter(black_box(&haystack)).count());
-        let count_theirs = best(ROUNDS, || {
+        let count = timed(ROUNDS, || rare.iter(black_box(&haystack)).count());
+        let count_theirs = timed(ROUNDS, || {
             memchr::memchr_iter(RARE, black_box(&haystack)).count()
         });
 

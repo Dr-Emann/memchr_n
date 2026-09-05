@@ -6,28 +6,17 @@
 //! The `memchr` rows are a reference point only: that crate always uses the widest
 //! backend the CPU has, so it is not scanning these tails the same way.
 
+mod timing;
+
 use memchr_n::{Backend, MemchrN};
 use std::hint::black_box;
-use std::time::Instant;
+use timing::best;
 
 const HAYSTACK: &[u8] = include_bytes!("../benches/haystacks/sherlock/huge.txt");
 
 const LENS: [usize; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 24, 63, 64, 65];
 
 const ROUNDS: u32 = 100;
-
-fn best<T>(rounds: u32, iters: u32, mut f: impl FnMut() -> T) -> f64 {
-    let mut best = f64::MAX;
-    for _ in 0..rounds {
-        let start = Instant::now();
-        for _ in 0..iters {
-            black_box(f());
-        }
-        let elapsed = start.elapsed().as_secs_f64() / f64::from(iters);
-        best = best.min(elapsed);
-    }
-    best
-}
 
 fn row(name: &str, mut f: impl FnMut(&[u8]) -> Option<usize>) {
     print!("{name:16}");

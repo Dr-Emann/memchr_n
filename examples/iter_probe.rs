@@ -3,9 +3,11 @@
 //! `iterate` in the benchmark suite measures the same thing, but a mean over a noisy host
 //! moves further between runs of one binary than the changes worth seeing move it.
 
+mod timing;
+
 use memchr_n::MemchrN;
 use std::hint::black_box;
-use std::time::Instant;
+use timing::best;
 
 const SHERLOCK: &[u8] = include_bytes!("../benches/haystacks/sherlock/huge.txt");
 
@@ -47,14 +49,10 @@ fn their_iter<'h>(needles: &[u8], hay: &'h [u8]) -> Box<dyn Iterator<Item = usiz
     }
 }
 
-fn best(mut f: impl FnMut() -> usize) -> f64 {
-    let mut best = f64::MAX;
-    for _ in 0..ROUNDS {
-        let start = Instant::now();
-        black_box(f());
-        best = best.min(start.elapsed().as_secs_f64());
-    }
-    best * 1e6
+/// Microseconds for one pass over the corpus, which is long enough that a round needs only
+/// the one.
+fn micros(f: impl FnMut() -> usize) -> f64 {
+    best(ROUNDS, 1, f) * 1e6
 }
 
 fn main() {
@@ -71,18 +69,18 @@ fn main() {
         let finder = MemchrN::new(needles);
         let hay = SHERLOCK;
 
-        let iterate = best(|| {
+        let iterate = micros(|| {
             black_box(&finder)
                 .iter(black_box(hay))
                 .fold(0usize, |acc, off| acc.wrapping_add(off))
         });
-        let their_iterate = best(|| {
+        let their_iterate = micros(|| {
             their_iter(needles, black_box(hay)).fold(0usize, |acc, off| acc.wrapping_add(off))
         });
-        let count = best(|| black_box(&finder).iter(black_box(hay)).count());
-        let their_count = best(|| their_iter(needles, black_box(hay)).count());
-        let find = best(|| black_box(&finder).find(black_box(hay)).unwrap_or(0));
-        let their_find = best(|| their_find(needles, black_box(hay)).unwrap_or(0));
+        let count = micros(|| black_box(&finder).iter(black_box(hay)).count());
+        let their_count = micros(|| their_iter(needles, black_box(hay)).count());
+        let find = micros(|| black_box(&finder).find(black_box(hay)).unwrap_or(0));
+        let their_find = micros(|| their_find(needles, black_box(hay)).unwrap_or(0));
 
         println!(
             "{name:>13} {iterate:>9.2} {their_iterate:>9.2}   \

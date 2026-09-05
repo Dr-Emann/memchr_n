@@ -169,23 +169,7 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> Matc
     let unscanned = unsafe { haystack.get_unchecked(from..) };
     let (chunks, tail) = unscanned.as_chunks::<CHUNK>();
 
-    let mut chunks = chunks.iter().fuse().enumerate();
-    // As in `crate::swar::find_next`: the first chunk packs unconditionally, because a dense
-    // haystack refills one chunk at a time from `Iter::next` and nearly always matches right
-    // here. Only a sparse haystack reaches the gated loop below, where skipping `movemask`
-    // across a long run of misses repays the pass wasted here.
-    if let Some((_i, chunk)) = chunks.next() {
-        let (marks, any) = chunk_marks(&kernel, chunk);
-        if any != 0 {
-            state.bits_offset = from;
-            state.pos = from + CHUNK;
-            return pack_marks(marks).into();
-        }
-    }
-
-    // `from` stays at the start of the run: the enumeration was not restarted after the
-    // chunk above, so `i` already counts it.
-    for (i, chunk) in chunks {
+    for (i, chunk) in chunks.iter().enumerate() {
         let (marks, any) = chunk_marks(&kernel, chunk);
         if any != 0 {
             let offset = from + i * CHUNK;
@@ -202,10 +186,7 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> Matc
 
 /// The [`Scan`] whose entry points run `K`.
 pub(crate) fn scan<K: Kernel>() -> &'static Scan {
-    unsafe fn find_next<K: Kernel>(
-        data: &KernelData,
-        state: &mut IterState<'_>,
-    ) -> MatchedBitset {
+    unsafe fn find_next<K: Kernel>(data: &KernelData, state: &mut IterState<'_>) -> MatchedBitset {
         // SAFETY: as in [`crate::swar::scan`]: the `Scan` below stores this function only
         // for the kind whose `KernelData` field `K` reads.
         let kernel = unsafe { K::from_data(data) };

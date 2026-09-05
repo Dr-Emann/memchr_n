@@ -65,9 +65,9 @@ pub(crate) trait Kernel<S: Simd>: Copy {
 
 /// Whether the target has a single-instruction dynamic byte shuffle.
 ///
-/// [`kernels::SmallSet`], [`kernels::SingleNibble`] and [`kernels::AnyByte`] are built on one. Where it is missing,
-/// `swizzle_dyn` degrades into a per-lane gather through memory, which loses to probing
-/// the byte set directly with [`crate::bytewise`].
+/// [`kernels::SmallSet`], [`kernels::SingleNibble`] and [`kernels::AnyByte`] are built on
+/// one. Where it is missing, `swizzle_dyn` degrades into a per-lane gather through memory,
+/// which loses to probing the byte set directly with [`crate::bytewise`].
 pub(crate) fn has_byte_shuffle(level: Level) -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -110,11 +110,11 @@ pub(crate) fn find_next<S: Simd, K: Kernel<S>>(
         let matched_second = kernel.matches(u8x64::load_array_ref(simd, second));
         if (matched_first | matched_second).any_true() {
             state.bits_offset = from;
-            state.pos = from + first.len() + second.len();
+            state.pos = from + 2 * CHUNK_BYTES;
             return MatchedBitset::from(matched_first.to_bitmask())
                 | MatchedBitset::from(matched_second.to_bitmask()) << CHUNK_BYTES;
         }
-        from += first.len() + second.len();
+        from += 2 * CHUNK_BYTES;
     }
 
     if let [chunk] = rest {
@@ -124,7 +124,7 @@ pub(crate) fn find_next<S: Simd, K: Kernel<S>>(
             state.pos = from + CHUNK_BYTES;
             return MatchedBitset::from(matched.to_bitmask());
         }
-        from += chunk.len();
+        from += CHUNK_BYTES;
     }
 
     let (blocks, tail) = tail.as_chunks::<BLOCK_BYTES>();
@@ -132,10 +132,10 @@ pub(crate) fn find_next<S: Simd, K: Kernel<S>>(
         let matched = kernel.matches(u8x16::load_array_ref(simd, block));
         if matched.any_true() {
             state.bits_offset = from;
-            state.pos = from + block.len();
+            state.pos = from + BLOCK_BYTES;
             return MatchedBitset::from(matched.to_bitmask());
         }
-        from += block.len();
+        from += BLOCK_BYTES;
     }
     state.bits_offset = haystack.len() - tail.len();
     state.pos = haystack.len();
@@ -239,11 +239,7 @@ pub(crate) fn find_first<S: Simd, K: Kernel<S>>(
 /// Below the narrowest vector the ladder runs out, and the bottom rung is [`PROBE_BYTES`]
 /// scalar probes ahead of the staged pair.
 #[inline(always)]
-fn find_first_short<S: Simd, K: Kernel<S>>(
-    simd: S,
-    haystack: &[u8],
-    kernel: K,
-) -> Option<usize> {
+fn find_first_short<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) -> Option<usize> {
     debug_assert!(haystack.len() < CHUNK_BYTES);
     let len = haystack.len();
 
@@ -305,8 +301,8 @@ fn find_first_short<S: Simd, K: Kernel<S>>(
 /// Counts every matching byte of `haystack`.
 #[inline(always)]
 pub(crate) fn count<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) -> usize {
-    // Each lane of the counting accumulator starts at zero, and gains at most one per chunk,
-    // we can accumulate within a single vector until
+    // Each lane of the accumulator starts at zero and gains at most one per chunk, so this
+    // many chunks can be counted in the vector before a lane could wrap.
     const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
 
     let (chunks, tail) = haystack.as_chunks::<CHUNK_BYTES>();
@@ -348,7 +344,7 @@ pub(crate) fn count<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) 
 /// a padded buffer.
 #[inline(always)]
 fn tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, haystack: &[u8], tail: &[u8]) -> u64 {
-    debug_assert!(0 < tail.len() && tail.len() < BLOCK_BYTES);
+    debug_assert!(!tail.is_empty() && tail.len() < BLOCK_BYTES);
     if let Some(chunk) = haystack.last_chunk::<BLOCK_BYTES>() {
         let matched = kernel.matches(u8x16::load_array_ref(simd, chunk));
         matched.to_bitmask() >> (BLOCK_BYTES - tail.len())
@@ -400,7 +396,7 @@ fn staged_ends_bits<S: Simd, K: Kernel<S>>(
     }
 
     let len = short_haystack.len();
-    debug_assert!(0 < len && len < BLOCK_BYTES);
+    debug_assert!(!short_haystack.is_empty() && len < BLOCK_BYTES);
 
     let (words, staged) = match len {
         // Eight bytes from each end fill both words, so this is the one case that reads them

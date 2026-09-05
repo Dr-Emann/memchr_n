@@ -10,9 +10,11 @@
 //! answers a byte at a time has to pay for the offsets it walks past. `miss` never matches, so
 //! the row is the whole scan.
 
+mod timing;
+
 use memchr_n::MemchrN;
 use std::hint::black_box;
-use std::time::Instant;
+use timing::best;
 
 const ROUNDS: u32 = 200;
 const ITERS: u32 = 500;
@@ -36,23 +38,17 @@ const SETS: [(&str, &[u8]); 7] = [
 /// their whole call against our prebuilt one — the comparison in their favour.
 fn theirs(needles: &[u8], hay: &[u8]) -> f64 {
     match *needles {
-        [a] => best(|| memchr::memchr(black_box(a), black_box(hay))),
-        [a, b] => best(|| memchr::memchr2(black_box(a), black_box(b), black_box(hay))),
-        [a, b, c] => best(|| memchr::memchr3(black_box(a), black_box(b), black_box(c), black_box(hay))),
+        [a] => best(ROUNDS, ITERS, || {
+            memchr::memchr(black_box(a), black_box(hay))
+        }),
+        [a, b] => best(ROUNDS, ITERS, || {
+            memchr::memchr2(black_box(a), black_box(b), black_box(hay))
+        }),
+        [a, b, c] => best(ROUNDS, ITERS, || {
+            memchr::memchr3(black_box(a), black_box(b), black_box(c), black_box(hay))
+        }),
         _ => f64::NAN,
     }
-}
-
-fn best<T>(mut f: impl FnMut() -> T) -> f64 {
-    let mut best = f64::MAX;
-    for _ in 0..ROUNDS {
-        let start = Instant::now();
-        for _ in 0..ITERS {
-            black_box(f());
-        }
-        best = best.min(start.elapsed().as_secs_f64() / f64::from(ITERS));
-    }
-    best
 }
 
 /// Where the one match in a haystack sits, if there is one.
@@ -100,7 +96,7 @@ fn main() {
     );
 
     for (name, needles) in SETS {
-        let build = best(|| MemchrN::new(black_box(needles)));
+        let build = best(ROUNDS, ITERS, || MemchrN::new(black_box(needles)));
         let prebuilt_finder = MemchrN::new(needles);
 
         for planted in [Planted::Front, Planted::Middle, Planted::Nowhere] {
@@ -108,9 +104,15 @@ fn main() {
                 let hay = haystack(len, needles, planted);
                 let hay = hay.as_slice();
 
-                let prebuilt = best(|| black_box(&prebuilt_finder).iter(black_box(hay)).next());
-                let direct = best(|| black_box(&prebuilt_finder).find(black_box(hay)));
-                let oneshot = best(|| MemchrN::new(black_box(needles)).find(black_box(hay)));
+                let prebuilt = best(ROUNDS, ITERS, || {
+                    black_box(&prebuilt_finder).iter(black_box(hay)).next()
+                });
+                let direct = best(ROUNDS, ITERS, || {
+                    black_box(&prebuilt_finder).find(black_box(hay))
+                });
+                let oneshot = best(ROUNDS, ITERS, || {
+                    MemchrN::new(black_box(needles)).find(black_box(hay))
+                });
                 let theirs = theirs(needles, hay);
 
                 let label = planted.label();

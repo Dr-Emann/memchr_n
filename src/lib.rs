@@ -146,7 +146,7 @@ impl MemchrN {
     /// Returns the offset of the first matching byte in `haystack`.
     #[inline]
     pub fn find(&self, haystack: &[u8]) -> Option<usize> {
-        // SAFETY: as in `Iter::next`.
+        // SAFETY: as in `Iter::refill`.
         unsafe { (self.scan.find_first)(&self.data, haystack) }
     }
 
@@ -208,20 +208,11 @@ struct IterState<'a> {
 /// pre-splatted block is one aligned load. On a short [`MemchrN::find`] that showed up as
 /// 0.7-1.5ns of a ~4ns call for three needles and for a range.
 ///
-/// It is not about build cost, which the original note here claimed: the two measured the
-/// same to within noise, because building is dominated by collecting the set and choosing the
-/// kernel, not by writing this out.
-///
 /// What splatting costs is size: `[[u8; 16]; 3]` is what holds this union at 48 bytes. That
-/// looked like it mattered — storing the needles raw shrank a [`MemchrN`] from 80 bytes to 64
-/// and measured 5-12% faster on dense iteration, which a refill straddling one cache line
-/// instead of two would explain, since it reaches both this and the [`Scan`].
-///
-/// It does not. The [`Scan`] moved behind a reference afterwards, which gets to 64 bytes on
-/// its own and changes nothing else, and that measured no faster than 80 did. So whatever the
-/// raw-needle reading was, it was not the size — and it was taken with benchmark means, which
-/// `examples/iter_probe.rs` was written because this host is too noisy for. Re-measure before
-/// building anything on it.
+/// once looked like it mattered on dense iteration, but the reading did not survive moving
+/// the [`Scan`] behind a reference, which reaches 64 bytes on its own and measured no faster
+/// than 80 did. Re-measure before building anything on it, with `examples/iter_probe.rs`
+/// rather than benchmark means, which this host is too noisy for.
 ///
 /// # Safety
 ///
@@ -315,7 +306,6 @@ impl KernelData {
         }
     }
 }
-
 
 /// The search loops for one level-and-kernel pair, chosen when the [`MemchrN`] is built.
 ///
@@ -418,25 +408,40 @@ fn word_build(kind: Kind) -> &'static Scan {
     }
 }
 
+impl<'a> Iter<'a> {
+    /// Scans on from `pos` until a run that matched, leaving its bits in `bits`.
+    ///
+    /// `None` says the haystack is spent: a scan that finds nothing runs to the end of it,
+    /// so no bits and no error are the same answer.
+    #[inline]
+    fn refill(&mut self) -> Option<()> {
+        if self.state.pos == self.state.haystack.len() {
+            return None;
+        }
+        // SAFETY: each `build` installs a scan only for the kind whose `KernelData` field
+        // its kernel reads, and the `Level` that chose it proves the target has its features.
+        self.bits = unsafe { (self.memchr_n.scan.find_next)(&self.memchr_n.data, &mut self.state) };
+        (self.bits != 0).then_some(())
+    }
+
+    /// Takes the lowest match out of `bits`, which must hold one.
+    #[inline]
+    fn take_lowest(&mut self) -> usize {
+        let bit = self.bits.trailing_zeros() as usize;
+        self.bits &= self.bits - 1;
+        self.state.bits_offset + bit
+    }
+}
+
 impl<'a> Iterator for Iter<'a> {
     type Item = usize;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.bits == 0 {
-            if self.state.pos == self.state.haystack.len() {
-                return None;
-            }
-            // SAFETY: `build_scan` installs each function for the kind passed back to it
-            // here, and the `Level` that chose it proves the target has its features.
-            self.bits = unsafe { (self.memchr_n.scan.find_next)(&self.memchr_n.data, &mut self.state) };
-            if self.bits == 0 {
-                return None;
-            }
+            self.refill()?;
         }
-        let bit = self.bits.trailing_zeros() as usize;
-        self.bits &= self.bits - 1;
-        Some(self.state.bits_offset + bit)
+        Some(self.take_lowest())
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -450,7 +455,7 @@ impl<'a> Iterator for Iter<'a> {
         // SAFETY: `pos` only ever moves to an offset a scan reached, so it is in bounds.
         let unscanned = unsafe { self.state.haystack.get_unchecked(self.state.pos..) };
         if !unscanned.is_empty() {
-                        // SAFETY: as in `next`.
+            // SAFETY: as in `refill`.
             total += unsafe { (self.memchr_n.scan.count_all)(&self.memchr_n.data, unscanned) };
         }
         total
@@ -459,24 +464,19 @@ impl<'a> Iterator for Iter<'a> {
     #[inline]
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         let mut remaining = n;
-        while (self.bits.count_ones() as usize) <= remaining {
-            remaining -= self.bits.count_ones() as usize;
+        loop {
+            let held = self.bits.count_ones() as usize;
+            if held > remaining {
+                break;
+            }
+            remaining -= held;
             self.bits = 0;
-            if self.state.pos == self.state.haystack.len() {
-                return None;
-            }
-            // SAFETY: as in `next`.
-            self.bits = unsafe { (self.memchr_n.scan.find_next)(&self.memchr_n.data, &mut self.state) };
-            if self.bits == 0 {
-                return None;
-            }
+            self.refill()?;
         }
         for _ in 0..remaining {
             self.bits &= self.bits - 1;
         }
-        let bit = self.bits.trailing_zeros() as usize;
-        self.bits &= self.bits - 1;
-        Some(self.state.bits_offset + bit)
+        Some(self.take_lowest())
     }
 }
 
@@ -537,8 +537,8 @@ mod tests {
     }
 
     /// Both halves must agree on the kernel, not just the set: a bitset that covers a span
-    /// exactly still has to reach [`Kind::OneRange`], and few enough distinct bytes
-    /// still have to reach the kinds only the array representation can name.
+    /// exactly still has to reach [`Kind::OneRange`], and few enough distinct bytes still
+    /// have to reach the kinds that name their members.
     fn assert_same_set_and_kernel(bulk: &Bitset, one_at_a_time: &Bitset, case: &str) {
         assert_eq!(members(bulk), members(one_at_a_time), "{case}");
         for backend in [Backend::Auto, Backend::Scalar] {
@@ -550,8 +550,8 @@ mod tests {
         }
     }
 
-    /// Past `ARRAY_MAX`, `from_bytes` dedups through a bitset rather than by rescanning the
-    /// array, and has to land where the byte-at-a-time insert would.
+    /// `from_bytes` collects a whole slice at once, and has to land where the byte-at-a-time
+    /// insert would, at every size and shape of set.
     #[test]
     fn from_bytes_matches_adding_each_byte() {
         let alnum: Vec<u8> = (b'0'..=b'9')
@@ -571,8 +571,11 @@ mod tests {
             ("100 bytes, 24 distinct", (0..100).map(|i| i % 24).collect()),
             ("100 bytes, 25 distinct", (0..100).map(|i| i % 25).collect()),
             ("contiguous, out of order", contiguous_out_of_order),
-            ("25 scattered", (0..25).map(|i: u8| i.wrapping_mul(7)).collect()),
-            ("exactly ARRAY_MAX + 1", (0..25).collect()),
+            (
+                "25 scattered",
+                (0..25).map(|i: u8| i.wrapping_mul(7)).collect(),
+            ),
+            ("one past the members a kind can name", (0..17).collect()),
         ];
 
         for (case, bytes) in cases {
@@ -806,7 +809,11 @@ mod tests {
                         "{name} len {len} offset {offset}"
                     );
                 }
-                assert_eq!(searcher.find(&vec![b'.'; len]), None, "{name} miss len {len}");
+                assert_eq!(
+                    searcher.find(&vec![b'.'; len]),
+                    None,
+                    "{name} miss len {len}"
+                );
             }
         }
     }
@@ -945,7 +952,3 @@ mod tests {
         assert_eq!(searcher.iter(&haystack).count(), len);
     }
 }
-
-
-
-
