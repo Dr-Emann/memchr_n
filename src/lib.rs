@@ -118,28 +118,32 @@ impl MemchrN {
     /// pair the kernel's data and its entry points.
     fn from_set(set: Bitset, backend: Backend) -> Self {
         let level = Level::new();
-        let vector = match backend {
+        let vectors = match backend {
             Backend::Scalar => None,
             Backend::Auto => vector::builder(level),
         };
-        let family = if vector.is_some() {
-            Family::Vector
-        } else {
-            Family::Word
-        };
         // A word kernel has no shuffle to reach for, so it classifies as a vector target
         // without fast ones does.
-        let fast_shuffles = vector.is_some() && vector::has_byte_shuffle(level);
+        let fast_shuffles = vectors.is_some_and(|vectors| vectors.has_byte_shuffle);
         let kind = Kind::of(&set, fast_shuffles);
+        // The family and the builder together, because one question settles both: whether
+        // this level can scan this kind at all. `AnyByte` gathers through byte shuffles like
+        // the two kinds `fast_shuffles` withheld, and cannot be withheld the same way — it is
+        // where a set that fits no other kind lands, so it has to have somewhere to go. A
+        // vector level without shuffles gives it up here for the word family's probe, which
+        // is what emulating the shuffle would amount to anyway.
+        let (family, build): (_, fn(Kind) -> &'static Scan) = match vectors {
+            Some(vectors) if fast_shuffles || !matches!(kind, Kind::AnyByte(_)) => {
+                (Family::Vector, vectors.build)
+            }
+            _ => (Family::Word, word_build),
+        };
         Self {
             level,
             family,
             kind: KindTag::of(kind),
             data: KernelData::new(family, kind),
-            scan: match vector {
-                Some(build) => build(kind),
-                None => word_build(kind),
-            },
+            scan: build(kind),
         }
     }
 
@@ -494,6 +498,23 @@ mod tests {
             "MemchrN is {} bytes",
             size_of::<MemchrN>()
         );
+    }
+
+    /// What the `unreachable!` in each level's `build` rests on: told there are no byte
+    /// shuffles, [`Kind::of`] names only kinds a kernel without them can scan. `AnyByte` is
+    /// the exception it cannot make, which is why that one is redirected rather than withheld.
+    #[test]
+    fn without_shuffles_only_scannable_kinds_are_named() {
+        for step in 1..=9usize {
+            for len in [0, 1, 2, 3, 4, 5, 8, 9, 16, 17, 24, 64, 200, 256] {
+                let bytes: Vec<u8> = (0..len).map(|i| (i * step) as u8).collect();
+                let kind = Kind::of(&Bitset::from_bytes(&bytes), false);
+                assert!(
+                    !matches!(kind, Kind::SmallSet { .. } | Kind::ConstantNibble(..)),
+                    "{kind:?} for {len} bytes of step {step}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -63,22 +63,21 @@ pub(crate) trait Kernel<S: Simd>: Copy {
     fn matches_byte(&self, byte: u8) -> bool;
 }
 
-/// Whether the target has a single-instruction dynamic byte shuffle.
-///
-/// [`kernels::SmallSet`], [`kernels::SingleNibble`] and [`kernels::AnyByte`] are built on
-/// one. Where it is missing, `swizzle_dyn` degrades into a per-lane gather through memory,
-/// which loses to probing the byte set directly with [`crate::bytewise`].
-pub(crate) fn has_byte_shuffle(level: Level) -> bool {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        // `pshufb` arrived with SSSE3, so plain SSE2 has nothing equivalent. `as_sse4_2`
-        // also answers yes for AVX2 and AVX-512.
-        level.as_sse4_2().is_some()
-    }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        !level.is_fallback()
-    }
+/// What one level offers, which is its kernels and the one property of it the choice of
+/// kind turns on.
+#[derive(Copy, Clone)]
+pub(crate) struct Vectors {
+    /// Picks the [`Scan`] for a [`Kind`], out of this level's kernels.
+    pub(crate) build: fn(Kind) -> &'static Scan,
+    /// Whether the level has a single-instruction dynamic byte shuffle.
+    ///
+    /// [`kernels::SmallSet`], [`kernels::SingleNibble`] and [`kernels::AnyByte`] are gathers
+    /// built on one. Where it is missing, `swizzle_dyn` spills the vector and reads it back a
+    /// lane at a time, which is [`crate::bytewise`]'s probe with a vector's ceremony around
+    /// it, so none of the three reaches such a level: this withholds the first two from
+    /// [`Kind::of`], and sends [`Kind::AnyByte`] to the word family in
+    /// [`MemchrN::from_set`](crate::MemchrN).
+    pub(crate) has_byte_shuffle: bool,
 }
 
 /// Scans from `from` for the first pair of [`CHUNK_BYTES`]s that contains a match.
@@ -312,7 +311,7 @@ pub(crate) fn count<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) 
     for batch in chunks.chunks(CHUNKS_PER_ACCUMULATOR) {
         let mut counts = u8x64::splat(simd, 0);
         for chunk in batch {
-            let matches = kernel.matches(u8x64::from_slice(simd, chunk));
+            let matches = kernel.matches(u8x64::load_array_ref(simd, chunk));
             let matches: u8x64<_> = i8x64::load_array(simd, matches.into()).bitcast();
             // A matching lane is all ones (-1), so subtracting it adds one.
             counts -= matches;
@@ -535,7 +534,7 @@ unsafe fn token<S: Simd>() -> S {
 /// these cannot have and still share one fn-pointer type across levels.
 macro_rules! level_scans {
 
-    ($($(#[$cfg:meta])* $module:ident => $level:ident;)*) => {$(
+    ($($(#[$cfg:meta])* $module:ident => $level:ident, byte_shuffle: $byte_shuffle:literal;)*) => {$(
         $(#[$cfg])*
         mod $module {
             use super::*;
@@ -605,18 +604,31 @@ macro_rules! level_scans {
                 }
             }
 
+            pub(super) const VECTORS: Vectors = Vectors {
+                build,
+                has_byte_shuffle: $byte_shuffle,
+            };
+
             /// Picks the vector kernel for a kind. Each arm's kernel reads that same arm back
             /// in its [`Kernel`] impl.
+            ///
+            /// The guarded arms are the gathers, and the guard is a constant, so on a level
+            /// without a byte shuffle they are dropped before anything is instantiated from
+            /// them. That is the point of writing it this way: an emulated `swizzle_dyn` costs
+            /// more code than every other kernel here put together, and none of it can run.
             pub(super) fn build(kind: Kind) -> &'static Scan {
                 match kind {
                     Kind::OneByte(_) => scan::<kernels::AnyOf<Token, 1>>(),
                     Kind::TwoBytes(_) => scan::<kernels::AnyOf<Token, 2>>(),
                     Kind::ThreeBytes(_) => scan::<kernels::AnyOf<Token, 3>>(),
                     Kind::OneRange(_) => scan::<kernels::OneRange<Token>>(),
-                    Kind::SmallSet { .. } => scan::<kernels::SmallSet>(),
-                    Kind::ConstantNibble(..) => scan::<kernels::SingleNibble>(),
-                    Kind::AnyByte(_) => scan::<kernels::AnyByte>(),
                     Kind::Never => never_scan(),
+                    Kind::SmallSet { .. } if $byte_shuffle => scan::<kernels::SmallSet>(),
+                    Kind::ConstantNibble(..) if $byte_shuffle => scan::<kernels::SingleNibble>(),
+                    Kind::AnyByte(_) if $byte_shuffle => scan::<kernels::AnyByte>(),
+                    Kind::SmallSet { .. } | Kind::ConstantNibble(..) | Kind::AnyByte(_) => {
+                        unreachable!("a level without a byte shuffle is sent no gather kind")
+                    }
                 }
             }
         }
@@ -624,49 +636,50 @@ macro_rules! level_scans {
 }
 
 level_scans! {
+    // `pshufb` arrived with SSSE3, so plain SSE2 is the one level here with no byte shuffle.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    sse2 => Sse2;
+    sse2 => Sse2, byte_shuffle: false;
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    sse4_2 => Sse4_2;
+    sse4_2 => Sse4_2, byte_shuffle: true;
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    avx2 => Avx2;
+    avx2 => Avx2, byte_shuffle: true;
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    avx512 => Avx512;
+    avx512 => Avx512, byte_shuffle: true;
     #[cfg(target_arch = "aarch64")]
-    neon => Neon;
+    neon => Neon, byte_shuffle: true;
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    wasm_simd128 => WasmSimd128;
+    wasm_simd128 => WasmSimd128, byte_shuffle: true;
 }
 
-/// The entry points for `level`'s vector kernels, or `None` for a level that has none: the
-/// fallback level, and any level `level_scans!` has not been given.
+/// What `level` offers, or `None` for a level that offers no vectors at all: the fallback
+/// level, and any level `level_scans!` has not been given.
 ///
 /// Also what decides [`Family`](crate::Family), so a level without vector entry points
 /// cannot be handed a [`Kind`] only a vector kernel can scan.
-pub(crate) fn builder(level: Level) -> Option<fn(Kind) -> &'static Scan> {
+pub(crate) fn builder(level: Level) -> Option<Vectors> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         // Strongest first: each accessor answers for its own level and every level above it.
         if level.as_avx512().is_some() {
-            return Some(avx512::build);
+            return Some(avx512::VECTORS);
         }
         if level.as_avx2().is_some() {
-            return Some(avx2::build);
+            return Some(avx2::VECTORS);
         }
         if level.as_sse4_2().is_some() {
-            return Some(sse4_2::build);
+            return Some(sse4_2::VECTORS);
         }
         if level.as_sse2().is_some() {
-            return Some(sse2::build);
+            return Some(sse2::VECTORS);
         }
     }
     #[cfg(target_arch = "aarch64")]
     if level.as_neon().is_some() {
-        return Some(neon::build);
+        return Some(neon::VECTORS);
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if level.as_wasm_simd128().is_some() {
-        return Some(wasm_simd128::build);
+        return Some(wasm_simd128::VECTORS);
     }
     let _ = level;
     None
