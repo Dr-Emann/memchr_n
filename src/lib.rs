@@ -10,13 +10,17 @@ use crate::bitset::Bitset;
 use crate::kind::{ConstantNibble, Kind, KindTag, NibbleLookup};
 use core::fmt;
 use core::range::RangeInclusive;
+
+#[cfg(feature = "manual_level")]
+pub use fearless_simd::Level;
+#[cfg(not(feature = "manual_level"))]
 use fearless_simd::Level;
 
 /// Matches of one scan, the `i`th bit (numbered from lsb to msb) is 1 if the `i`th byte matched
 type MatchedBitset = u128;
 
 /// Which family of kernels a [`MemchrN`] is built from.
-#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Default, Debug)]
 #[non_exhaustive]
 pub enum Backend {
     /// The best kernels the running CPU supports.
@@ -24,6 +28,20 @@ pub enum Backend {
     Auto,
     /// Word-at-a-time kernels, even on a target that has vectors.
     Scalar,
+    /// An explicit [`Level`]
+    #[cfg(feature = "manual_level")]
+    Level(Level),
+}
+
+impl Backend {
+    fn level(self) -> Option<Level> {
+        match self {
+            Backend::Auto => Some(Level::new()),
+            Backend::Scalar => None,
+            #[cfg(feature = "manual_level")]
+            Backend::Level(level) => Some(level),
+        }
+    }
 }
 
 const _: () = {
@@ -33,30 +51,19 @@ const _: () = {
 };
 
 /// A searcher for a fixed set of bytes.
-///
-/// The set is fixed at construction, which is what lets everything about the search be
-/// decided there too: the representation the bytes are collected into, the kernel that
-/// matches them, and the data that kernel reads. Nothing about the set is recoverable
-/// afterwards, and nothing can be added to it.
 #[derive(Clone)]
 pub struct MemchrN {
-    /// Kept, with `family` and `kind`, only for [`Debug`]; `data` and `scan` are what
-    /// searching goes through.
-    level: Level,
+    // `family` and `kind`, only for `Debug`; `data` and `scan` are what
+    // searching goes through.
     family: Family,
     kind: KindTag,
     data: KernelData,
-    /// Shared rather than held: every [`MemchrN`] of one level and kind wants the same three
-    /// pointers, and a reference to them is 8 bytes where the table is 24. That is what
-    /// brings the whole struct inside one cache line, which a refill needs, since it reaches
-    /// both this and `data` on every call.
     scan: &'static Scan,
 }
 
 impl fmt::Debug for MemchrN {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MemchrN")
-            .field("level", &self.level)
             .field("family", &self.family)
             .field("kind", &self.kind)
             .finish_non_exhaustive()
@@ -66,7 +73,7 @@ impl fmt::Debug for MemchrN {
 /// Which kernels a [`MemchrN`] runs, resolved from [`Backend`] and the level.
 #[derive(Copy, Clone, Debug)]
 enum Family {
-    Vector,
+    Vector(Level),
     Word,
 }
 
@@ -96,10 +103,6 @@ impl MemchrN {
     }
 
     /// [`from_range`](Self::from_range), on a chosen [`Backend`].
-    ///
-    /// Takes an [`ops::RangeInclusive`](core::ops::RangeInclusive) rather than the
-    /// [`range::RangeInclusive`](RangeInclusive) used throughout, because it is worth
-    /// supporting `..=` syntax at the boundary.
     pub fn from_range_with(range: core::ops::RangeInclusive<u8>, backend: Backend) -> Self {
         let mut set = Bitset::new();
         set.add_range(RangeInclusive {
@@ -109,39 +112,33 @@ impl MemchrN {
         Self::from_set(set, backend)
     }
 
-    /// Resolves a collected set down to the one kernel that will scan for it.
-    ///
-    /// Every choice the search depends on is made here: the family, whether the target's
-    /// byte shuffles are worth the kinds that need them, the kind itself, and from that
-    /// pair the kernel's data and its entry points.
     fn from_set(set: Bitset, backend: Backend) -> Self {
-        let level = Level::new();
-        let vector = match backend {
-            Backend::Scalar => None,
-            Backend::Auto => vector::builder(level),
-        };
-        let family = if vector.is_some() {
-            Family::Vector
+        let vector_level_builder: Option<(Level, _)> = backend
+            .level()
+            .and_then(|l| vector::builder(l).map(|builder| (l, builder)));
+        let family = if let Some((level, _)) = vector_level_builder {
+            Family::Vector(level)
         } else {
             Family::Word
         };
-        // A word kernel has no shuffle to reach for, so it classifies as a vector target
-        // without fast ones does.
-        let fast_shuffles = vector.is_some() && vector::has_byte_shuffle(level);
+        let fast_shuffles =
+            vector_level_builder.is_some_and(|(level, _)| vector::has_byte_shuffle(level));
         let kind = Kind::of(&set, fast_shuffles);
         Self {
-            level,
             family,
             kind: KindTag::of(kind),
             data: KernelData::new(family, kind),
-            scan: match vector {
-                Some(build) => build(kind),
+            scan: match vector_level_builder {
+                Some((_level, builder)) => builder(kind),
                 None => word_build(kind),
             },
         }
     }
 
     /// Returns the offset of the first matching byte in `haystack`.
+    ///
+    /// Prefer [`iter`](Self::iter) rather than calling this function repeatedly
+    /// to iterate over the instances of matching bytes.
     #[inline]
     pub fn find(&self, haystack: &[u8]) -> Option<usize> {
         // SAFETY: as in `Iter::refill`.
@@ -149,6 +146,8 @@ impl MemchrN {
     }
 
     /// Returns an iterator over the offsets of every matching byte in `haystack`.
+    ///
+    /// If only iterating a single next instance, prefer [`find`](Self::find)
     #[inline]
     pub fn iter<'a>(&'a self, haystack: &'a [u8]) -> Iter<'a> {
         Iter {
@@ -163,7 +162,6 @@ impl MemchrN {
     }
 }
 
-/// Collects the bytes, then builds the searcher for them, on [`Backend::Auto`].
 impl FromIterator<u8> for MemchrN {
     fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
         Self::from_set(Bitset::from_iter(iter), Backend::Auto)
@@ -255,7 +253,7 @@ impl KernelData {
         fn splat_needles<const N: usize>(family: Family, needles: [u8; N]) -> KernelData {
             const { assert!(N <= 3) }
             match family {
-                Family::Vector => {
+                Family::Vector(_) => {
                     let mut splatted = [[0; 16]; 3];
                     for (slot, needle) in splatted.iter_mut().zip(needles) {
                         *slot = [needle; 16];
@@ -283,7 +281,7 @@ impl KernelData {
             // The other kind both families reach, and the only one where they want
             // different shapes: one splats the endpoints, the other derives masks from them.
             Kind::OneRange(range) => match family {
-                Family::Vector => Self {
+                Family::Vector(_) => Self {
                     splatted_range: [[range.start; 16], [range.last; 16]],
                 },
                 Family::Word => Self {

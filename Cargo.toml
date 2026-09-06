@@ -10,6 +10,10 @@ license = "MIT OR Apache-2.0"
 keywords = ["memchr", "simd", "search", "bytes", "scan"]
 categories = ["algorithms", "text-processing"]
 
+[features]
+# Enables the ability to create a Backend with an explicit fearless_simd::Level
+manual_level = []
+
 [dependencies]
 fearless_simd = { git = "https://github.com/linebender/fearless_simd.git" }
 

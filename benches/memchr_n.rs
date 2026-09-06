@@ -350,9 +350,11 @@ fn bench_first_call(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::new("find", &param), &finder, |b, finder| {
                 b.iter(|| black_box(finder).find(black_box(haystack)))
             });
-            group.bench_with_input(BenchmarkId::new("iter-next", &param), &finder, |b, finder| {
-                b.iter(|| black_box(finder).iter(black_box(haystack)).next())
-            });
+            group.bench_with_input(
+                BenchmarkId::new("iter-next", &param),
+                &finder,
+                |b, finder| b.iter(|| black_box(finder).iter(black_box(haystack)).next()),
+            );
             if let Some(needles) = needles {
                 group.bench_with_input(
                     BenchmarkId::new(THEIRS, &param),

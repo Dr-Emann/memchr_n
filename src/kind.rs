@@ -102,9 +102,7 @@ impl Kind {
                     hi_lookup,
                 }
             }
-            _ if fast_shuffles
-                && let Some((nibble, lookup)) = constant_nibble(members) =>
-            {
+            _ if fast_shuffles && let Some((nibble, lookup)) = constant_nibble(members) => {
                 Self::ConstantNibble(nibble, lookup)
             }
             _ => Self::AnyByte(*set),
