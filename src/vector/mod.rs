@@ -63,21 +63,27 @@ pub(crate) trait Kernel<S: Simd>: Copy {
     fn matches_byte(&self, byte: u8) -> bool;
 }
 
-/// What one level offers, which is its kernels and the one property of it the choice of
-/// kind turns on.
-#[derive(Copy, Clone)]
-pub(crate) struct Vectors {
-    /// Picks the [`Scan`] for a [`Kind`], out of this level's kernels.
-    pub(crate) build: fn(Kind) -> &'static Scan,
-    /// Whether the level has a single-instruction dynamic byte shuffle.
-    ///
-    /// [`kernels::SmallSet`], [`kernels::SingleNibble`] and [`kernels::AnyByte`] are gathers
-    /// built on one. Where it is missing, `swizzle_dyn` spills the vector and reads it back a
-    /// lane at a time, which is [`crate::bytewise`]'s probe with a vector's ceremony around
-    /// it, so none of the three reaches such a level: this withholds the first two from
-    /// [`Kind::of`], and sends [`Kind::AnyByte`] to the word family in
-    /// [`MemchrN::from_set`](crate::MemchrN).
-    pub(crate) has_byte_shuffle: bool,
+/// Whether `level` has a single-instruction dynamic byte shuffle.
+///
+/// [`kernels::SmallSet`], [`kernels::SingleNibble`] and [`kernels::AnyByte`] are gathers built
+/// on one. Where it is missing, `swizzle_dyn` spills the vector and reads it back a lane at a
+/// time, which is [`crate::bytewise`]'s probe with a vector's ceremony around it, so none of
+/// the three reaches such a level: [`Kind::of`] withholds the first two, and
+/// [`MemchrN::from_set`](crate::MemchrN) sends [`Kind::AnyByte`] to the word family.
+///
+/// Asked here of a runtime [`Level`], and in [`build`] of the one a token fixes — where it
+/// folds to a constant, and so decides what is instantiated rather than merely what runs.
+pub(crate) fn has_byte_shuffle(level: Level) -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        // `pshufb` arrived with SSSE3, so plain SSE2 has nothing equivalent. `as_sse4_2`
+        // also answers yes for AVX2 and AVX-512.
+        level.as_sse4_2().is_some()
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        !level.is_fallback()
+    }
 }
 
 /// Scans from `from` for the first pair of [`CHUNK_BYTES`]s that contains a match.
@@ -488,199 +494,150 @@ unsafe fn token<S: Simd>() -> S {
     unsafe { transmute_copy(&()) }
 }
 
-/// Writes one level's [`Scan`] entry points, and the [`Kind`] match that picks between them.
+/// The [`Scan`] entry points, and the [`Kind`] match that picks between them.
 ///
-/// Every entry point reaches its scan through [`Simd::vectorize`], which is what establishes
-/// the target-feature context, and does it by calling into that context rather than by
-/// putting the features on the entry point. So each of these is a trampoline, and what
-/// matters is that it be a bare `jmp` and not a stack frame: a closure of more than two words
-/// is passed indirectly, so it lands in the trampoline's own frame, which the call then has
-/// to outlive.
+/// Each entry point is a plain function pointer, so the token cannot come in as an argument;
+/// [`token`] rebuilds it instead, and [`Simd::vectorize`](fearless_simd::Simd) establishes the
+/// target-feature context inside. That is what lets one generic pair of `S` and `K` stand for
+/// every level-and-kernel combination, where a module per level used to be written out by
+/// hand — [`dispatch!`](fearless_simd::dispatch) supplies the `S`, and `K` follows from the
+/// [`Kind`].
 ///
-/// So a three-word argument list becomes a three-word closure, which is passed indirectly and
-/// so builds that frame. Bundling the arguments behind one pointer avoids it — but only by
-/// moving the frame into [`MemchrN::find`](crate::MemchrN::find), which then has to build the
-/// bundle and can no longer tail-call either. See [`Scan`] for what that cost and why the
-/// bundle is gone.
+/// # The trampoline
 ///
-/// # Where there is no trampoline at all
+/// `vectorize` establishes its context by calling into it rather than by putting the features
+/// on the entry point, so each of these is a trampoline, and what matters is that it be a bare
+/// `jmp` and not a stack frame: a closure of more than two words is passed indirectly, so it
+/// lands in the trampoline's own frame, which the call then has to outlive. See [`Scan`] for
+/// why the arguments stay loose rather than bundled.
 ///
-/// `vectorize`'s target-feature function is `#[inline]`, and a caller may inline a callee
-/// whose feature set it already covers. So wherever the level is what the crate is being
-/// compiled for anyway, LLVM folds that function into these and the entry point *is* the
-/// scan — the same code putting the attribute here by hand would give. That is every level
-/// which is baseline for its architecture: all of `aarch64`, since NEON always is, where the
-/// 42 boundaries this macro writes come out as none; `sse2` on `x86-64`; and `avx2` as well
-/// in a build that enables it.
+/// `vectorize`'s target-feature function is `#[inline]`, and a caller may inline a callee whose
+/// feature set it already covers. So wherever the level is what the crate is being compiled for
+/// anyway, LLVM folds that function into these and the entry point *is* the scan — the same
+/// code putting the attribute here by hand would give. That is every level which is baseline
+/// for its architecture: all of `aarch64`, since NEON always is; `sse2` on `x86-64`; and `avx2`
+/// as well in a build that enables it. What still trampolines is a level above the compile-time
+/// baseline, reached by runtime dispatch — `avx2` and `avx512` in an ordinary `x86-64` build.
+/// There the caller genuinely lacks the features, and no amount of `#[inline]` may cross that.
 ///
-/// What still trampolines is a level above the compile-time baseline, reached by runtime
-/// dispatch — `avx2` and `avx512` in an ordinary `x86-64` build. There the caller genuinely
-/// lacks the features, and no amount of `#[inline]` may cross that.
-///
-/// # What the trampoline costs where it is left
-///
-/// One stack frame per search, on the entry point rather than on `find`. On `x86-64` that is a
-/// `sub`, three stores and a `call` where a `jmp` would do, and it does not survive measurement
-/// against putting `#[target_feature]` here by hand: 1.004 over 252 points on an AVX-512 host,
-/// 90 faster and 108 slower. On `aarch64` there is no trampoline left to pay for at all.
+/// One stack frame per search is what that costs, on the entry point rather than on `find`. On
+/// `x86-64` it is a `sub`, three stores and a `call` where a `jmp` would do, and it does not
+/// survive measurement against putting `#[target_feature]` here by hand: 1.004 over 252 points
+/// on an AVX-512 host, 90 faster and 108 slower. On `aarch64` there is no trampoline left to
+/// pay for at all.
 ///
 /// It could not be taken anyway: there is no way to write that attribute from public API.
 /// Spelling the feature list out here means keeping a copy of `fearless_simd`'s in step,
-/// silently losing every lane operation to a call if it drifts; `fearless_simd::kernel!`
-/// writes it correctly but takes only non-generic functions, so it would want one of these
-/// per kind as well as per level. The remaining way in is the macro behind `kernel!`, which
-/// is exported but `doc(hidden)`. `fearless_simd_macros::simd` is not a fourth option: it
-/// expands to exactly the `vectorize` call below, and wants the token as a parameter, which
-/// these cannot have and still share one fn-pointer type across levels.
-macro_rules! level_scans {
+/// silently losing every lane operation to a call if it drifts; `fearless_simd::kernel!` writes
+/// it correctly but takes only non-generic functions, so it would want one of these per kind as
+/// well as per level. The remaining way in is the macro behind `kernel!`, which is exported but
+/// `doc(hidden)`. `fearless_simd_macros::simd` is not a fourth option: it expands to exactly the
+/// `vectorize` call below, and wants the token as a parameter, which these cannot have and still
+/// share one fn-pointer type across levels.
+mod entry {
+    use super::*;
 
-    ($($(#[$cfg:meta])* $module:ident => $level:ident, byte_shuffle: $byte_shuffle:literal;)*) => {$(
-        $(#[$cfg])*
-        mod $module {
-            use super::*;
-            use fearless_simd::$level as Token;
+    /// # Safety
+    ///
+    /// The running target must support `S`'s level, and `data`'s live field must be the one
+    /// `K` reads.
+    pub(super) unsafe fn find_next<S: Simd, K: Kernel<S>>(
+        data: &KernelData,
+        state: &mut IterState<'_>,
+    ) -> MatchedBitset {
+        // SAFETY: the caller's obligations, both of which `build` discharges: it is reached
+        // only through a `Level` that proves the support, and each arm there pairs a kernel
+        // with the kind whose `KernelData` field that kernel reads.
+        let simd = unsafe { token::<S>() };
+        simd.vectorize(
+            #[inline(always)]
+            move || {
+                // SAFETY: as above.
+                let kernel = unsafe { K::from_data(simd, data) };
+                super::find_next(simd, state, kernel)
+            },
+        )
+    }
 
-            /// # Safety
-            ///
-            /// The running target must support this module's level, and `data`'s live field
-            /// must be the one `K` reads.
-            unsafe fn find_next<K: Kernel<Token>>(
-                data: &KernelData,
-                state: &mut IterState<'_>,
-            ) -> MatchedBitset {
-                // SAFETY: the caller's obligations, both of which `build` below discharges:
-                // it is reached only through a `Level` that proves the support, and each arm
-                // pairs a kernel with the kind whose `KernelData` field that kernel reads.
-                let simd = unsafe { token::<Token>() };
-                simd.vectorize(
-                    #[inline(always)]
-                    move || {
-                        // SAFETY: as above.
-                        let kernel = unsafe { K::from_data(simd, data) };
-                        super::find_next(simd, state, kernel)
-                    },
-                )
-            }
+    /// # Safety
+    ///
+    /// As in [`find_next`].
+    pub(super) unsafe fn count_all<S: Simd, K: Kernel<S>>(
+        data: &KernelData,
+        haystack: &[u8],
+    ) -> usize {
+        // SAFETY: as in `find_next`.
+        let simd = unsafe { token::<S>() };
+        simd.vectorize(
+            #[inline(always)]
+            move || {
+                // SAFETY: as above.
+                let kernel = unsafe { K::from_data(simd, data) };
+                super::count(simd, haystack, kernel)
+            },
+        )
+    }
 
-            /// # Safety
-            ///
-            /// As in [`find_next`].
-            unsafe fn count_all<K: Kernel<Token>>(data: &KernelData, haystack: &[u8]) -> usize {
-                // SAFETY: as in `find_next`.
-                let simd = unsafe { token::<Token>() };
-                simd.vectorize(
-                    #[inline(always)]
-                    move || {
-                        // SAFETY: as above.
-                        let kernel = unsafe { K::from_data(simd, data) };
-                        super::count(simd, haystack, kernel)
-                    },
-                )
-            }
+    /// # Safety
+    ///
+    /// As in [`find_next`].
+    pub(super) unsafe fn find_first<S: Simd, K: Kernel<S>>(
+        data: &KernelData,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        // SAFETY: as in `find_next`.
+        let simd = unsafe { token::<S>() };
+        simd.vectorize(
+            #[inline(always)]
+            move || {
+                // SAFETY: as above.
+                let kernel = unsafe { K::from_data(simd, data) };
+                super::find_first(simd, haystack, kernel)
+            },
+        )
+    }
+}
 
-            /// # Safety
-            ///
-            /// As in [`find_next`].
-            unsafe fn find_first<K: Kernel<Token>>(data: &KernelData, haystack: &[u8]) -> Option<usize> {
-                // SAFETY: as in `find_next`.
-                let simd = unsafe { token::<Token>() };
-                simd.vectorize(
-                    #[inline(always)]
-                    move || {
-                        // SAFETY: as above.
-                        let kernel = unsafe { K::from_data(simd, data) };
-                        super::find_first(simd, haystack, kernel)
-                    },
-                )
-            }
-
-            fn scan<K: Kernel<Token>>() -> &'static Scan {
-                &const {
-                    Scan {
-                        find_next: find_next::<K>,
-                        count_all: count_all::<K>,
-                        find_first: find_first::<K>,
-                    }
-                }
-            }
-
-            pub(super) const VECTORS: Vectors = Vectors {
-                build,
-                has_byte_shuffle: $byte_shuffle,
-            };
-
-            /// Picks the vector kernel for a kind. Each arm's kernel reads that same arm back
-            /// in its [`Kernel`] impl.
-            ///
-            /// The guarded arms are the gathers, and the guard is a constant, so on a level
-            /// without a byte shuffle they are dropped before anything is instantiated from
-            /// them. That is the point of writing it this way: an emulated `swizzle_dyn` costs
-            /// more code than every other kernel here put together, and none of it can run.
-            pub(super) fn build(kind: Kind) -> &'static Scan {
-                match kind {
-                    Kind::OneByte(_) => scan::<kernels::AnyOf<Token, 1>>(),
-                    Kind::TwoBytes(_) => scan::<kernels::AnyOf<Token, 2>>(),
-                    Kind::ThreeBytes(_) => scan::<kernels::AnyOf<Token, 3>>(),
-                    Kind::OneRange(_) => scan::<kernels::OneRange<Token>>(),
-                    Kind::Never => never_scan(),
-                    Kind::SmallSet { .. } if $byte_shuffle => scan::<kernels::SmallSet>(),
-                    Kind::ConstantNibble(..) if $byte_shuffle => scan::<kernels::SingleNibble>(),
-                    Kind::AnyByte(_) if $byte_shuffle => scan::<kernels::AnyByte>(),
-                    Kind::SmallSet { .. } | Kind::ConstantNibble(..) | Kind::AnyByte(_) => {
-                        unreachable!("a level without a byte shuffle is sent no gather kind")
-                    }
-                }
-            }
+fn scan<S: Simd, K: Kernel<S>>() -> &'static Scan {
+    &const {
+        Scan {
+            find_next: entry::find_next::<S, K>,
+            count_all: entry::count_all::<S, K>,
+            find_first: entry::find_first::<S, K>,
         }
-    )*};
+    }
 }
 
-level_scans! {
-    // `pshufb` arrived with SSSE3, so plain SSE2 is the one level here with no byte shuffle.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    sse2 => Sse2, byte_shuffle: false;
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    sse4_2 => Sse4_2, byte_shuffle: true;
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    avx2 => Avx2, byte_shuffle: true;
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    avx512 => Avx512, byte_shuffle: true;
-    #[cfg(target_arch = "aarch64")]
-    neon => Neon, byte_shuffle: true;
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    wasm_simd128 => WasmSimd128, byte_shuffle: true;
-}
-
-/// What `level` offers, or `None` for a level that offers no vectors at all: the fallback
-/// level, and any level `level_scans!` has not been given.
+/// Picks the vector kernel for a kind. Each arm's kernel reads that same arm back in its
+/// [`Kernel`] impl.
 ///
-/// Also what decides [`Family`](crate::Family), so a level without vector entry points
-/// cannot be handed a [`Kind`] only a vector kernel can scan.
-pub(crate) fn builder(level: Level) -> Option<Vectors> {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        // Strongest first: each accessor answers for its own level and every level above it.
-        if level.as_avx512().is_some() {
-            return Some(avx512::VECTORS);
+/// `simd` is here to fix `S`, which the kernels are chosen out of; nothing reads it but the
+/// two questions about its level, and both fold to constants once `S` is one. That is what
+/// makes the guarded arms free: on a level with no byte shuffle they are dropped before
+/// anything is instantiated from them, and an emulated `swizzle_dyn` costs more code than
+/// every other kernel here put together. See [`has_byte_shuffle`] for what keeps those kinds
+/// away in the first place.
+pub(crate) fn build<S: Simd>(simd: S, kind: Kind) -> &'static Scan {
+    // [`MemchrN::from_set`](crate::MemchrN) only dispatches on a level that has vectors, but
+    // `dispatch!` writes an arm for the fallback level wherever the target has no baseline
+    // SIMD. Answering it here keeps every kernel below out of that instantiation, where each
+    // lane operation would be emulated one lane at a time.
+    if simd.level().is_fallback() {
+        return crate::word_build(kind);
+    }
+    match kind {
+        Kind::OneByte(_) => scan::<S, kernels::AnyOf<S, 1>>(),
+        Kind::TwoBytes(_) => scan::<S, kernels::AnyOf<S, 2>>(),
+        Kind::ThreeBytes(_) => scan::<S, kernels::AnyOf<S, 3>>(),
+        Kind::OneRange(_) => scan::<S, kernels::OneRange<S>>(),
+        Kind::Never => never_scan(),
+        Kind::SmallSet { .. } if has_byte_shuffle(simd.level()) => scan::<S, kernels::SmallSet>(),
+        Kind::ConstantNibble(..) if has_byte_shuffle(simd.level()) => {
+            scan::<S, kernels::SingleNibble>()
         }
-        if level.as_avx2().is_some() {
-            return Some(avx2::VECTORS);
-        }
-        if level.as_sse4_2().is_some() {
-            return Some(sse4_2::VECTORS);
-        }
-        if level.as_sse2().is_some() {
-            return Some(sse2::VECTORS);
+        Kind::AnyByte(_) if has_byte_shuffle(simd.level()) => scan::<S, kernels::AnyByte>(),
+        Kind::SmallSet { .. } | Kind::ConstantNibble(..) | Kind::AnyByte(_) => {
+            unreachable!("a level without a byte shuffle is sent no gather kind")
         }
     }
-    #[cfg(target_arch = "aarch64")]
-    if level.as_neon().is_some() {
-        return Some(neon::VECTORS);
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    if level.as_wasm_simd128().is_some() {
-        return Some(wasm_simd128::VECTORS);
-    }
-    let _ = level;
-    None
 }

@@ -119,31 +119,40 @@ impl MemchrN {
     fn from_set(set: Bitset, backend: Backend) -> Self {
         let level = Level::new();
         let vectors = match backend {
-            Backend::Scalar => None,
-            Backend::Auto => vector::builder(level),
+            Backend::Scalar => false,
+            // The fallback level emulates every lane operation one lane at a time, which is
+            // what the word family does directly.
+            Backend::Auto => !level.is_fallback(),
         };
         // A word kernel has no shuffle to reach for, so it classifies as a vector target
         // without fast ones does.
-        let fast_shuffles = vectors.is_some_and(|vectors| vectors.has_byte_shuffle);
+        let fast_shuffles = vectors && vector::has_byte_shuffle(level);
         let kind = Kind::of(&set, fast_shuffles);
-        // The family and the builder together, because one question settles both: whether
-        // this level can scan this kind at all. `AnyByte` gathers through byte shuffles like
-        // the two kinds `fast_shuffles` withheld, and cannot be withheld the same way — it is
+        // One question settles both the family and where the scan comes from: whether this
+        // level can scan this kind at all. `AnyByte` gathers through byte shuffles like the
+        // two kinds `fast_shuffles` withheld, and cannot be withheld the same way — it is
         // where a set that fits no other kind lands, so it has to have somewhere to go. A
         // vector level without shuffles gives it up here for the word family's probe, which
         // is what emulating the shuffle would amount to anyway.
-        let (family, build): (_, fn(Kind) -> &'static Scan) = match vectors {
-            Some(vectors) if fast_shuffles || !matches!(kind, Kind::AnyByte(_)) => {
-                (Family::Vector, vectors.build)
-            }
-            _ => (Family::Word, word_build),
+        let vectors = vectors && (fast_shuffles || !matches!(kind, Kind::AnyByte(_)));
+        let family = if vectors {
+            Family::Vector
+        } else {
+            Family::Word
         };
         Self {
             level,
             family,
             kind: KindTag::of(kind),
             data: KernelData::new(family, kind),
-            scan: build(kind),
+            // `dispatch!` writes this call once per level its target supports, each with that
+            // level's token, which is what instantiates `vector::build` and everything it
+            // picks. The body is repeated per arm, so it stays a single call.
+            scan: if vectors {
+                fearless_simd::dispatch!(level, simd => vector::build(simd, kind))
+            } else {
+                word_build(kind)
+            },
         }
     }
 
