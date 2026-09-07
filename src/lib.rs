@@ -10,11 +10,12 @@ use crate::bitset::Bitset;
 use crate::kind::Kind;
 use core::fmt;
 use core::range::RangeInclusive;
+use fearless_simd::dispatch;
+
 #[cfg(feature = "manual_level")]
 pub use fearless_simd::Level;
 #[cfg(not(feature = "manual_level"))]
 use fearless_simd::Level;
-use fearless_simd::dispatch;
 
 /// Matches of one scan, the `i`th bit (numbered from lsb to msb) is 1 if the `i`th byte matched
 type MatchedBitset = u128;
@@ -162,31 +163,24 @@ impl MemchrN {
             3 => Kind::ThreeBytes,
             _ => unreachable!(),
         };
+        let mut splatted_needles = [[0; _]; 3];
+        for (dst, needle) in splatted_needles.iter_mut().zip(needles) {
+            *dst = [needle; _];
+        }
+        let data = KernelData { splatted_needles };
         match family {
-            Family::Vector(level) => {
-                let mut splatted_needles = [[0; _]; 3];
-                for (dst, needle) in splatted_needles.iter_mut().zip(needles) {
-                    *dst = [needle; _];
-                }
-                Self {
-                    family,
-                    kind,
-                    data: KernelData { splatted_needles },
-                    scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::AnyOf<_, N>>(simd)),
-                }
-            }
-            Family::Scalar => {
-                let mut splatted_words = [0; 3];
-                for (dst, needle) in splatted_words.iter_mut().zip(needles) {
-                    *dst = u64::from_ne_bytes([needle; _]);
-                }
-                Self {
-                    family,
-                    kind,
-                    data: KernelData { splatted_words },
-                    scan: word_build(kind),
-                }
-            }
+            Family::Vector(level) => Self {
+                family,
+                kind,
+                data,
+                scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::AnyOf<_, N>>(simd)),
+            },
+            Family::Scalar => Self {
+                family,
+                kind,
+                data,
+                scan: swar::scan::<swar::kernels::AnyOf<N>>(),
+            },
         }
     }
 
@@ -207,7 +201,7 @@ impl MemchrN {
                 data: KernelData {
                     range_masks: swar::kernels::OneRange::new(range),
                 },
-                scan: word_build(kind),
+                scan: swar::scan::<swar::kernels::OneRange>(),
             },
         }
     }
@@ -272,7 +266,7 @@ impl MemchrN {
                 family,
                 kind,
                 data,
-                scan: word_build(kind),
+                scan: bytewise::scan::<bytewise::kernels::AnyByte>(),
             },
         }
     }
@@ -437,8 +431,6 @@ union KernelData {
     nibble_table: NibbleTable,
     /// [`vector::kernels::AnyByte`] and [`bytewise::kernels::AnyByte`].
     bitset: Bitset,
-    /// [`swar::kernels::AnyOf`]: one to three needles, each splatted across a word.
-    splatted_words: [u64; 3],
     /// [`swar::kernels::OneRange`], whose masks are all derived up front.
     range_masks: swar::kernels::OneRange,
     /// never has no data
@@ -526,28 +518,6 @@ pub(crate) fn never_scan() -> &'static Scan {
         find_next,
         count_all,
         find_first,
-    }
-}
-
-/// The word-at-a-time counterpart of [`vector::builder`].
-///
-/// It stays here, where [`vector::builder`] does not, because it is the one build that spans
-/// two modules: `swar`'s arithmetic covers the kinds it has a trick for, and the rest fall
-/// through to `bytewise`'s table probe. Neither module chooses that; this is where they meet.
-fn word_build(kind: Kind) -> &'static Scan {
-    match kind {
-        Kind::OneByte => swar::scan::<swar::kernels::AnyOf<1>>(),
-        Kind::TwoBytes => swar::scan::<swar::kernels::AnyOf<2>>(),
-        Kind::ThreeBytes => swar::scan::<swar::kernels::AnyOf<3>>(),
-        Kind::OneRange => swar::scan::<swar::kernels::OneRange>(),
-        Kind::AnyByte => bytewise::scan::<bytewise::kernels::AnyByte>(),
-        Kind::Never => never_scan(),
-        // Both scan by shuffling bytes within a vector, which is what picks them over
-        // `AnyByte` in the first place; `Kind::of` only builds them for a family that
-        // has shuffles to spend.
-        Kind::SmallSet | Kind::ConstantNibble => {
-            unreachable!("shuffle kinds need vectors")
-        }
     }
 }
 

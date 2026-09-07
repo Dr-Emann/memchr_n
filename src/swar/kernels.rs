@@ -18,12 +18,14 @@ fn any_of_matches<const N: usize>(word: u64, splatted_needles: [u64; N]) -> u64 
 
 impl<const N: usize> Kernel for AnyOf<N> {
     unsafe fn from_data(data: &KernelData) -> Self {
-        const { assert!(N <= 3, "`splatted_words` holds three") }
-        // SAFETY: the caller guarantees `splatted_words` is live, and the assertion above
+        const { assert!(N <= 3, "`splatted_needles` holds three") }
+        // SAFETY: the caller guarantees `splatted_needles` is live, and the assertion above
         // keeps the reads below inside it.
-        let splatted = unsafe { data.splatted_words };
+        let splatted = unsafe { data.splatted_needles };
         Self {
-            splatted_needles: core::array::from_fn(|i| splatted[i]),
+            splatted_needles: core::array::from_fn(|i| {
+                u64::from_ne_bytes(*splatted[i].first_chunk().unwrap())
+            }),
         }
     }
 
