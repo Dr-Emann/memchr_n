@@ -7,14 +7,14 @@ mod swar;
 mod vector;
 
 use crate::bitset::Bitset;
-use crate::kind::{ConstantNibble, Kind, KindTag, NibbleLookup};
+use crate::kind::Kind;
 use core::fmt;
 use core::range::RangeInclusive;
-
 #[cfg(feature = "manual_level")]
 pub use fearless_simd::Level;
 #[cfg(not(feature = "manual_level"))]
 use fearless_simd::Level;
+use fearless_simd::dispatch;
 
 /// Matches of one scan, the `i`th bit (numbered from lsb to msb) is 1 if the `i`th byte matched
 type MatchedBitset = u128;
@@ -34,12 +34,12 @@ pub enum Backend {
 }
 
 impl Backend {
-    fn level(self) -> Option<Level> {
+    fn family(self) -> Family {
         match self {
-            Backend::Auto => Some(Level::new()),
-            Backend::Scalar => None,
+            Backend::Auto => Family::Vector(Level::new()),
+            Backend::Scalar => Family::Scalar,
             #[cfg(feature = "manual_level")]
-            Backend::Level(level) => Some(level),
+            Backend::Level(level) => Family::Vector(level),
         }
     }
 }
@@ -56,7 +56,7 @@ pub struct MemchrN {
     // `family` and `kind`, only for `Debug`; `data` and `scan` are what
     // searching goes through.
     family: Family,
-    kind: KindTag,
+    kind: Kind,
     data: KernelData,
     scan: &'static Scan,
 }
@@ -74,7 +74,17 @@ impl fmt::Debug for MemchrN {
 #[derive(Copy, Clone, Debug)]
 enum Family {
     Vector(Level),
-    Word,
+    Scalar,
+}
+
+impl Family {
+    #[must_use]
+    fn for_shuffle(self) -> Self {
+        match self {
+            Family::Vector(level) if vector::has_byte_shuffle(level) => Family::Vector(level),
+            _ => Family::Scalar,
+        }
+    }
 }
 
 impl MemchrN {
@@ -113,25 +123,166 @@ impl MemchrN {
     }
 
     fn from_set(set: Bitset, backend: Backend) -> Self {
-        let vector_level_builder: Option<(Level, _)> = backend
-            .level()
-            .and_then(|l| vector::builder(l).map(|builder| (l, builder)));
-        let family = if let Some((level, _)) = vector_level_builder {
-            Family::Vector(level)
+        // Enough for all items to share a nibble
+        const MEMBERS_MAX: usize = 16;
+
+        let family = backend.family();
+        let mut members = [0; MEMBERS_MAX];
+        if let Some(count) = set.members(&mut members) {
+            let members = &members[..usize::from(count)];
+
+            match *members {
+                [] => Self::of_never(),
+                [first] => Self::of_needles(family, [first]),
+                [first, second] => Self::of_needles(family, [first, second]),
+                [first, second, third] => Self::of_needles(family, [first, second, third]),
+                // `members` is ascending and distinct, so the set is contiguous exactly when it
+                // fills the span from its first to its last.
+                [start, .., last] if usize::from(last - start) + 1 == members.len() => {
+                    Self::of_range(family, RangeInclusive { start, last })
+                }
+                _ => Self::of_small_set(family, members)
+                    .or_else(|| Self::of_single_nibble(family, members))
+                    .unwrap_or_else(|| Self::of_any_byte(family, set)),
+            }
         } else {
-            Family::Word
+            // Too many members for any kind that names them. A range is still worth
+            // recognizing: it is two comparisons per byte however wide it is.
+            match set.extract_range() {
+                Some(range) => Self::of_range(family, range),
+                None => Self::of_any_byte(family, set),
+            }
+        }
+    }
+
+    fn of_needles<const N: usize>(family: Family, needles: [u8; N]) -> Self {
+        let kind = match N {
+            1 => Kind::OneByte,
+            2 => Kind::TwoBytes,
+            3 => Kind::ThreeBytes,
+            _ => unreachable!(),
         };
-        let fast_shuffles =
-            vector_level_builder.is_some_and(|(level, _)| vector::has_byte_shuffle(level));
-        let kind = Kind::of(&set, fast_shuffles);
-        Self {
-            family,
-            kind: KindTag::of(kind),
-            data: KernelData::new(family, kind),
-            scan: match vector_level_builder {
-                Some((_level, builder)) => builder(kind),
-                None => word_build(kind),
+        match family {
+            Family::Vector(level) => {
+                let mut splatted_needles = [[0; _]; 3];
+                for (dst, needle) in splatted_needles.iter_mut().zip(needles) {
+                    *dst = [needle; _];
+                }
+                Self {
+                    family,
+                    kind,
+                    data: KernelData { splatted_needles },
+                    scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::AnyOf<_, N>>(simd)),
+                }
+            }
+            Family::Scalar => {
+                let mut splatted_words = [0; 3];
+                for (dst, needle) in splatted_words.iter_mut().zip(needles) {
+                    *dst = u64::from_ne_bytes([needle; _]);
+                }
+                Self {
+                    family,
+                    kind,
+                    data: KernelData { splatted_words },
+                    scan: word_build(kind),
+                }
+            }
+        }
+    }
+
+    fn of_range(family: Family, range: RangeInclusive<u8>) -> Self {
+        let kind = Kind::OneRange;
+        match family {
+            Family::Vector(level) => Self {
+                family,
+                kind,
+                data: KernelData {
+                    splatted_range: [[range.start; _], [range.last; _]],
+                },
+                scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::OneRange<_>>(simd)),
             },
+            Family::Scalar => Self {
+                family,
+                kind,
+                data: KernelData {
+                    range_masks: swar::kernels::OneRange::new(range),
+                },
+                scan: word_build(kind),
+            },
+        }
+    }
+
+    fn of_small_set(family: Family, possible_set: &[u8]) -> Option<Self> {
+        if possible_set.len() > 8 {
+            return None;
+        }
+        let Family::Vector(level) = family else {
+            return None;
+        };
+        if !vector::has_byte_shuffle(level) {
+            return None;
+        }
+        let mut lo_lookup = NibbleLookup::default();
+        let mut hi_lookup = NibbleLookup::default();
+        for (i, &item) in possible_set.iter().enumerate() {
+            lo_lookup.set(item & 0x0F, i as u8);
+            hi_lookup.set(item >> 4, i as u8);
+        }
+        Some(Self {
+            family,
+            kind: Kind::SmallSet,
+            data: KernelData {
+                nibble_lookups: [lo_lookup, hi_lookup],
+            },
+            scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::SmallSet>(simd)),
+        })
+    }
+
+    fn of_single_nibble(family: Family, possible_set: &[u8]) -> Option<Self> {
+        let Family::Vector(level) = family else {
+            return None;
+        };
+        if !vector::has_byte_shuffle(level) {
+            return None;
+        }
+        let Some((which, table)) = constant_nibble(possible_set) else {
+            return None;
+        };
+        Some(Self {
+            family,
+            kind: Kind::ConstantNibble,
+            data: KernelData {
+                nibble_table: NibbleTable { which, table },
+            },
+            scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::SingleNibble>(simd)),
+        })
+    }
+
+    fn of_any_byte(family: Family, bitset: Bitset) -> Self {
+        let family = family.for_shuffle();
+        let (kind, data) = (Kind::AnyByte, KernelData { bitset });
+        match family {
+            Family::Vector(level) => Self {
+                family,
+                kind,
+                data,
+                scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::AnyByte>(simd)),
+            },
+            Family::Scalar => Self {
+                family,
+                kind,
+                data,
+                scan: word_build(kind),
+            },
+        }
+    }
+
+    fn of_never() -> Self {
+        Self {
+            family: Family::Scalar,
+            kind: Kind::Never,
+            data: KernelData { never: () },
+            scan: never_scan(),
         }
     }
 
@@ -165,6 +316,64 @@ impl MemchrN {
 impl FromIterator<u8> for MemchrN {
     fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
         Self::from_set(Bitset::from_iter(iter), Backend::Auto)
+    }
+}
+
+/// The table [`crate::vector::kernels::SingleNibble`] shuffles, if every byte of `items`
+/// agrees on one of its nibbles.
+///
+/// Deciding costs one pass with no branch on the answer, and only the winning table is then
+/// filled — testing and building together, as this used to, meant carrying two half-built
+/// tables through the loop and a branch per item per table.
+fn constant_nibble(items: &[u8]) -> Option<(ConstantNibble, [u8; 16])> {
+    let first = *items.first()?;
+    let (lo_nibble, hi_nibble) = (first & 0x0F, first >> 4);
+
+    let (mut lo_constant, mut hi_constant) = (true, true);
+    for &item in items {
+        lo_constant &= item & 0x0F == lo_nibble;
+        hi_constant &= item >> 4 == hi_nibble;
+    }
+
+    // Unfilled slots need a sentinel that can never match: slot `i` is only ever compared
+    // against bytes whose variable nibble is `i`, so the sentinel's own variable nibble must
+    // differ from its index. 0x00 satisfies that everywhere except slot 0, hence the one
+    // filled slot below — the variable nibble is the high one for a constant low nibble, and
+    // the low one for a constant high one.
+    if lo_constant {
+        let mut table = [0; 16];
+        table[0] = 0x10;
+        for &item in items {
+            table[usize::from(item >> 4)] = item;
+        }
+        Some((ConstantNibble::Lo, table))
+    } else if hi_constant {
+        let mut table = [0; 16];
+        table[0] = 0x01;
+        for &item in items {
+            table[usize::from(item & 0x0F)] = item;
+        }
+        Some((ConstantNibble::Hi, table))
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum ConstantNibble {
+    Lo,
+    Hi,
+}
+
+#[derive(Debug, Default, Copy, Clone)]
+pub(crate) struct NibbleLookup(pub(crate) [u8; 16]);
+
+impl NibbleLookup {
+    #[inline]
+    fn set(&mut self, nibble: u8, bit: u8) {
+        debug_assert!(nibble < 16);
+        debug_assert!(bit < 8);
+        self.0[usize::from(nibble)] |= 1 << bit;
     }
 }
 
@@ -243,66 +452,6 @@ struct NibbleTable {
     table: [u8; 16],
 }
 
-impl KernelData {
-    /// Builds the field the kernels for `family` and `kind` read. The arms line up
-    /// one-for-one with [`word_build`] and the per-level `build` that `level_scans!` writes,
-    /// which pick those kernels.
-    fn new(family: Family, kind: Kind) -> Self {
-        /// Splats one to three needles across whichever unit `family` scans in, leaving
-        /// the slots past `N` zeroed for a kernel that will not read them.
-        fn splat_needles<const N: usize>(family: Family, needles: [u8; N]) -> KernelData {
-            const { assert!(N <= 3) }
-            match family {
-                Family::Vector(_) => {
-                    let mut splatted = [[0; 16]; 3];
-                    for (slot, needle) in splatted.iter_mut().zip(needles) {
-                        *slot = [needle; 16];
-                    }
-                    KernelData {
-                        splatted_needles: splatted,
-                    }
-                }
-                Family::Word => {
-                    let mut splatted = [0; 3];
-                    for (slot, needle) in splatted.iter_mut().zip(needles) {
-                        *slot = swar::splat(needle);
-                    }
-                    KernelData {
-                        splatted_words: splatted,
-                    }
-                }
-            }
-        }
-
-        match kind {
-            Kind::OneByte(needle) => splat_needles(family, [needle]),
-            Kind::TwoBytes(needles) => splat_needles(family, needles),
-            Kind::ThreeBytes(needles) => splat_needles(family, needles),
-            // The other kind both families reach, and the only one where they want
-            // different shapes: one splats the endpoints, the other derives masks from them.
-            Kind::OneRange(range) => match family {
-                Family::Vector(_) => Self {
-                    splatted_range: [[range.start; 16], [range.last; 16]],
-                },
-                Family::Word => Self {
-                    range_masks: swar::kernels::OneRange::new(range),
-                },
-            },
-            Kind::SmallSet {
-                lo_lookup,
-                hi_lookup,
-            } => Self {
-                nibble_lookups: [lo_lookup, hi_lookup],
-            },
-            Kind::ConstantNibble(which, table) => Self {
-                nibble_table: NibbleTable { which, table },
-            },
-            Kind::AnyByte(bitset) => Self { bitset },
-            Kind::Never => Self { never: () },
-        }
-    }
-}
-
 /// The search loops for one level-and-kernel pair, chosen when the [`MemchrN`] is built.
 ///
 /// This is a `Box<dyn Scan>` written out by hand, to keep the allocation off callers that
@@ -373,12 +522,10 @@ pub(crate) fn never_scan() -> &'static Scan {
         None
     }
 
-    &const {
-        Scan {
-            find_next,
-            count_all,
-            find_first,
-        }
+    &Scan {
+        find_next,
+        count_all,
+        find_first,
     }
 }
 
@@ -389,16 +536,16 @@ pub(crate) fn never_scan() -> &'static Scan {
 /// through to `bytewise`'s table probe. Neither module chooses that; this is where they meet.
 fn word_build(kind: Kind) -> &'static Scan {
     match kind {
-        Kind::OneByte(_) => swar::scan::<swar::kernels::AnyOf<1>>(),
-        Kind::TwoBytes(_) => swar::scan::<swar::kernels::AnyOf<2>>(),
-        Kind::ThreeBytes(_) => swar::scan::<swar::kernels::AnyOf<3>>(),
-        Kind::OneRange(_) => swar::scan::<swar::kernels::OneRange>(),
-        Kind::AnyByte(_) => bytewise::scan::<bytewise::kernels::AnyByte>(),
+        Kind::OneByte => swar::scan::<swar::kernels::AnyOf<1>>(),
+        Kind::TwoBytes => swar::scan::<swar::kernels::AnyOf<2>>(),
+        Kind::ThreeBytes => swar::scan::<swar::kernels::AnyOf<3>>(),
+        Kind::OneRange => swar::scan::<swar::kernels::OneRange>(),
+        Kind::AnyByte => bytewise::scan::<bytewise::kernels::AnyByte>(),
         Kind::Never => never_scan(),
         // Both scan by shuffling bytes within a vector, which is what picks them over
         // `AnyByte` in the first place; `Kind::of` only builds them for a family that
         // has shuffles to spend.
-        Kind::SmallSet { .. } | Kind::ConstantNibble(..) => {
+        Kind::SmallSet | Kind::ConstantNibble => {
             unreachable!("shuffle kinds need vectors")
         }
     }
