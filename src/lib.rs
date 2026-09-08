@@ -17,7 +17,7 @@ pub use fearless_simd::Level;
 #[cfg(not(feature = "manual_level"))]
 use fearless_simd::Level;
 
-/// Matches of one scan, the `i`th bit (numbered from lsb to msb) is 1 if the `i`th byte matched
+// Matches of one scan, the `i`th bit (numbered from lsb to msb) is 1 if the `i`th byte matched
 type MatchedBitset = u128;
 
 /// Which family of kernels a [`MemchrN`] is built from.
@@ -71,7 +71,6 @@ impl fmt::Debug for MemchrN {
     }
 }
 
-/// Which kernels a [`MemchrN`] runs, resolved from [`Backend`] and the level.
 #[derive(Copy, Clone, Debug)]
 enum Family {
     Vector(Level),
@@ -79,21 +78,25 @@ enum Family {
 }
 
 impl Family {
+    // Get a family that would be used if we want to use shuffles
     #[must_use]
     fn for_shuffle(self) -> Self {
         match self {
-            Family::Vector(level) if vector::has_byte_shuffle(level) => Family::Vector(level),
-            _ => Family::Scalar,
+            Family::Vector(level) => {
+                if vector::has_byte_shuffle(level) {
+                    Family::Vector(level)
+                } else {
+                    Family::Scalar
+                }
+            }
+            Family::Scalar => Family::Scalar,
         }
     }
 }
 
 impl MemchrN {
-    /// Builds a searcher for the distinct bytes of `bytes`, on the best kernels the running
+    /// Build a searcher for the distinct bytes of `bytes`, on the best kernels the running
     /// CPU supports.
-    ///
-    /// Repeats are ignored, so the set is the bytes present, not how many times each
-    /// appears.
     #[inline]
     pub fn new(bytes: &[u8]) -> Self {
         Self::new_with(bytes, Backend::Auto)
@@ -104,8 +107,7 @@ impl MemchrN {
         Self::from_set(Bitset::from_bytes(bytes), backend)
     }
 
-    /// Builds a searcher for every byte from the start of `range` through its end,
-    /// inclusive.
+    /// Builds a searcher which will match the bytes within the provided range
     ///
     /// An empty range matches nothing.
     #[inline]
@@ -239,15 +241,11 @@ impl MemchrN {
         if !vector::has_byte_shuffle(level) {
             return None;
         }
-        let Some((which, table)) = constant_nibble(possible_set) else {
-            return None;
-        };
+        let nibble_table = extract_constant_nibble(possible_set)?;
         Some(Self {
             family,
             kind: Kind::ConstantNibble,
-            data: KernelData {
-                nibble_table: NibbleTable { which, table },
-            },
+            data: KernelData { nibble_table },
             scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::SingleNibble>(simd)),
         })
     }
@@ -313,13 +311,9 @@ impl FromIterator<u8> for MemchrN {
     }
 }
 
-/// The table [`crate::vector::kernels::SingleNibble`] shuffles, if every byte of `items`
-/// agrees on one of its nibbles.
-///
-/// Deciding costs one pass with no branch on the answer, and only the winning table is then
-/// filled — testing and building together, as this used to, meant carrying two half-built
-/// tables through the loop and a branch per item per table.
-fn constant_nibble(items: &[u8]) -> Option<(ConstantNibble, [u8; 16])> {
+// If `items` contains only items which share a constant lo/hi nibble, extract it, and
+// a lookup table for the other nibble
+fn extract_constant_nibble(items: &[u8]) -> Option<NibbleTable> {
     let first = *items.first()?;
     let (lo_nibble, hi_nibble) = (first & 0x0F, first >> 4);
 
@@ -340,14 +334,20 @@ fn constant_nibble(items: &[u8]) -> Option<(ConstantNibble, [u8; 16])> {
         for &item in items {
             table[usize::from(item >> 4)] = item;
         }
-        Some((ConstantNibble::Lo, table))
+        Some(NibbleTable {
+            which: ConstantNibble::Lo,
+            table,
+        })
     } else if hi_constant {
         let mut table = [0; 16];
         table[0] = 0x01;
         for &item in items {
             table[usize::from(item & 0x0F)] = item;
         }
-        Some((ConstantNibble::Hi, table))
+        Some(NibbleTable {
+            which: ConstantNibble::Hi,
+            table,
+        })
     } else {
         None
     }
@@ -374,50 +374,25 @@ impl NibbleLookup {
 pub struct Iter<'a> {
     memchr_n: &'a MemchrN,
     state: IterState<'a>,
-    /// Matches of the most recently scanned run that have not been yielded yet.
-    ///
-    /// Deliberately not in [`IterState`]: a scan neither reads nor writes it, so keeping it
-    /// out of the struct the scan is handed keeps the caller from having to set it up before
-    /// every call, and a scan returns its bits in registers instead.
+    // Matches of the most recently scanned run that have not been yielded yet.
     bits: MatchedBitset,
 }
 
-/// What a scan reads and writes, which is everything about the search but its matches.
+// What a scan reads and writes, which is everything about the search but its matches.
 struct IterState<'a> {
     haystack: &'a [u8],
-    /// Offset of the first byte that has not been scanned yet.
+    // Offset of the first byte that has not been scanned yet.
     pos: usize,
-    /// Offset of the first byte the most recent scan's bits describe.
+    // Offset of the first byte the most recent scan's bits describe.
     bits_offset: usize,
 }
 
 /// Everything a kernel needs, in the shape that kernel reads it, built once when the
 /// [`MemchrN`] is.
 ///
-/// Reading it back out of a [`Kind`] would cost an unaligned load at the enum's payload
-/// offset. A union does not: the live field is decided once, by the same `build` that
-/// installs the [`Scan`] beside it, and the alignment lets a whole block come back in one
-/// load.
-///
-/// # Why the needles and range endpoints are splatted here
-///
-/// Storing them raw and splatting when the kernel loads was measured, and is the better
-/// trade only for a single needle. Beyond that it costs two instructions per needle — a byte
-/// into a general-purpose register, that register into a vector, then the broadcast — where a
-/// pre-splatted block is one aligned load. On a short [`MemchrN::find`] that showed up as
-/// 0.7-1.5ns of a ~4ns call for three needles and for a range.
-///
-/// What splatting costs is size: `[[u8; 16]; 3]` is what holds this union at 48 bytes. That
-/// once looked like it mattered on dense iteration, but the reading did not survive moving
-/// the [`Scan`] behind a reference, which reaches 64 bytes on its own and measured no faster
-/// than 80 did. Re-measure before building anything on it, with `examples/iter_probe.rs`
-/// rather than benchmark means, which this host is too noisy for.
-///
-/// # Safety
-///
-/// Which field is live is fixed for a [`MemchrN`]'s lifetime by its [`Kind`], as
-/// [`KernelData::new`] lays out. Nothing but the [`Scan`] built from that same kind may read
-/// it.
+/// This is effectively the data half of a manual implementation of a dyn trait,
+/// but we don't need any dynamic allocations.
+/// The data will be read in the [`Scan`] implementation.
 #[derive(Copy, Clone)]
 #[repr(align(16))]
 union KernelData {
@@ -444,44 +419,14 @@ struct NibbleTable {
     table: [u8; 16],
 }
 
-/// The search loops for one level-and-kernel pair, chosen when the [`MemchrN`] is built.
-///
-/// This is a `Box<dyn Scan>` written out by hand, to keep the allocation off callers that
-/// build a [`MemchrN`] per search.
-///
-/// The level and the [`Kind`] are both fixed for a [`MemchrN`]'s lifetime, so resolving
-/// them here also removes the two matches every refill used to run, and keeps `levels * kinds`
-/// copies of the loop body out of [`Iter::next`].
-///
-/// # Why these take their arguments loose
-///
-/// A pointer and a slice are three words, and three words are one too many to ride in
-/// registers: two are a `ScalarPair`, three are an aggregate and go indirect. So bundling them
-/// into one `&Search` argument was tried, to keep the `vectorize` trampoline in
-/// [`vector::level_scans!`] a bare `jmp` rather than a stack frame.
-///
-/// It did not remove that frame. It moved it up here, into [`MemchrN::find`], which then had to
-/// build the bundle before it could pass a pointer to it — and, holding memory the callee would
-/// read, could no longer tail-call. Inlined into its caller on `aarch64`, `find` went from
-///
-/// ```text
-/// ldr x8, [x0, #0x30]     ldr x8, [x0, #0x30]    sub  sp, sp, #0x30
-/// ldr x3, [x8, #0x10]     ldr x3, [x8, #0x10]    stp  x29, x30, [sp, #0x20]
-/// br  x3                  br  x3                 …3 stores, blr x8, restore, ret
-/// ```
-///
-/// — the left being both loose arguments and the bundle removed again, the right being the
-/// bundle. That is a fixed cost on every search, invisible in throughput and in one-shot
-/// (where a 16ns construction hides it), and it measured 2.4ns against 12.8ns of prebuilt
-/// `find` on NEON: a frame record to save and restore, three stores the callee immediately
-/// reloads, and no tail call at either end.
-///
-/// On `x86-64` the same trade is a wash — 1.004 over 252 points — because there the frame only
-/// moves between `find` and the entry point rather than disappearing, and `x86` pays less for
-/// it. `aarch64` is where it disappears, because [`Simd::vectorize`](fearless_simd::Simd)
-/// leaves no trampoline for a level that is the compile-time baseline, which NEON always is.
 #[derive(Copy, Clone)]
 struct Scan {
+    /// Search forward until the first non-zero matching bitset
+    ///
+    /// Modifies the passed [`IterState`] to the new pos/bits_offset.
+    ///
+    /// # Safety
+    /// Callers must call with the matching KernelData that this [`Scan`] was created for
     find_next: unsafe fn(&KernelData, &mut IterState<'_>) -> MatchedBitset,
     /// Counts every match in what is left of a haystack.
     ///
@@ -493,13 +438,11 @@ struct Scan {
     ///
     /// Both of the above are shaped for an iterator that will call them again: they take the
     /// [`IterState`] by pointer, which forces it to memory across the call, and they answer
-    /// in a [`MatchedBitset`] the caller has to unpack. A search that stops at the first
-    /// match wants neither, and pays for both — which on a short haystack is most of the
-    /// call.
+    /// in a [`MatchedBitset`] the caller has to unpack.
     find_first: unsafe fn(&KernelData, &[u8]) -> Option<usize>,
 }
 
-/// The [`Scan`] for a byte set that nothing can match.
+// The Scan for a byte set that nothing can match.
 pub(crate) fn never_scan() -> &'static Scan {
     fn find_next(_data: &KernelData, state: &mut IterState<'_>) -> MatchedBitset {
         state.pos = state.haystack.len();
@@ -522,10 +465,10 @@ pub(crate) fn never_scan() -> &'static Scan {
 }
 
 impl<'a> Iter<'a> {
-    /// Scans on from `pos` until a run that matched, leaving its bits in `bits`.
-    ///
-    /// `None` says the haystack is spent: a scan that finds nothing runs to the end of it,
-    /// so no bits and no error are the same answer.
+    // Scans on from `pos` until a run that matched, leaving its bits in `bits`.
+    //
+    // `None` says the haystack is spent: a scan that finds nothing runs to the end of it,
+    // so no bits and no error are the same answer.
     #[inline]
     fn refill(&mut self) -> Option<()> {
         if self.state.pos == self.state.haystack.len() {
@@ -537,9 +480,11 @@ impl<'a> Iter<'a> {
         (self.bits != 0).then_some(())
     }
 
-    /// Takes the lowest match out of `bits`, which must hold one.
+    // Takes the lowest match out of `bits`, which must hold one.
     #[inline]
     fn take_lowest(&mut self) -> usize {
+        debug_assert!(self.bits != 0);
+
         let bit = self.bits.trailing_zeros() as usize;
         self.bits &= self.bits - 1;
         self.state.bits_offset + bit
