@@ -1,4 +1,4 @@
-//! Measures [`memchr_n::Backend::Scalar`] tail latency around the eight-byte word width.
+//! Measures [`memchr_n::Backend::Swar`] tail latency around the eight-byte word width.
 //!
 //! `memchr` uses its widest available backend, so its rows are reference values only.
 
@@ -17,23 +17,23 @@ const ROUNDS: u32 = 100;
 fn row(name: &str, mut f: impl FnMut(&[u8]) -> Option<usize>) {
     print!("{name:16}");
     for len in LENS {
-        let hay = &HAYSTACK[..len];
-        assert!(f(hay).is_none());
-        let t = best(ROUNDS, 5000, || f(black_box(hay)));
+        let haystack = &HAYSTACK[..len];
+        assert!(f(haystack).is_none());
+        let t = best(ROUNDS, 5000, || f(black_box(haystack)));
         print!(" {:6.2}", t * 1e9);
     }
     println!();
 }
 
 fn main() {
-    let onebyte = MemchrN::new_with(b"<", Backend::Scalar);
-    let threebyte = MemchrN::new_with(b"<>@", Backend::Scalar);
+    let onebyte = MemchrN::new_with_backend(b"<", Backend::Swar);
+    let threebyte = MemchrN::new_with_backend(b"<>@", Backend::Swar);
 
-    row("onebyte", |hay| onebyte.iter(hay).next());
-    row("onebyte memchr", |hay| memchr::memchr(b'<', hay));
-    row("threebyte", |hay| threebyte.iter(hay).next());
-    row("threebyte memchr", |hay| {
-        memchr::memchr3(b'<', b'>', b'@', hay)
+    row("onebyte", |haystack| onebyte.iter(haystack).next());
+    row("onebyte memchr", |haystack| memchr::memchr(b'<', haystack));
+    row("threebyte", |haystack| threebyte.iter(haystack).next());
+    row("threebyte memchr", |haystack| {
+        memchr::memchr3(b'<', b'>', b'@', haystack)
     });
 
     print!("{:16}", "len");

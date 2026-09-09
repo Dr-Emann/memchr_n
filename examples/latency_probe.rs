@@ -21,22 +21,22 @@ fn main() {
     let offsets = [
         0usize, 1, 8, 15, 16, 17, 32, 63, 64, 65, 127, 128, 129, 192, 255, 256, 511, 1023,
     ];
-    let mut hay = vec![b'.'; 1 << 20];
+    let mut haystack = vec![b'.'; 1 << 20];
     for offset in offsets {
-        hay[offset] = b'x';
+        haystack[offset] = b'x';
         println!(
             "{offset:>7} {:>9.2}n {:>9.2}n {:>9.2}n {:>9.2}n",
-            best(ROUNDS, ITERS, || one.find(black_box(&hay))) * 1e9,
-            best(ROUNDS, ITERS, || memchr::memchr(b'x', black_box(&hay))) * 1e9,
-            best(ROUNDS, ITERS, || three.find(black_box(&hay))) * 1e9,
+            best(ROUNDS, ITERS, || one.find(black_box(&haystack))) * 1e9,
+            best(ROUNDS, ITERS, || memchr::memchr(b'x', black_box(&haystack))) * 1e9,
+            best(ROUNDS, ITERS, || three.find(black_box(&haystack))) * 1e9,
             best(ROUNDS, ITERS, || memchr::memchr3(
                 b'x',
                 b'y',
                 b'z',
-                black_box(&hay)
+                black_box(&haystack)
             )) * 1e9,
         );
-        hay[offset] = b'.';
+        haystack[offset] = b'.';
     }
 
     println!("== match at offset 0, haystack length swept");
@@ -45,14 +45,14 @@ fn main() {
         "len", "ours1", "ours3", "memchr1"
     );
     for len in [1usize, 8, 15, 16, 32, 63, 64, 65, 127, 128, 129, 1024] {
-        let mut hay = vec![b'.'; len];
-        hay[0] = b'x';
-        let hay = hay.as_slice();
+        let mut haystack = vec![b'.'; len];
+        haystack[0] = b'x';
+        let haystack = haystack.as_slice();
         println!(
             "{len:>8} {:>9.2}n {:>9.2}n {:>9.2}n",
-            best(ROUNDS, ITERS, || one.find(black_box(hay))) * 1e9,
-            best(ROUNDS, ITERS, || three.find(black_box(hay))) * 1e9,
-            best(ROUNDS, ITERS, || memchr::memchr(b'x', black_box(hay))) * 1e9,
+            best(ROUNDS, ITERS, || one.find(black_box(haystack))) * 1e9,
+            best(ROUNDS, ITERS, || three.find(black_box(haystack))) * 1e9,
+            best(ROUNDS, ITERS, || memchr::memchr(b'x', black_box(haystack))) * 1e9,
         );
     }
 }

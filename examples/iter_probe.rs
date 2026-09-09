@@ -19,21 +19,21 @@ const SETS: [(&str, &[u8]); 6] = [
     ("verycommon1", b" "),
 ];
 
-fn their_find(needles: &[u8], hay: &[u8]) -> Option<usize> {
+fn their_find(needles: &[u8], haystack: &[u8]) -> Option<usize> {
     match *needles {
-        [a] => memchr::memchr(a, hay),
-        [a, b] => memchr::memchr2(a, b, hay),
-        [a, b, c] => memchr::memchr3(a, b, c, hay),
+        [a] => memchr::memchr(a, haystack),
+        [a, b] => memchr::memchr2(a, b, haystack),
+        [a, b, c] => memchr::memchr3(a, b, c, haystack),
         _ => unreachable!("every set above is one to three needles"),
     }
 }
 
 // Boxing is negligible over a full corpus pass.
-fn their_iter<'h>(needles: &[u8], hay: &'h [u8]) -> Box<dyn Iterator<Item = usize> + 'h> {
+fn their_iter<'h>(needles: &[u8], haystack: &'h [u8]) -> Box<dyn Iterator<Item = usize> + 'h> {
     match *needles {
-        [a] => Box::new(memchr::memchr_iter(a, hay)),
-        [a, b] => Box::new(memchr::memchr2_iter(a, b, hay)),
-        [a, b, c] => Box::new(memchr::memchr3_iter(a, b, c, hay)),
+        [a] => Box::new(memchr::memchr_iter(a, haystack)),
+        [a, b] => Box::new(memchr::memchr2_iter(a, b, haystack)),
+        [a, b, c] => Box::new(memchr::memchr3_iter(a, b, c, haystack)),
         _ => unreachable!("every set above is one to three needles"),
     }
 }
@@ -54,20 +54,20 @@ fn main() {
     );
     for (name, needles) in SETS {
         let finder = MemchrN::new(needles);
-        let hay = SHERLOCK;
+        let haystack = SHERLOCK;
 
         let iterate = micros(|| {
             black_box(&finder)
-                .iter(black_box(hay))
+                .iter(black_box(haystack))
                 .fold(0usize, |acc, off| acc.wrapping_add(off))
         });
         let their_iterate = micros(|| {
-            their_iter(needles, black_box(hay)).fold(0usize, |acc, off| acc.wrapping_add(off))
+            their_iter(needles, black_box(haystack)).fold(0usize, |acc, off| acc.wrapping_add(off))
         });
-        let count = micros(|| black_box(&finder).iter(black_box(hay)).count());
-        let their_count = micros(|| their_iter(needles, black_box(hay)).count());
-        let find = micros(|| black_box(&finder).find(black_box(hay)).unwrap_or(0));
-        let their_find = micros(|| their_find(needles, black_box(hay)).unwrap_or(0));
+        let count = micros(|| black_box(&finder).iter(black_box(haystack)).count());
+        let their_count = micros(|| their_iter(needles, black_box(haystack)).count());
+        let find = micros(|| black_box(&finder).find(black_box(haystack)).unwrap_or(0));
+        let their_find = micros(|| their_find(needles, black_box(haystack)).unwrap_or(0));
 
         println!(
             "{name:>13} {iterate:>9.2} {their_iterate:>9.2}   \

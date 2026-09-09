@@ -18,7 +18,7 @@ const HEX_LOWER: &[u8] = b"0123456789abcdef";
 const OURS: &str = "memchr_n";
 const THEIRS: &str = "memchr";
 
-const BACKENDS: &[(&str, Backend)] = &[("auto", Backend::Auto), ("scalar", Backend::Scalar)];
+const BACKENDS: &[(&str, Backend)] = &[("auto", Backend::Auto), ("swar", Backend::Swar)];
 
 #[derive(Copy, Clone)]
 enum ByteSet {
@@ -30,8 +30,8 @@ enum ByteSet {
 impl ByteSet {
     fn finder(self, backend: Backend) -> MemchrN {
         match self {
-            ByteSet::List(bytes) => MemchrN::new_with(bytes, backend),
-            ByteSet::Range(start, end) => MemchrN::from_range_with(start..=end, backend),
+            ByteSet::List(bytes) => MemchrN::new_with_backend(bytes, backend),
+            ByteSet::Range(start, end) => MemchrN::from_range_with_backend(start..=end, backend),
             ByteSet::Stride { start, last, step } => {
                 let mut bytes = Vec::new();
                 let mut byte = start;
@@ -42,7 +42,7 @@ impl ByteSet {
                     };
                     byte = next;
                 }
-                MemchrN::new_with(&bytes, backend)
+                MemchrN::new_with_backend(&bytes, backend)
             }
         }
     }
@@ -350,8 +350,8 @@ fn bench_kinds(c: &mut Criterion) {
     let mut group = c.benchmark_group("kind/sherlock");
     group.throughput(Throughput::Bytes(SHERLOCK_HUGE.len() as u64));
     for &(name, set) in KIND_SETS {
-        for &(family, backend) in BACKENDS {
-            let param = format!("{name}/{family}");
+        for &(backend_name, backend) in BACKENDS {
+            let param = format!("{name}/{backend_name}");
             let finder = verified_finder(set, backend, SHERLOCK_HUGE, &param);
             group.bench_function(&param, |b| {
                 b.iter(|| black_box(&finder).iter(black_box(SHERLOCK_HUGE)).count())
@@ -386,8 +386,8 @@ fn bench_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("count/sizes");
     for &(name, set) in SIZE_SETS {
         for (size, haystack) in latency_haystacks() {
-            for &(family, backend) in BACKENDS {
-                let param = format!("{name}/{size}/{family}");
+            for &(backend_name, backend) in BACKENDS {
+                let param = format!("{name}/{size}/{backend_name}");
                 let finder = verified_finder(set, backend, haystack, &param);
                 group.bench_with_input(BenchmarkId::new(OURS, &param), &finder, |b, finder| {
                     b.iter(|| black_box(finder).iter(black_box(haystack)).count())
@@ -409,8 +409,8 @@ fn bench_find_first_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("find-first/sizes");
     for &(name, set) in FIRST_SETS {
         for (size, haystack) in latency_haystacks() {
-            for &(family, backend) in BACKENDS {
-                let param = format!("{name}/{size}/{family}");
+            for &(backend_name, backend) in BACKENDS {
+                let param = format!("{name}/{size}/{backend_name}");
                 let finder = verified_finder(set, backend, haystack, &param);
                 group.bench_with_input(BenchmarkId::new(OURS, &param), &finder, |b, finder| {
                     b.iter(|| black_box(finder).iter(black_box(haystack)).next())

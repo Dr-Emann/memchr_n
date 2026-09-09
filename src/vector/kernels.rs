@@ -1,31 +1,31 @@
 use super::Kernel;
-use crate::bitset::Bitset;
-use crate::{ConstantNibble, KernelData, NibbleLookup};
+use crate::bitset::ByteSet;
+use crate::{FixedNibble, KernelData, NibbleLookup};
 use fearless_simd::prelude::*;
 use fearless_simd::{u8x16, u8x32, u8x64};
 
 /// Compares each byte with up to three needles.
 #[derive(Copy, Clone)]
 pub(crate) struct AnyOf<S: Simd, const N: usize> {
-    needles: [u8x16<S>; N],
-    bytes: [u8; N],
+    needle_vectors: [u8x16<S>; N],
+    needles: [u8; N],
 }
 
 impl<S: Simd, const N: usize> Kernel<S> for AnyOf<S, N> {
-    unsafe fn from_data(simd: S, data: &KernelData) -> Self {
+    unsafe fn from_data(simd: S, kernel_data: &KernelData) -> Self {
         const { assert!(N <= 3, "`splatted_needles` holds three") }
         // SAFETY: the caller guarantees `splatted_needles` is live; `N <= 3` bounds the reads.
-        let splatted = unsafe { &data.splatted_needles };
+        let splatted = unsafe { &kernel_data.splatted_needles };
         Self {
-            needles: core::array::from_fn(|i| u8x16::load_array_ref(simd, &splatted[i])),
-            bytes: core::array::from_fn(|i| plain(&splatted[i])),
+            needle_vectors: core::array::from_fn(|i| u8x16::load_array_ref(simd, &splatted[i])),
+            needles: core::array::from_fn(|i| splatted_byte(&splatted[i])),
         }
     }
 
     #[inline(always)]
     fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
         let mut matched = V::Mask::splat(chunk.witness(), false);
-        for &needle in &self.needles {
+        for &needle in &self.needle_vectors {
             matched |= chunk.simd_eq(V::block_splat(needle));
         }
         matched
@@ -33,35 +33,36 @@ impl<S: Simd, const N: usize> Kernel<S> for AnyOf<S, N> {
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        self.bytes.contains(&byte)
+        self.needles.contains(&byte)
     }
 }
 
 #[derive(Copy, Clone)]
 pub(crate) struct OneRange<S: Simd> {
-    start: u8x16<S>,
-    last: u8x16<S>,
-    bounds: (u8, u8),
+    start_vector: u8x16<S>,
+    last_vector: u8x16<S>,
+    scalar_bounds: (u8, u8),
 }
 
 impl<S: Simd> Kernel<S> for OneRange<S> {
-    unsafe fn from_data(simd: S, data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `splatted_range` is live.
-        let [start, last] = unsafe { &data.splatted_range };
+    unsafe fn from_data(simd: S, kernel_data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `splatted_bounds` is live.
+        let [start, last] = unsafe { &kernel_data.splatted_bounds };
         Self {
-            start: u8x16::load_array_ref(simd, start),
-            last: u8x16::load_array_ref(simd, last),
-            bounds: (plain(start), plain(last)),
+            start_vector: u8x16::load_array_ref(simd, start),
+            last_vector: u8x16::load_array_ref(simd, last),
+            scalar_bounds: (splatted_byte(start), splatted_byte(last)),
         }
     }
     #[inline(always)]
     fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
-        chunk.simd_ge(V::block_splat(self.start)) & chunk.simd_le(V::block_splat(self.last))
+        chunk.simd_ge(V::block_splat(self.start_vector))
+            & chunk.simd_le(V::block_splat(self.last_vector))
     }
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        let (start, last) = self.bounds;
+        let (start, last) = self.scalar_bounds;
         start <= byte && byte <= last
     }
 }
@@ -73,9 +74,9 @@ pub(crate) struct SmallSet {
 }
 
 impl<S: Simd> Kernel<S> for SmallSet {
-    unsafe fn from_data(_simd: S, data: &KernelData) -> Self {
+    unsafe fn from_data(_simd: S, kernel_data: &KernelData) -> Self {
         // SAFETY: the caller guarantees `nibble_lookups` is live.
-        let [lo_lookup, hi_lookup] = unsafe { data.nibble_lookups };
+        let [lo_lookup, hi_lookup] = unsafe { kernel_data.nibble_lookups };
         Self {
             lo_lookup,
             hi_lookup,
@@ -107,17 +108,17 @@ impl<S: Simd> Kernel<S> for SmallSet {
 }
 
 #[derive(Copy, Clone)]
-pub(crate) struct SingleNibble {
-    which: ConstantNibble,
+pub(crate) struct FixedNibbleSet {
+    fixed_nibble: FixedNibble,
     table: [u8; 16],
 }
 
-impl<S: Simd> Kernel<S> for SingleNibble {
-    unsafe fn from_data(_simd: S, data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `nibble_table` is live.
-        let table = unsafe { data.nibble_table };
+impl<S: Simd> Kernel<S> for FixedNibbleSet {
+    unsafe fn from_data(_simd: S, kernel_data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `fixed_nibble_table` is live.
+        let table = unsafe { kernel_data.fixed_nibble_table };
         Self {
-            which: table.which,
+            fixed_nibble: table.fixed_nibble,
             table: table.table,
         }
     }
@@ -128,9 +129,9 @@ impl<S: Simd> Kernel<S> for SingleNibble {
         chunk: V,
     ) -> V::Mask {
         let table = V::block_splat(u8x16::simd_from(chunk.witness(), self.table));
-        let non_const_nibbles = match self.which {
-            ConstantNibble::Lo => chunk >> 4,
-            ConstantNibble::Hi => chunk & 0x0F,
+        let non_const_nibbles = match self.fixed_nibble {
+            FixedNibble::Low => chunk >> 4,
+            FixedNibble::High => chunk & 0x0F,
         };
         let should_match = table.swizzle_dyn_within_blocks(non_const_nibbles);
         chunk.simd_eq(should_match)
@@ -139,24 +140,24 @@ impl<S: Simd> Kernel<S> for SingleNibble {
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
         // Empty slots contain a sentinel whose variable nibble differs from its index.
-        let variable_nibble = match self.which {
-            ConstantNibble::Lo => byte >> 4,
-            ConstantNibble::Hi => byte & 0x0F,
+        let variable_nibble = match self.fixed_nibble {
+            FixedNibble::Low => byte >> 4,
+            FixedNibble::High => byte & 0x0F,
         };
         self.table[usize::from(variable_nibble)] == byte
     }
 }
 
 #[derive(Copy, Clone)]
-pub(crate) struct AnyByte {
-    bitset: Bitset,
+pub(crate) struct BitsetLookup {
+    byte_set: ByteSet,
 }
 
-impl<S: Simd> Kernel<S> for AnyByte {
-    unsafe fn from_data(_simd: S, data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `bitset` is live.
+impl<S: Simd> Kernel<S> for BitsetLookup {
+    unsafe fn from_data(_simd: S, kernel_data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `byte_set` is live.
         Self {
-            bitset: unsafe { data.bitset },
+            byte_set: unsafe { kernel_data.byte_set },
         }
     }
 
@@ -167,12 +168,12 @@ impl<S: Simd> Kernel<S> for AnyByte {
     ) -> V::Mask {
         let bits = V::block_splat(u8x16::from_fn(chunk.witness(), |i| 1 << (i % 8)));
         let bit = bits.swizzle_dyn_within_blocks(chunk & 0b0111);
-        !(bit & membership_bits(&self.bitset, chunk >> 3)).simd_eq(0)
+        !(bit & lookup_membership_bytes(&self.byte_set, chunk >> 3)).simd_eq(0)
     }
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        self.bitset.contains(byte)
+        self.byte_set.contains(byte)
     }
 }
 
@@ -180,19 +181,19 @@ impl<S: Simd> Kernel<S> for AnyByte {
 ///
 /// Borrowing preserves an aligned vector load; copying generates scalar inserts.
 #[inline(always)]
-fn plain(splatted: &[u8; 16]) -> u8 {
+fn splatted_byte(splatted: &[u8; 16]) -> u8 {
     splatted[0]
 }
 
 /// Looks each byte's high five bits up in the 256-bit table, giving the table byte
 /// that holds its membership bit.
 #[inline(always)]
-fn membership_bits<S: Simd, V: SimdInt<S, Element = u8, ByteVector = V>>(
-    bitset: &Bitset,
+fn lookup_membership_bytes<S: Simd, V: SimdInt<S, Element = u8, ByteVector = V>>(
+    byte_set: &ByteSet,
     indices: V,
 ) -> V {
     let simd = indices.witness();
-    let table = u8x32::load_array_ref(simd, bitset.as_array());
+    let table = u8x32::load_array_ref(simd, byte_set.as_array());
 
     const { assert!(V::LEN == 16 || V::LEN == 32 || V::LEN == 64) }
     match V::LEN {

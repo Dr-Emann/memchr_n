@@ -1,12 +1,15 @@
 #![deny(unnameable_types, unreachable_pub)]
 
 mod bitset;
-mod kind;
+mod search;
 mod swar;
 mod vector;
 
-use crate::bitset::Bitset;
-use crate::kind::Kind;
+use crate::bitset::ByteSet;
+use crate::search::{
+    FixedNibble, FixedNibbleTable, KernelData, KernelKind, NibbleLookup, ScanOps, SearchPlan,
+    never_scan_ops,
+};
 use core::fmt;
 use core::ops::{Bound, RangeBounds};
 use core::range::RangeInclusive;
@@ -20,14 +23,14 @@ use fearless_simd::Level;
 // Bit `i` marks byte `i` of one scan.
 type MatchedBitset = u128;
 
-/// Selects the family of kernels used to build a [`MemchrN`].
+/// Selects the engine of kernels used to build a [`MemchrN`].
 ///
 /// # Examples
 ///
 /// ```
 /// use memchr_n::{Backend, MemchrN};
 ///
-/// let finder = MemchrN::new_with(b"!?", Backend::Scalar);
+/// let finder = MemchrN::new_with_backend(b"!?", Backend::Swar);
 /// assert_eq!(finder.find(b"well, hello!"), Some(11));
 /// ```
 #[derive(Copy, Clone, Default, Debug)]
@@ -37,19 +40,19 @@ pub enum Backend {
     #[default]
     Auto,
     /// Word-at-a-time kernels, even on a target that has vectors.
-    Scalar,
+    Swar,
     /// The kernels supported by an explicit [`Level`].
     #[cfg(feature = "manual_level")]
     Level(Level),
 }
 
 impl Backend {
-    fn family(self) -> Family {
+    fn engine(self) -> Engine {
         match self {
-            Backend::Auto => Family::Vector(Level::new()),
-            Backend::Scalar => Family::Scalar,
+            Backend::Auto => Engine::Vector(Level::new()),
+            Backend::Swar => Engine::Swar,
             #[cfg(feature = "manual_level")]
-            Backend::Level(level) => Family::Vector(level),
+            Backend::Level(level) => Engine::Vector(level),
         }
     }
 }
@@ -72,39 +75,36 @@ const _: () = {
 /// ```
 #[derive(Clone)]
 pub struct MemchrN {
-    family: Family,
-    kind: Kind,
-    data: KernelData,
-    scan: &'static Scan,
+    search: SearchPlan,
 }
 
 impl fmt::Debug for MemchrN {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MemchrN")
-            .field("family", &self.family)
-            .field("kind", &self.kind)
+            .field("engine", &self.search.engine)
+            .field("kernel_kind", &self.search.kernel_kind)
             .finish_non_exhaustive()
     }
 }
 
 #[derive(Copy, Clone, Debug)]
-enum Family {
+enum Engine {
     Vector(Level),
-    Scalar,
+    Swar,
 }
 
-impl Family {
+impl Engine {
     #[must_use]
-    fn for_shuffle(self) -> Self {
+    fn with_byte_shuffle(self) -> Self {
         match self {
-            Family::Vector(level) => {
+            Engine::Vector(level) => {
                 if vector::has_byte_shuffle(level) {
-                    Family::Vector(level)
+                    Engine::Vector(level)
                 } else {
-                    Family::Scalar
+                    Engine::Swar
                 }
             }
-            Family::Scalar => Family::Scalar,
+            Engine::Swar => Engine::Swar,
         }
     }
 }
@@ -122,7 +122,7 @@ impl MemchrN {
     /// ```
     #[inline]
     pub fn new(bytes: &[u8]) -> Self {
-        Self::new_with(bytes, Backend::Auto)
+        Self::new_with_backend(bytes, Backend::Auto)
     }
 
     /// Builds a searcher for the distinct values in `bytes` using `backend`.
@@ -132,11 +132,11 @@ impl MemchrN {
     /// ```
     /// use memchr_n::{Backend, MemchrN};
     ///
-    /// let finder = MemchrN::new_with(b"!?", Backend::Scalar);
+    /// let finder = MemchrN::new_with_backend(b"!?", Backend::Swar);
     /// assert_eq!(finder.find(b"well, hello!"), Some(11));
     /// ```
-    pub fn new_with(bytes: &[u8], backend: Backend) -> Self {
-        Self::from_set(Bitset::from_bytes(bytes), backend)
+    pub fn new_with_backend(bytes: &[u8], backend: Backend) -> Self {
+        Self::from_set(ByteSet::from_bytes(bytes), backend)
     }
 
     /// Builds a searcher for the bytes in a [`RangeBounds<u8>`] using the best supported kernels.
@@ -153,7 +153,7 @@ impl MemchrN {
     /// ```
     #[inline]
     pub fn from_range(range: impl RangeBounds<u8>) -> Self {
-        Self::from_range_with(range, Backend::Auto)
+        Self::from_range_with_backend(range, Backend::Auto)
     }
 
     /// Builds a searcher for the bytes in a [`RangeBounds<u8>`] using `backend`.
@@ -165,101 +165,109 @@ impl MemchrN {
     /// ```
     /// use memchr_n::{Backend, MemchrN};
     ///
-    /// let finder = MemchrN::from_range_with(b'0'..b':', Backend::Scalar);
+    /// let finder = MemchrN::from_range_with_backend(b'0'..b':', Backend::Swar);
     /// assert_eq!(finder.find(b"page 2"), Some(5));
     /// ```
-    pub fn from_range_with(range: impl RangeBounds<u8>, backend: Backend) -> Self {
-        let mut set = Bitset::new();
+    pub fn from_range_with_backend(range: impl RangeBounds<u8>, backend: Backend) -> Self {
+        let mut set = ByteSet::new();
         if let Some(range) = inclusive_range(range) {
             set.add_range(range);
         }
         Self::from_set(set, backend)
     }
 
-    fn from_set(set: Bitset, backend: Backend) -> Self {
+    fn from_set(set: ByteSet, backend: Backend) -> Self {
         const MEMBERS_MAX: usize = 16;
 
-        let family = backend.family();
+        let engine = backend.engine();
         let mut members = [0; MEMBERS_MAX];
-        if let Some(count) = set.members(&mut members) {
+        if let Some(count) = set.write_members(&mut members) {
             let members = &members[..usize::from(count)];
 
             match *members {
                 [] => Self::of_never(),
-                [first] => Self::of_needles(family, [first]),
-                [first, second] => Self::of_needles(family, [first, second]),
-                [first, second, third] => Self::of_needles(family, [first, second, third]),
+                [first] => Self::of_needles(engine, [first]),
+                [first, second] => Self::of_needles(engine, [first, second]),
+                [first, second, third] => Self::of_needles(engine, [first, second, third]),
                 [start, .., last] if usize::from(last - start) + 1 == members.len() => {
-                    Self::of_range(family, RangeInclusive { start, last })
+                    Self::of_range(engine, RangeInclusive { start, last })
                 }
-                _ => Self::of_small_set(family, members)
-                    .or_else(|| Self::of_single_nibble(family, members))
-                    .unwrap_or_else(|| Self::of_any_byte(family, set)),
+                _ => Self::of_small_set(engine, members)
+                    .or_else(|| Self::of_fixed_nibble_set(engine, members))
+                    .unwrap_or_else(|| Self::of_bitset_lookup(engine, set)),
             }
         } else {
             // Ranges remain cheap even when too large for a named-member kernel.
-            match set.extract_range() {
-                Some(range) => Self::of_range(family, range),
-                None => Self::of_any_byte(family, set),
+            match set.as_contiguous_range() {
+                Some(range) => Self::of_range(engine, range),
+                None => Self::of_bitset_lookup(engine, set),
             }
         }
     }
 
-    fn of_needles<const N: usize>(family: Family, needles: [u8; N]) -> Self {
-        let kind = match N {
-            1 => Kind::OneByte,
-            2 => Kind::TwoBytes,
-            3 => Kind::ThreeBytes,
+    fn of_needles<const N: usize>(engine: Engine, needles: [u8; N]) -> Self {
+        let kernel_kind = match N {
+            1 => KernelKind::OneByte,
+            2 => KernelKind::TwoBytes,
+            3 => KernelKind::ThreeBytes,
             _ => unreachable!(),
         };
         let mut splatted_needles = [[0; _]; 3];
         for (dst, needle) in splatted_needles.iter_mut().zip(needles) {
             *dst = [needle; _];
         }
-        let data = KernelData { splatted_needles };
-        match family {
-            Family::Vector(level) => Self {
-                family,
-                kind,
-                data,
-                scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::AnyOf<_, N>>(simd)),
+        let kernel_data = KernelData { splatted_needles };
+        match engine {
+            Engine::Vector(level) => Self {
+                search: SearchPlan {
+                    kernel_data,
+                    scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::AnyOf<_, N>>(simd)),
+                    engine,
+                    kernel_kind,
+                },
             },
-            Family::Scalar => Self {
-                family,
-                kind,
-                data,
-                scan: swar::scan::<swar::kernels::AnyOf<N>>(),
+            Engine::Swar => Self {
+                search: SearchPlan {
+                    kernel_data,
+                    scan_ops: swar::scan_ops::<swar::kernels::AnyOf<N>>(),
+                    engine,
+                    kernel_kind,
+                },
             },
         }
     }
 
-    fn of_range(family: Family, range: RangeInclusive<u8>) -> Self {
-        let kind = Kind::OneRange;
-        match family {
-            Family::Vector(level) => Self {
-                family,
-                kind,
-                data: KernelData {
-                    splatted_range: [[range.start; _], [range.last; _]],
+    fn of_range(engine: Engine, range: RangeInclusive<u8>) -> Self {
+        let kernel_kind = KernelKind::OneRange;
+        match engine {
+            Engine::Vector(level) => Self {
+                search: SearchPlan {
+                    kernel_data: KernelData {
+                        splatted_bounds: [[range.start; _], [range.last; _]],
+                    },
+                    scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::OneRange<_>>(simd)),
+                    engine,
+                    kernel_kind,
                 },
-                scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::OneRange<_>>(simd)),
             },
-            Family::Scalar => Self {
-                family,
-                kind,
-                data: KernelData {
-                    range_masks: swar::kernels::OneRange::new(range),
+            Engine::Swar => Self {
+                search: SearchPlan {
+                    kernel_data: KernelData {
+                        range_masks: swar::kernels::OneRange::new(range),
+                    },
+                    scan_ops: swar::scan_ops::<swar::kernels::OneRange>(),
+                    engine,
+                    kernel_kind,
                 },
-                scan: swar::scan::<swar::kernels::OneRange>(),
             },
         }
     }
 
-    fn of_small_set(family: Family, possible_set: &[u8]) -> Option<Self> {
+    fn of_small_set(engine: Engine, possible_set: &[u8]) -> Option<Self> {
         if possible_set.len() > 8 {
             return None;
         }
-        let Family::Vector(level) = family else {
+        let Engine::Vector(level) = engine else {
             return None;
         };
         if !vector::has_byte_shuffle(level) {
@@ -272,56 +280,66 @@ impl MemchrN {
             hi_lookup.set(item >> 4, i as u8);
         }
         Some(Self {
-            family,
-            kind: Kind::SmallSet,
-            data: KernelData {
-                nibble_lookups: [lo_lookup, hi_lookup],
+            search: SearchPlan {
+                kernel_data: KernelData {
+                    nibble_lookups: [lo_lookup, hi_lookup],
+                },
+                scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::SmallSet>(simd)),
+                engine,
+                kernel_kind: KernelKind::SmallSet,
             },
-            scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::SmallSet>(simd)),
         })
     }
 
-    fn of_single_nibble(family: Family, possible_set: &[u8]) -> Option<Self> {
-        let Family::Vector(level) = family else {
+    fn of_fixed_nibble_set(engine: Engine, possible_set: &[u8]) -> Option<Self> {
+        let Engine::Vector(level) = engine else {
             return None;
         };
         if !vector::has_byte_shuffle(level) {
             return None;
         }
-        let nibble_table = extract_constant_nibble(possible_set)?;
+        let fixed_nibble_table = extract_fixed_nibble_table(possible_set)?;
         Some(Self {
-            family,
-            kind: Kind::ConstantNibble,
-            data: KernelData { nibble_table },
-            scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::SingleNibble>(simd)),
+            search: SearchPlan {
+                kernel_data: KernelData { fixed_nibble_table },
+                scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::FixedNibbleSet>(simd)),
+                engine,
+                kernel_kind: KernelKind::FixedNibble,
+            },
         })
     }
 
-    fn of_any_byte(family: Family, bitset: Bitset) -> Self {
-        let family = family.for_shuffle();
-        let (kind, data) = (Kind::AnyByte, KernelData { bitset });
-        match family {
-            Family::Vector(level) => Self {
-                family,
-                kind,
-                data,
-                scan: dispatch!(level, simd => vector::scan::<_, vector::kernels::AnyByte>(simd)),
+    fn of_bitset_lookup(engine: Engine, byte_set: ByteSet) -> Self {
+        let engine = engine.with_byte_shuffle();
+        let (kernel_kind, kernel_data) = (KernelKind::BitsetLookup, KernelData { byte_set });
+        match engine {
+            Engine::Vector(level) => Self {
+                search: SearchPlan {
+                    kernel_data,
+                    scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::BitsetLookup>(simd)),
+                    engine,
+                    kernel_kind,
+                },
             },
-            Family::Scalar => Self {
-                family,
-                kind,
-                data,
-                scan: swar::scan::<swar::kernels::AnyByte>(),
+            Engine::Swar => Self {
+                search: SearchPlan {
+                    kernel_data,
+                    scan_ops: swar::scan_ops::<swar::kernels::BitsetLookup>(),
+                    engine,
+                    kernel_kind,
+                },
             },
         }
     }
 
     fn of_never() -> Self {
         Self {
-            family: Family::Scalar,
-            kind: Kind::Never,
-            data: KernelData { never: () },
-            scan: never_scan(),
+            search: SearchPlan {
+                kernel_data: KernelData { no_data: () },
+                scan_ops: never_scan_ops(),
+                engine: Engine::Swar,
+                kernel_kind: KernelKind::Never,
+            },
         }
     }
 
@@ -340,8 +358,8 @@ impl MemchrN {
     /// ```
     #[inline]
     pub fn find(&self, haystack: &[u8]) -> Option<usize> {
-        // SAFETY: `self.data` and `self.scan` are constructed as a matching pair.
-        unsafe { (self.scan.find_first)(&self.data, haystack) }
+        // SAFETY: `self.search` keeps the scan operations, kernel data, and supported SIMD level together.
+        unsafe { (self.search.scan_ops.find_first)(&self.search.kernel_data, haystack) }
     }
 
     /// Returns an [`Iter`] over the offsets of every matching byte in `haystack`.
@@ -359,13 +377,13 @@ impl MemchrN {
     #[inline]
     pub fn iter<'a>(&'a self, haystack: &'a [u8]) -> Iter<'a> {
         Iter {
-            memchr_n: self,
+            finder: self,
             state: IterState {
                 haystack,
-                pos: 0,
-                bits_offset: 0,
+                scan_offset: 0,
+                match_base: 0,
             },
-            bits: 0,
+            match_bits: 0,
         }
     }
 }
@@ -395,11 +413,11 @@ fn inclusive_range(range: impl RangeBounds<u8>) -> Option<RangeInclusive<u8>> {
 
 impl FromIterator<u8> for MemchrN {
     fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
-        Self::from_set(Bitset::from_iter(iter), Backend::Auto)
+        Self::from_set(ByteSet::from_iter(iter), Backend::Auto)
     }
 }
 
-fn extract_constant_nibble(items: &[u8]) -> Option<NibbleTable> {
+fn extract_fixed_nibble_table(items: &[u8]) -> Option<FixedNibbleTable> {
     let first = *items.first()?;
     let (lo_nibble, hi_nibble) = (first & 0x0F, first >> 4);
 
@@ -410,15 +428,15 @@ fn extract_constant_nibble(items: &[u8]) -> Option<NibbleTable> {
     }
 
     // An empty slot must contain a byte whose variable nibble differs from its index.
-    // Zero works except at index zero, which uses the opposite one-bit nibble.
+    // Zero works except at index zero, fixed_nibble uses the opposite one-bit nibble.
     if lo_constant {
         let mut table = [0; 16];
         table[0] = 0x10;
         for &item in items {
             table[usize::from(item >> 4)] = item;
         }
-        Some(NibbleTable {
-            which: ConstantNibble::Lo,
+        Some(FixedNibbleTable {
+            fixed_nibble: FixedNibble::Low,
             table,
         })
     } else if hi_constant {
@@ -427,30 +445,12 @@ fn extract_constant_nibble(items: &[u8]) -> Option<NibbleTable> {
         for &item in items {
             table[usize::from(item & 0x0F)] = item;
         }
-        Some(NibbleTable {
-            which: ConstantNibble::Hi,
+        Some(FixedNibbleTable {
+            fixed_nibble: FixedNibble::High,
             table,
         })
     } else {
         None
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum ConstantNibble {
-    Lo,
-    Hi,
-}
-
-#[derive(Debug, Default, Copy, Clone)]
-pub(crate) struct NibbleLookup(pub(crate) [u8; 16]);
-
-impl NibbleLookup {
-    #[inline]
-    fn set(&mut self, nibble: u8, bit: u8) {
-        debug_assert!(nibble < 16);
-        debug_assert!(bit < 8);
-        self.0[usize::from(nibble)] |= 1 << bit;
     }
 }
 
@@ -468,99 +468,40 @@ impl NibbleLookup {
 /// assert_eq!(matches.collect::<Vec<_>>(), vec![1, 4]);
 /// ```
 pub struct Iter<'a> {
-    memchr_n: &'a MemchrN,
+    finder: &'a MemchrN,
     state: IterState<'a>,
-    bits: MatchedBitset,
+    match_bits: MatchedBitset,
 }
 
 struct IterState<'a> {
     haystack: &'a [u8],
-    pos: usize,
-    bits_offset: usize,
-}
-
-/// Stores a kernel's precomputed data in the representation it consumes.
-#[derive(Copy, Clone)]
-#[repr(align(16))]
-union KernelData {
-    /// [`vector::kernels::AnyOf`]: one to three needles, each splatted across a block.
-    splatted_needles: [[u8; 16]; 3],
-    /// [`vector::kernels::OneRange`]: the endpoints, each splatted across a block.
-    splatted_range: [[u8; 16]; 2],
-    /// [`vector::kernels::SmallSet`]: the low- and high-nibble tables.
-    nibble_lookups: [NibbleLookup; 2],
-    /// [`vector::kernels::SingleNibble`].
-    nibble_table: NibbleTable,
-    /// [`vector::kernels::AnyByte`] and [`swar::kernels::AnyByte`].
-    bitset: Bitset,
-    /// [`swar::kernels::OneRange`], whose masks are all derived up front.
-    range_masks: swar::kernels::OneRange,
-    /// The no-match kernel requires no data.
-    never: (),
-}
-
-/// [`vector::kernels::SingleNibble`]'s table and the nibble it is indexed by.
-#[derive(Copy, Clone)]
-struct NibbleTable {
-    which: ConstantNibble,
-    table: [u8; 16],
-}
-
-#[derive(Copy, Clone)]
-struct Scan {
-    /// Searches forward until a scan produces a nonzero matching bitset.
-    ///
-    /// Updates the [`IterState`] position and bitset offset.
-    ///
-    /// # Safety
-    ///
-    /// `data` must have the field expected by this [`Scan`] as its live field.
-    find_next: unsafe fn(&KernelData, &mut IterState<'_>) -> MatchedBitset,
-    /// Counts every match in what is left of a haystack.
-    count_all: unsafe fn(&KernelData, &[u8]) -> usize,
-    /// Searches the entire haystack for its first match.
-    find_first: unsafe fn(&KernelData, &[u8]) -> Option<usize>,
-}
-
-pub(crate) fn never_scan() -> &'static Scan {
-    fn find_next(_data: &KernelData, state: &mut IterState<'_>) -> MatchedBitset {
-        state.pos = state.haystack.len();
-        0
-    }
-
-    fn count_all(_data: &KernelData, _haystack: &[u8]) -> usize {
-        0
-    }
-
-    fn find_first(_data: &KernelData, _haystack: &[u8]) -> Option<usize> {
-        None
-    }
-
-    &Scan {
-        find_next,
-        count_all,
-        find_first,
-    }
+    scan_offset: usize,
+    match_base: usize,
 }
 
 impl<'a> Iter<'a> {
     #[inline]
     fn refill(&mut self) -> Option<()> {
-        if self.state.pos == self.state.haystack.len() {
+        if self.state.scan_offset == self.state.haystack.len() {
             return None;
         }
-        // SAFETY: construction pairs the scan with its data and supported SIMD level.
-        self.bits = unsafe { (self.memchr_n.scan.find_next)(&self.memchr_n.data, &mut self.state) };
-        (self.bits != 0).then_some(())
+        // SAFETY: `SearchPlan` keeps the scan operations, kernel data, and supported SIMD level together.
+        self.match_bits = unsafe {
+            (self.finder.search.scan_ops.find_next)(
+                &self.finder.search.kernel_data,
+                &mut self.state,
+            )
+        };
+        (self.match_bits != 0).then_some(())
     }
 
     #[inline]
     fn take_lowest(&mut self) -> usize {
-        debug_assert!(self.bits != 0);
+        debug_assert!(self.match_bits != 0);
 
-        let bit = self.bits.trailing_zeros() as usize;
-        self.bits &= self.bits - 1;
-        self.state.bits_offset + bit
+        let bit = self.match_bits.trailing_zeros() as usize;
+        self.match_bits &= self.match_bits - 1;
+        self.state.match_base + bit
     }
 }
 
@@ -569,25 +510,27 @@ impl<'a> Iterator for Iter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.bits == 0 {
+        if self.match_bits == 0 {
             self.refill()?;
         }
         Some(self.take_lowest())
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let min = self.bits.count_ones() as usize;
-        let max = min.checked_add(self.state.haystack.len() - self.state.pos);
+        let min = self.match_bits.count_ones() as usize;
+        let max = min.checked_add(self.state.haystack.len() - self.state.scan_offset);
         (min, max)
     }
 
     fn count(self) -> usize {
-        let mut total = self.bits.count_ones() as usize;
-        // SAFETY: `pos` only ever moves to an offset a scan reached, so it is in bounds.
-        let unscanned = unsafe { self.state.haystack.get_unchecked(self.state.pos..) };
+        let mut total = self.match_bits.count_ones() as usize;
+        // SAFETY: `scan_offset` only ever moves to an offset a scan reached, so it is in bounds.
+        let unscanned = unsafe { self.state.haystack.get_unchecked(self.state.scan_offset..) };
         if !unscanned.is_empty() {
-            // SAFETY: `self.memchr_n` pairs the scan with its data and SIMD level.
-            total += unsafe { (self.memchr_n.scan.count_all)(&self.memchr_n.data, unscanned) };
+            // SAFETY: `SearchPlan` keeps the scan operations, kernel data, and supported SIMD level together.
+            total += unsafe {
+                (self.finder.search.scan_ops.count_all)(&self.finder.search.kernel_data, unscanned)
+            };
         }
         total
     }
@@ -596,16 +539,16 @@ impl<'a> Iterator for Iter<'a> {
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         let mut remaining = n;
         loop {
-            let held = self.bits.count_ones() as usize;
+            let held = self.match_bits.count_ones() as usize;
             if held > remaining {
                 break;
             }
             remaining -= held;
-            self.bits = 0;
+            self.match_bits = 0;
             self.refill()?;
         }
         for _ in 0..remaining {
-            self.bits &= self.bits - 1;
+            self.match_bits &= self.match_bits - 1;
         }
         Some(self.take_lowest())
     }
@@ -662,7 +605,7 @@ mod tests {
         }
         assert_eq!(MemchrN::from_range(3..3).find(&haystack), None);
         assert_eq!(
-            MemchrN::from_range_with(..0, Backend::Scalar).find(&haystack),
+            MemchrN::from_range_with_backend(..0, Backend::Swar).find(&haystack),
             None
         );
     }
@@ -671,10 +614,10 @@ mod tests {
     fn add_range_matches_adding_each_byte() {
         for start in 0..=u8::MAX {
             for last in start..=u8::MAX {
-                let mut ranged = Bitset::new();
+                let mut ranged = ByteSet::new();
                 ranged.add_range(RangeInclusive { start, last });
 
-                let mut one_at_a_time = Bitset::new();
+                let mut one_at_a_time = ByteSet::new();
                 for byte in start..=last {
                     one_at_a_time.add(byte);
                 }
@@ -686,13 +629,13 @@ mod tests {
 
     #[test]
     fn add_range_of_empty_range_adds_nothing() {
-        let mut set = Bitset::from_bytes(b"abc");
+        let mut set = ByteSet::from_bytes(b"abc");
         let before = set;
         set.add_range(RangeInclusive { start: 10, last: 9 });
         assert_eq!(set, before);
     }
 
-    fn members(set: &Bitset) -> Vec<u8> {
+    fn members(set: &ByteSet) -> Vec<u8> {
         let all: Vec<u8> = (0..=u8::MAX).collect();
         MemchrN::from_set(*set, Backend::Auto)
             .iter(&all)
@@ -700,10 +643,10 @@ mod tests {
             .collect()
     }
 
-    fn assert_same_set_and_kernel(bulk: &Bitset, one_at_a_time: &Bitset, case: &str) {
+    fn assert_same_set_and_kernel(bulk: &ByteSet, one_at_a_time: &ByteSet, case: &str) {
         // Equal members alone would miss representation-selection regressions.
         assert_eq!(members(bulk), members(one_at_a_time), "{case}");
-        for backend in [Backend::Auto, Backend::Scalar] {
+        for backend in [Backend::Auto, Backend::Swar] {
             assert_eq!(
                 format!("{:?}", MemchrN::from_set(*bulk, backend)),
                 format!("{:?}", MemchrN::from_set(*one_at_a_time, backend)),
@@ -735,15 +678,15 @@ mod tests {
                 "25 scattered",
                 (0..25).map(|i: u8| i.wrapping_mul(7)).collect(),
             ),
-            ("one past the members a kind can name", (0..17).collect()),
+            ("one past the members a kernel can name", (0..17).collect()),
         ];
 
         for (case, bytes) in cases {
-            let mut one_at_a_time = Bitset::new();
+            let mut one_at_a_time = ByteSet::new();
             for &byte in bytes {
                 one_at_a_time.add(byte);
             }
-            assert_same_set_and_kernel(&Bitset::from_bytes(bytes), &one_at_a_time, case);
+            assert_same_set_and_kernel(&ByteSet::from_bytes(bytes), &one_at_a_time, case);
         }
     }
 
@@ -752,10 +695,10 @@ mod tests {
         let seeds: &[&[u8]] = &[b"", b"z", b"\x00", b"\x7f", b"az", b"\x00\xff", b"aeiouAEI"];
         for seed in seeds {
             for (start, last) in [(0u8, 255u8), (0x80, 0xFF), (10, 40), (100, 124), (60, 200)] {
-                let mut ranged = Bitset::from_bytes(seed);
+                let mut ranged = ByteSet::from_bytes(seed);
                 ranged.add_range(RangeInclusive { start, last });
 
-                let mut one_at_a_time = Bitset::from_bytes(seed);
+                let mut one_at_a_time = ByteSet::from_bytes(seed);
                 for byte in start..=last {
                     one_at_a_time.add(byte);
                 }
@@ -773,7 +716,7 @@ mod tests {
             for &first_last in bounds.iter().filter(|&&b| b >= first_start) {
                 for &second_start in &bounds {
                     for &second_last in bounds.iter().filter(|&&b| b >= second_start) {
-                        let mut ranged = Bitset::new();
+                        let mut ranged = ByteSet::new();
                         ranged.add_range(RangeInclusive {
                             start: first_start,
                             last: first_last,
@@ -783,7 +726,7 @@ mod tests {
                             last: second_last,
                         });
 
-                        let mut one_at_a_time = Bitset::new();
+                        let mut one_at_a_time = ByteSet::new();
                         for byte in first_start..=first_last {
                             one_at_a_time.add(byte);
                         }
@@ -803,7 +746,7 @@ mod tests {
 
     #[test]
     fn add_keeps_a_byte_disjoint_from_an_existing_range() {
-        let mut set = Bitset::new();
+        let mut set = ByteSet::new();
         set.add_range(RangeInclusive {
             start: 0,
             last: 100,
@@ -814,8 +757,8 @@ mod tests {
 
     #[test]
     fn add_range_works_in_const_context() {
-        const DIGITS: Bitset = {
-            let mut set = Bitset::new();
+        const DIGITS: ByteSet = {
+            let mut set = ByteSet::new();
             set.add_range(RangeInclusive {
                 start: b'0',
                 last: b'9',
@@ -826,7 +769,7 @@ mod tests {
     }
 
     fn build_word(bytes: &[u8]) -> MemchrN {
-        MemchrN::new_with(bytes, Backend::Scalar)
+        MemchrN::new_with_backend(bytes, Backend::Swar)
     }
 
     fn build(bytes: &[u8]) -> MemchrN {
@@ -903,7 +846,7 @@ mod tests {
 
     #[test]
     fn overlapping_tail_does_not_repeat_matches() {
-        // The dense set exercises scalar `AnyByte` and contains `x`.
+        // The dense set exercises scalar `BitsetLookup` and contains `x`.
         let dense: Vec<u8> = (0..=u8::MAX).step_by(3).collect();
         for searcher in [build(b"x"), build_word(b"x"), build_word(&dense)] {
             for len in 0..192 {

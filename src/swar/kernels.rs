@@ -1,5 +1,5 @@
 use crate::KernelData;
-use crate::bitset::Bitset;
+use crate::bitset::ByteSet;
 use crate::swar::{HIGH, Kernel, nonzero_bytes, splat};
 use core::range::RangeInclusive;
 
@@ -18,10 +18,10 @@ fn any_of_matches<const N: usize>(word: u64, splatted_needles: [u64; N]) -> u64 
 }
 
 impl<const N: usize> Kernel for AnyOf<N> {
-    unsafe fn from_data(data: &KernelData) -> Self {
+    unsafe fn from_data(kernel_data: &KernelData) -> Self {
         const { assert!(N <= 3, "`splatted_needles` holds three") }
         // SAFETY: the caller guarantees `splatted_needles` is live; `N <= 3` bounds the reads.
-        let splatted = unsafe { data.splatted_needles };
+        let splatted = unsafe { kernel_data.splatted_needles };
         Self {
             splatted_needles: core::array::from_fn(|i| {
                 u64::from_ne_bytes(*splatted[i].first_chunk().unwrap())
@@ -70,9 +70,9 @@ impl OneRange {
 }
 
 impl Kernel for OneRange {
-    unsafe fn from_data(data: &KernelData) -> Self {
+    unsafe fn from_data(kernel_data: &KernelData) -> Self {
         // SAFETY: the caller guarantees `range_masks` is live.
-        unsafe { data.range_masks }
+        unsafe { kernel_data.range_masks }
     }
 
     #[inline]
@@ -98,15 +98,15 @@ impl Kernel for OneRange {
 
 /// Probes a 256-bit membership table one byte at a time.
 #[derive(Copy, Clone)]
-pub(crate) struct AnyByte {
-    bitset: Bitset,
+pub(crate) struct BitsetLookup {
+    byte_set: ByteSet,
 }
 
-impl Kernel for AnyByte {
-    unsafe fn from_data(data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `bitset` is live.
+impl Kernel for BitsetLookup {
+    unsafe fn from_data(kernel_data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `byte_set` is live.
         Self {
-            bitset: unsafe { data.bitset },
+            byte_set: unsafe { kernel_data.byte_set },
         }
     }
 
@@ -121,7 +121,7 @@ impl Kernel for AnyByte {
 
     #[inline]
     fn matches_byte(&self, byte: u8) -> bool {
-        self.bitset.contains(byte)
+        self.byte_set.contains(byte)
     }
 }
 
@@ -217,8 +217,8 @@ mod tests {
             (0x80..=u8::MAX).collect(),
         ];
         for set in sets {
-            let bitset = Bitset::from_bytes(&set);
-            let kernel = AnyByte { bitset };
+            let byte_set = ByteSet::from_bytes(&set);
+            let kernel = BitsetLookup { byte_set };
             for byte in 0..=u8::MAX {
                 assert_eq!(
                     kernel.matches_byte(byte),

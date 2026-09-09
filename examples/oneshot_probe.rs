@@ -23,16 +23,21 @@ const SETS: [(&str, &[u8]); 7] = [
     ("any-byte", b"0123456789abcdef"),
 ];
 
-fn theirs(needles: &[u8], hay: &[u8]) -> f64 {
+fn theirs(needles: &[u8], haystack: &[u8]) -> f64 {
     match *needles {
         [a] => best(ROUNDS, ITERS, || {
-            memchr::memchr(black_box(a), black_box(hay))
+            memchr::memchr(black_box(a), black_box(haystack))
         }),
         [a, b] => best(ROUNDS, ITERS, || {
-            memchr::memchr2(black_box(a), black_box(b), black_box(hay))
+            memchr::memchr2(black_box(a), black_box(b), black_box(haystack))
         }),
         [a, b, c] => best(ROUNDS, ITERS, || {
-            memchr::memchr3(black_box(a), black_box(b), black_box(c), black_box(hay))
+            memchr::memchr3(
+                black_box(a),
+                black_box(b),
+                black_box(c),
+                black_box(haystack),
+            )
         }),
         _ => f64::NAN,
     }
@@ -56,16 +61,16 @@ impl Planted {
 }
 
 fn haystack(len: usize, needles: &[u8], planted: Planted) -> Vec<u8> {
-    let mut hay = vec![b'.'; len];
+    let mut haystack = vec![b'.'; len];
     let offset = match planted {
         Planted::Front => 0,
         Planted::Middle => len / 2,
-        Planted::Nowhere => return hay,
+        Planted::Nowhere => return haystack,
     };
     if offset < len {
-        hay[offset] = needles[0];
+        haystack[offset] = needles[0];
     }
-    hay
+    haystack
 }
 
 fn main() {
@@ -85,19 +90,19 @@ fn main() {
 
         for planted in [Planted::Front, Planted::Middle, Planted::Nowhere] {
             for len in LENS {
-                let hay = haystack(len, needles, planted);
-                let hay = hay.as_slice();
+                let haystack = haystack(len, needles, planted);
+                let haystack = haystack.as_slice();
 
                 let prebuilt = best(ROUNDS, ITERS, || {
-                    black_box(&prebuilt_finder).iter(black_box(hay)).next()
+                    black_box(&prebuilt_finder).iter(black_box(haystack)).next()
                 });
                 let direct = best(ROUNDS, ITERS, || {
-                    black_box(&prebuilt_finder).find(black_box(hay))
+                    black_box(&prebuilt_finder).find(black_box(haystack))
                 });
                 let oneshot = best(ROUNDS, ITERS, || {
-                    MemchrN::new(black_box(needles)).find(black_box(hay))
+                    MemchrN::new(black_box(needles)).find(black_box(haystack))
                 });
-                let theirs = theirs(needles, hay);
+                let theirs = theirs(needles, haystack);
 
                 let label = planted.label();
                 println!(

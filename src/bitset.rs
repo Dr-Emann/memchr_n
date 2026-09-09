@@ -4,9 +4,9 @@ const TABLE_BITS: usize = 256;
 const TABLE_BYTES: usize = TABLE_BITS / u8::BITS as usize;
 
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
-pub(crate) struct Bitset([u8; TABLE_BYTES]);
+pub(crate) struct ByteSet([u8; TABLE_BYTES]);
 
-impl Bitset {
+impl ByteSet {
     pub(crate) const fn new() -> Self {
         Self([0; TABLE_BYTES])
     }
@@ -26,10 +26,10 @@ impl Bitset {
     }
 
     pub(crate) const fn add(&mut self, byte: u8) {
-        let word_idx = (byte / 8) as usize;
-        let bit_idx = byte % 8;
-        let mask = 1 << bit_idx;
-        self.0[word_idx] |= mask;
+        let table_index = (byte / 8) as usize;
+        let bit_index = byte % 8;
+        let mask = 1 << bit_index;
+        self.0[table_index] |= mask;
     }
 
     pub(crate) const fn add_range(&mut self, range: RangeInclusive<u8>) {
@@ -37,32 +37,32 @@ impl Bitset {
         if start > last {
             return;
         }
-        let first_word = (start / 8) as usize;
-        let last_word = (last / 8) as usize;
+        let first_table_byte = (start / 8) as usize;
+        let last_table_byte = (last / 8) as usize;
         let from_start = u8::MAX << (start % 8);
         let through_last = u8::MAX >> (7 - last % 8);
 
-        if first_word == last_word {
-            self.0[first_word] |= from_start & through_last;
+        if first_table_byte == last_table_byte {
+            self.0[first_table_byte] |= from_start & through_last;
             return;
         }
 
-        self.0[first_word] |= from_start;
-        let mut i = first_word + 1;
-        while i < last_word {
+        self.0[first_table_byte] |= from_start;
+        let mut i = first_table_byte + 1;
+        while i < last_table_byte {
             self.0[i] = u8::MAX;
             i += 1;
         }
-        self.0[last_word] |= through_last;
+        self.0[last_table_byte] |= through_last;
     }
 
     pub(crate) const fn contains(&self, byte: u8) -> bool {
-        let word_idx = (byte / 8) as usize;
-        let bit_idx = byte % 8;
-        self.0[word_idx] & (1 << bit_idx) != 0
+        let table_index = (byte / 8) as usize;
+        let bit_index = byte % 8;
+        self.0[table_index] & (1 << bit_index) != 0
     }
 
-    pub(crate) const fn extract_range(&self) -> Option<RangeInclusive<u8>> {
+    pub(crate) const fn as_contiguous_range(&self) -> Option<RangeInclusive<u8>> {
         let mut first = None;
         let mut last = 0;
         let mut count = 0;
@@ -93,7 +93,7 @@ impl Bitset {
         })
     }
 
-    pub(crate) const fn members<const N: usize>(&self, out: &mut [u8; N]) -> Option<u8> {
+    pub(crate) const fn write_members<const N: usize>(&self, members: &mut [u8; N]) -> Option<u8> {
         let mut count = 0;
         let mut i = 0;
         while i < TABLE_BYTES / 8 {
@@ -102,7 +102,7 @@ impl Bitset {
                 if count == N {
                     return None;
                 }
-                out[count] = (i * 64) as u8 + word.trailing_zeros() as u8;
+                members[count] = (i * 64) as u8 + word.trailing_zeros() as u8;
                 word &= word - 1;
                 count += 1;
             }
@@ -126,7 +126,7 @@ impl Bitset {
     }
 }
 
-impl Extend<u8> for Bitset {
+impl Extend<u8> for ByteSet {
     fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
         for byte in iter {
             self.add(byte);
@@ -134,7 +134,7 @@ impl Extend<u8> for Bitset {
     }
 }
 
-impl FromIterator<u8> for Bitset {
+impl FromIterator<u8> for ByteSet {
     fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
         let mut set = Self::new();
         set.extend(iter);

@@ -15,9 +15,9 @@ const ROUNDS: u32 = 100;
 fn row(name: &str, mut f: impl FnMut(&[u8]) -> Option<usize>) {
     print!("{name:14}");
     for len in LENS {
-        let hay = &HAYSTACK[..len];
-        assert!(f(hay).is_none());
-        let t = best(ROUNDS, 5000, || f(black_box(hay)));
+        let haystack = &HAYSTACK[..len];
+        assert!(f(haystack).is_none());
+        let t = best(ROUNDS, 5000, || f(black_box(haystack)));
         print!(" {:6.2}", t * 1e9);
     }
     println!();
@@ -25,11 +25,11 @@ fn row(name: &str, mut f: impl FnMut(&[u8]) -> Option<usize>) {
 
 fn main() {
     let anybyte: MemchrN = (0x80u8..=0xFF).step_by(6).collect();
-    let onebyte = MemchrN::new_with(b"<", Backend::Auto);
+    let onebyte = MemchrN::new_with_backend(b"<", Backend::Auto);
 
-    row("anybyte", |hay| anybyte.iter(hay).next());
-    row("onebyte", |hay| onebyte.iter(hay).next());
-    row("onebyte memchr", |hay| memchr::memchr(b'<', hay));
+    row("anybyte", |haystack| anybyte.iter(haystack).next());
+    row("onebyte", |haystack| onebyte.iter(haystack).next());
+    row("onebyte memchr", |haystack| memchr::memchr(b'<', haystack));
 
     print!("{:14}", "len");
     for len in LENS {

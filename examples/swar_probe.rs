@@ -12,7 +12,7 @@ const HAYSTACK: &[u8] = include_bytes!("../benches/haystacks/sherlock/huge.txt")
 const ROUNDS: u32 = 100;
 
 fn finder(needles: &[u8]) -> MemchrN {
-    MemchrN::new_with(needles, Backend::Scalar)
+    MemchrN::new_with_backend(needles, Backend::Swar)
 }
 
 fn memchr_sum(needles: &[u8], iters: u32) -> Option<f64> {
@@ -159,36 +159,36 @@ fn main() {
     println!("== find first in a short prefix (latency, ns)");
     for len in [4usize, 8, 16, 32, 64, 128, 1024] {
         let f = finder(b"z");
-        let hay = &HAYSTACK[..len];
-        let ours = best(ROUNDS, 2000, || f.iter(black_box(hay)).next());
-        let theirs = best(ROUNDS, 2000, || theirs_z.find(black_box(hay)));
+        let haystack = &HAYSTACK[..len];
+        let ours = best(ROUNDS, 2000, || f.iter(black_box(haystack)).next());
+        let theirs = best(ROUNDS, 2000, || theirs_z.find(black_box(haystack)));
         ns_row(&format!("len {len}"), ours, theirs);
     }
 
     println!("== full scan of one chunk plus a tail, no match (ns)");
     for len in [64usize, 65, 72, 88, 96, 120, 127] {
-        let hay = vec![b'.'; len];
+        let haystack = vec![b'.'; len];
         let f = finder(b"z");
-        let ours = best(ROUNDS, 2000, || f.iter(black_box(&hay[..])).next());
-        let theirs = best(ROUNDS, 2000, || theirs_z.find(black_box(&hay[..])));
+        let ours = best(ROUNDS, 2000, || f.iter(black_box(&haystack[..])).next());
+        let theirs = best(ROUNDS, 2000, || theirs_z.find(black_box(&haystack[..])));
         ns_row(&format!("len {len}"), ours, theirs);
     }
 
     println!("== anybyte full scan, no match, by length (ns)");
     for len in [4usize, 8, 16, 32, 64, 65, 72, 88, 96, 127, 128, 1024] {
         let f = finder(b"<>{}");
-        let hay = &HAYSTACK[..len];
-        let ours = best(ROUNDS, 2000, || f.iter(black_box(hay)).next());
+        let haystack = &HAYSTACK[..len];
+        let ours = best(ROUNDS, 2000, || f.iter(black_box(haystack)).next());
         find_row(&format!("len {len}"), ours, None, len);
     }
 
     println!("== find first at a known early offset (ns)");
     for off in [0usize, 3, 7, 9, 40, 70, 200] {
-        let mut hay = vec![b'.'; 4096];
-        hay[off] = b'z';
+        let mut haystack = vec![b'.'; 4096];
+        haystack[off] = b'z';
         let f = finder(b"z");
-        let ours = best(ROUNDS, 2000, || f.iter(black_box(&hay[..])).next());
-        let theirs = best(ROUNDS, 2000, || theirs_z.find(black_box(&hay[..])));
+        let ours = best(ROUNDS, 2000, || f.iter(black_box(&haystack[..])).next());
+        let theirs = best(ROUNDS, 2000, || theirs_z.find(black_box(&haystack[..])));
         ns_row(&format!("match at {off}"), ours, theirs);
     }
 }
