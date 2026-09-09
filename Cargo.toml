@@ -2,7 +2,8 @@
 name = "memchr-n"
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+# Required for `core::range::RangeInclusive`.
+rust-version = "1.95"
 authors = ["Zachary Dremann <dremann@gmail.com>"]
 description = "Fast SIMD-accelerated search and iteration over the bytes belonging to an arbitrary set of byte values"
 repository = "https://github.com/Dr-Emann/memchr_n"
@@ -11,7 +12,6 @@ keywords = ["memchr", "simd", "search", "bytes", "scan"]
 categories = ["algorithms", "text-processing"]
 
 [features]
-# Enables the ability to create a Backend with an explicit fearless_simd::Level
 manual_level = []
 
 [dependencies]
@@ -24,4 +24,3 @@ memchr = "2.8"
 [[bench]]
 name = "memchr_n"
 harness = false
-

@@ -83,7 +83,7 @@ impl Bitset {
         let Some(first) = first else {
             return None;
         };
-        // The set is a range exactly when its members fill the whole span they cover.
+        // A set is contiguous when its members fill its span.
         if count != last - first + 1 {
             return None;
         }
@@ -93,8 +93,6 @@ impl Bitset {
         })
     }
 
-    // Writes this set's members, ascending, into the front of `out`, and returns how many
-    // there were. Nothing is written past `out`, and `None` says the set does not fit.
     pub(crate) const fn members<const N: usize>(&self, out: &mut [u8; N]) -> Option<u8> {
         let mut count = 0;
         let mut i = 0;
@@ -113,7 +111,6 @@ impl Bitset {
         Some(count as u8)
     }
 
-    // The `i`th 64-bit word
     const fn word(&self, i: usize) -> u64 {
         let b = i * 8;
         u64::from_le_bytes([

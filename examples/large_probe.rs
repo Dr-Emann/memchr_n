@@ -1,8 +1,4 @@
-//! Times the public API on haystacks far larger than last-level cache.
-//!
-//! The scanning loop is wide enough that its cost per byte changes with where the
-//! haystack lives; `bench_probe`'s haystack is cache-resident, so this covers the other
-//! end.
+//! Measures scans on haystacks larger than the last-level cache.
 
 mod timing;
 
@@ -12,7 +8,6 @@ use timing::best;
 
 const SEED: &[u8] = include_bytes!("../benches/haystacks/sherlock/huge.txt");
 
-/// Never occurs in the text, so the scan runs the whole way through.
 const NEVER: u8 = b'<';
 const RARE: u8 = b'z';
 
@@ -35,8 +30,7 @@ fn row(label: &str, len: usize, ours: f64, theirs: f64) {
 }
 
 fn timed<T>(rounds: u32, mut f: impl FnMut() -> T) -> f64 {
-    // The first pass over a fresh mapping pays for its page faults, and at these sizes
-    // that dwarfs the scan itself.
+    // Exclude the first pass, which includes page faults.
     black_box(f());
     best(rounds, 1, f)
 }
@@ -54,8 +48,6 @@ fn main() {
 
         let scan = timed(ROUNDS, || never.find(black_box(&haystack)));
         let scan_theirs = timed(ROUNDS, || memchr::memchr(NEVER, black_box(&haystack)));
-        // `count` does not go through the widened loop, so it holds still between builds
-        // and shows how much of any difference is the machine rather than the code.
         let count = timed(ROUNDS, || rare.iter(black_box(&haystack)).count());
         let count_theirs = timed(ROUNDS, || {
             memchr::memchr_iter(RARE, black_box(&haystack)).count()

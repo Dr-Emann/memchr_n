@@ -1,9 +1,4 @@
-//! Timing harness for the word-at-a-time backend: throughput per byte set, and the
-//! latency of short haystacks and early matches.
-//!
-//! The `memchr` columns come from that crate's own word-at-a-time searchers in
-//! `arch::all`, not its top-level functions, so both sides are treating a `usize` as a
-//! vector of lanes rather than one side using SIMD.
+//! Compares scalar-backend throughput and latency with `memchr`'s word-at-a-time searchers.
 
 mod timing;
 
@@ -20,10 +15,6 @@ fn finder(needles: &[u8]) -> MemchrN {
     MemchrN::new_with(needles, Backend::Scalar)
 }
 
-/// Times `memchr` over the whole haystack, summing the offsets it yields.
-///
-/// The searcher is built and the needle count matched outside the timed loop, so what
-/// is measured is the scan alone, as it is for our side.
 fn memchr_sum(needles: &[u8], iters: u32) -> Option<f64> {
     fn sum(it: impl Iterator<Item = usize>) -> usize {
         it.fold(0usize, |acc, offset| acc.wrapping_add(offset))
@@ -99,11 +90,6 @@ fn row(name: &str, ours: f64, theirs: Option<f64>, bytes: usize) {
     );
 }
 
-/// Reports a first-match search as latency rather than throughput.
-///
-/// Only the needles that never occur scan the whole haystack; the rest return within a
-/// few bytes, so a GB/s figure for them is just fixed overhead divided by a tiny
-/// length. `scanned` is how far the search had to look, which is what separates them.
 fn find_row(name: &str, ours: f64, theirs: Option<f64>, scanned: usize) {
     let cmp = match theirs {
         Some(t) => format!("memchr {:10.4} ns  {:5.2}x", t * 1e9, t / ours),

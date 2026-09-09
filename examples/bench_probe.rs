@@ -1,6 +1,4 @@
-//! Low-noise timing harness for the public API, used to compare against `memchr`
-//! without criterion's sampling in the way. Reports the best of several rounds, which
-//! is far more stable run-to-run than criterion's `--quick` estimates.
+//! Compares public API throughput and latency with `memchr` using the fastest timed round.
 
 mod timing;
 
@@ -25,7 +23,6 @@ fn row(name: &str, ours: f64, theirs: Option<f64>) {
     println!("{name:28} {:9.3} us {gbs:8.1} GB/s   {cmp}", ours * 1e6);
 }
 
-/// Column labels aligned to [`row`]'s field widths.
 fn header() {
     println!(
         "{:28} {:>9}    {:>8}        {:>9}   {:>8}",
@@ -33,11 +30,6 @@ fn header() {
     );
 }
 
-/// Reports a first-match search as latency rather than throughput.
-///
-/// Only `never1` scans the whole haystack; the rest return within a few bytes, so a
-/// GB/s figure for them is just fixed overhead divided by a tiny length. `scanned` is
-/// how far the search had to look, which is what separates the two.
 fn find_row(name: &str, ours: f64, theirs: Option<f64>, scanned: usize) {
     let cmp = match theirs {
         Some(t) => format!("{:10.1} ns   {:5.2}x", t * 1e9, t / ours),

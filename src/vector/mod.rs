@@ -10,29 +10,9 @@ const _: () = assert!(MatchedBitset::BITS as usize >= CHUNK_BYTES * 2);
 
 const BLOCK_BYTES: usize = 16;
 
-/// How many leading bytes [`find_first_short`] asks about one at a time before it stages a
-/// haystack too short to fill a vector.
+/// Leading bytes probed before staging a sub-vector haystack.
 ///
-/// Staging costs the same whether the answer is the first byte or the last: the two ends go
-/// through general-purpose registers into a vector, the vector produces a bitmask, and only
-/// then is there an answer. A probe with [`Kernel::matches_byte`] is a compare and a branch,
-/// so it answers its own byte in about a cycle — which is what `memchr` does below its own
-/// vector width, and the whole of what it was beating us by there.
-///
-/// # Why one
-///
-/// Every byte probed is a byte the staging behind it pays for anyway, so a probe that does not
-/// answer is wasted work. Swept over 0, 1, 2, 4, 8 and 16 on an AVX2 host, at 1, 4, 8 and 12
-/// bytes, against a match at the front, a match halfway, and no match at all:
-///
-/// - the first byte carries the whole win. A match at the front went from 3.3-4.8ns to
-///   2.7-3.3, and no longer probe beat that by more than a timer tick.
-/// - the bytes after it only cost. A miss at twelve bytes ran 4.2ns at one probe, 4.5 at two,
-///   5.0 at four, 5.9 at eight and 6.2 at sixteen — the last of which is `memchr`'s own walk,
-///   against 3.6 for staging alone.
-///
-/// A one-byte haystack is the one length where probing the lot wins outright, and one probe
-/// already covers it: it answers and returns without staging anything.
+/// One probe improves front-match latency; additional probes slow misses and later matches.
 pub(crate) const PROBE_BYTES: usize = 1;
 
 /// Tests a chunk of [`CHUNK_BYTES`] bytes against a byte set.
@@ -41,8 +21,7 @@ pub(crate) trait Kernel<S: Simd>: Copy {
     ///
     /// # Safety
     ///
-    /// `data`'s live field must be the one this kernel reads, as [`KernelData::new`] and
-    /// the per-level `build` that `level_scans!` writes agree on for a [`Kind`].
+    /// `data` must have the field this kernel reads as its live field.
     unsafe fn from_data(simd: S, data: &KernelData) -> Self;
 
     fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
@@ -52,27 +31,17 @@ pub(crate) trait Kernel<S: Simd>: Copy {
 
     /// Whether the byte set holds `byte`.
     ///
-    /// The scalar counterpart of [`matches`](Self::matches), and not a fallback for a target
-    /// that cannot run it: every kernel here is cheaper per byte in a vector, and this exists
-    /// for the haystack that cannot fill one. Below a vector's width the lanes have to be
-    /// staged before they can be tested, and staging costs the same whether the answer is the
-    /// first byte or the last, where a compare per byte answers the first byte in a compare.
-    ///
-    /// Each of these reads the same data the vector kernel does, so the two agree by
-    /// construction rather than by keeping two descriptions of one set in step.
+    /// This scalar path avoids staging for the leading bytes of short haystacks.
     fn matches_byte(&self, byte: u8) -> bool;
 }
 
 /// Whether the target has a single-instruction dynamic byte shuffle.
 ///
-/// [`kernels::SmallSet`], [`kernels::SingleNibble`] and [`kernels::AnyByte`] are built on
-/// one. Where it is missing, `swizzle_dyn` degrades into a per-lane gather through memory,
-/// which loses to probing the byte set directly with [`crate::bytewise`].
+/// Shuffle-based kernels fall back to [`crate::swar::kernels::AnyByte`] without one.
 pub(crate) fn has_byte_shuffle(level: Level) -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        // `pshufb` arrived with SSSE3, so plain SSE2 has nothing equivalent. `as_sse4_2`
-        // also answers yes for AVX2 and AVX-512.
+        // SSE2 lacks `pshufb`; later levels accepted by `as_sse4_2` provide it.
         level.as_sse4_2().is_some()
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -81,17 +50,10 @@ pub(crate) fn has_byte_shuffle(level: Level) -> bool {
     }
 }
 
-/// Scans from `from` for the first pair of [`CHUNK_BYTES`]s that contains a match.
+/// Scans from the current position until it finds matches or reaches the end.
 ///
-/// Extracting the bitmask is the expensive half of a scan, so [`any_true`](fearless_simd::SimdMask::any_true) skips it
-/// for the chunks that did not match at all. The check reduces to a general-purpose
-/// register and feeds a branch, which is the loop's longest serial dependency, so two
-/// chunks share one.
-///
-/// Both chunks of a matching pair are reported together. Reporting only the first and
-/// resuming at the second would leave the work already done on the second to be redone
-/// on the next call, which costs more than the shared check saves as soon as matches are
-/// dense enough to land in most pairs.
+/// Chunk pairs share an [`any_true`](fearless_simd::SimdMask::any_true) check and are returned
+/// together so the second chunk is not rescanned.
 #[inline(always)]
 pub(crate) fn find_next<S: Simd, K: Kernel<S>>(
     simd: S,
@@ -99,8 +61,7 @@ pub(crate) fn find_next<S: Simd, K: Kernel<S>>(
     kernel: K,
 ) -> MatchedBitset {
     let (haystack, mut from) = (state.haystack, state.pos);
-    // SAFETY: `pos` only ever moves to an offset this function already scanned to, so it
-    // never passes the end.
+    // SAFETY: `state.pos` never exceeds the haystack length.
     let unscanned = unsafe { haystack.get_unchecked(from..) };
     let (chunks, tail) = unscanned.as_chunks::<CHUNK_BYTES>();
     let (pairs, rest) = chunks.as_chunks::<2>();
@@ -148,36 +109,20 @@ pub(crate) fn find_next<S: Simd, K: Kernel<S>>(
 
 /// Returns the offset of the first matching byte of `haystack`.
 ///
-/// Broadly [`find_next`]'s walk, with everything an iterator would need afterwards left out:
-/// no [`IterState`] to write back, and a bitmask extracted only for the one unit that
-/// matched, whose lowest set bit is the answer.
-///
-/// Where it parts company is in what it is willing to spend to reach the end of a haystack it
-/// will not reach. A refill is entered with whatever is left of one, so it is short only on
-/// its last call and long on every other; a search is entered with the whole thing, and stops
-/// at the first match. So this one leads with the cases that end early — a haystack below one
-/// chunk, and a match in the first chunk — and only then falls into the paired loop that
-/// carries a long scan.
+/// Handles short haystacks and the first chunk before entering the paired scan loop.
 #[inline(always)]
 pub(crate) fn find_first<S: Simd, K: Kernel<S>>(
     simd: S,
     haystack: &[u8],
     kernel: K,
 ) -> Option<usize> {
-    // A haystack shorter than one chunk reaches none of the chunk walk below, and taking its
-    // length past three chunk sizes to discover that is most of what such a call costs.
-    // `find_next` has no equivalent because an iterator arrives here with the length it has
-    // left, which is short only on its last refill.
     if haystack.len() < CHUNK_BYTES {
         return find_first_short(simd, haystack, kernel);
     }
 
     let (chunks, _) = haystack.as_chunks::<CHUNK_BYTES>();
 
-    // The first chunk on its own, ahead of the pairing below. Pairing buys one `any_true`
-    // per two chunks, which is what carries a long scan, but it also loads a second chunk
-    // before it will look at the first one's answer. A search that returns early almost
-    // always returns in the first chunk, and should not pay for a second to find that out.
+    // Avoid loading the second chunk before checking the common first-chunk case.
     let mut from = 0;
     let chunks = if let [first, rest @ ..] = chunks {
         let matched = kernel.matches(u8x64::load_array_ref(simd, first));
@@ -213,9 +158,7 @@ pub(crate) fn find_first<S: Simd, K: Kernel<S>>(
         from += CHUNK_BYTES;
     }
 
-    // Whatever is left is shorter than a chunk, and the haystack is not, so one read of its
-    // last chunk covers it. That read reaches back over bytes already scanned, which costs
-    // nothing and cannot mislead: this only runs because none of them matched.
+    // Re-read the last chunk; the overlapping prefix is known not to match.
     if from == haystack.len() {
         return None;
     }
@@ -230,14 +173,8 @@ pub(crate) fn find_first<S: Simd, K: Kernel<S>>(
 
 /// [`find_first`] for a haystack shorter than one [`CHUNK_BYTES`].
 ///
-/// Two reads that overlap in the middle cover any length between one vector and two, so this
-/// is a ladder of widths rather than a walk: at most two vector operations and no loop,
-/// where blocks and a tail would take up to four for the same bytes and branch between them.
-/// The reads may see a byte twice, which costs nothing, because the front is tested first and
-/// a match there is at the offset it reports.
-///
-/// Below the narrowest vector the ladder runs out, and the bottom rung is [`PROBE_BYTES`]
-/// scalar probes ahead of the staged pair.
+/// Overlapping front and back vectors avoid a loop. Sub-vector haystacks use a scalar probe
+/// followed by staged ends.
 #[inline(always)]
 fn find_first_short<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) -> Option<usize> {
     debug_assert!(haystack.len() < CHUNK_BYTES);
@@ -271,8 +208,6 @@ fn find_first_short<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) 
             .then(|| len - BLOCK_BYTES + matched.to_bitmask().trailing_zeros() as usize);
     }
 
-    // Below one vector there is nothing to overlap with, so the ladder runs out and the
-    // leading bytes are asked for one at a time instead. See [`PROBE_BYTES`].
     for (offset, &byte) in haystack.iter().take(PROBE_BYTES).enumerate() {
         if kernel.matches_byte(byte) {
             return Some(offset);
@@ -282,9 +217,7 @@ fn find_first_short<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) 
         return None;
     }
 
-    // What the probe did not reach is staged into one vector as two ends — and read back as
-    // two halves rather than slid into place, since the front half answers whenever it can
-    // and the back half is only reached when it cannot.
+    // Keep staged ends separate so each half retains its original offset.
     let rest = &haystack[PROBE_BYTES..];
     let (bits, staged) = staged_ends_bits(simd, &kernel, rest);
     let kept = !(u64::MAX << staged);
@@ -292,8 +225,6 @@ fn find_first_short<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) 
     if front != 0 {
         return Some(PROBE_BYTES + front.trailing_zeros() as usize);
     }
-    // The back end was read from the end of the haystack either way, so its offsets are the
-    // ones it would have had without the probe.
     let back = (bits >> staged) & kept;
     (back != 0).then(|| len - staged + back.trailing_zeros() as usize)
 }
@@ -301,8 +232,7 @@ fn find_first_short<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) 
 /// Counts every matching byte of `haystack`.
 #[inline(always)]
 pub(crate) fn count<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) -> usize {
-    // Each lane of the accumulator starts at zero and gains at most one per chunk, so this
-    // many chunks can be counted in the vector before a lane could wrap.
+    // Drain after 255 chunks to prevent byte-lane overflow.
     const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
 
     let (chunks, tail) = haystack.as_chunks::<CHUNK_BYTES>();
@@ -314,7 +244,7 @@ pub(crate) fn count<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) 
         for chunk in batch {
             let matches = kernel.matches(u8x64::from_slice(simd, chunk));
             let matches: u8x64<_> = i8x64::load_array(simd, matches.into()).bitcast();
-            // A matching lane is all ones (-1), so subtracting it adds one.
+            // Subtracting an all-ones match mask adds one per lane.
             counts -= matches;
         }
         total += sum_lanes_64(simd, counts);
@@ -336,12 +266,9 @@ pub(crate) fn count<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) 
     total
 }
 
-/// Matches `tail`, the final bytes of `haystack`, returning their bits at positions
-/// `0..tail.len()`.
+/// Returns match bits for the final partial block in `haystack`.
 ///
-/// A haystack of at least one full block is handled by re-reading the last block and
-/// shifting the already-scanned bits off the bottom, which avoids staging the tail in
-/// a padded buffer.
+/// Re-reads the last full block when possible; shorter haystacks are staged.
 #[inline(always)]
 fn tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, haystack: &[u8], tail: &[u8]) -> u64 {
     debug_assert!(!tail.is_empty() && tail.len() < BLOCK_BYTES);
@@ -353,32 +280,17 @@ fn tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, haystack: &[u8], tail: 
     }
 }
 
-/// Matches a haystack shorter than one [`BLOCK_BYTES`], returning the bits of its two staged
-/// ends and how many bytes each end covers.
+/// Returns match bits for both ends of a haystack shorter than [`BLOCK_BYTES`].
 ///
-/// The ends are staged through general-purpose registers rather than a `[u8; 16]` buffer. A
-/// buffer written as two narrow stores and then read back as one 16-byte vector load is the
-/// shape store forwarding cannot satisfy, so the load waits for both stores to reach the cache
-/// — tens of cycles, on a path whose whole job is to be short. Assembling the same bytes in
-/// two `u64`s and handing the pair over as a value keeps it off the stack entirely, and each
-/// load is still of a constant width, which is what kept `copy_from_slice` from lowering to a
-/// `memcpy` call.
-///
-/// Bit `i` below `staged` is byte `i`; bit `staged + i` is byte `len - staged + i`. The two
-/// overlap in the middle, where they agree. Neither half means anything above its own
-/// `staged` bits: past the front's sit the back's, and past the back's sit the lanes it was
-/// duplicated into and the zero padding, which matches whenever the byte set holds zero.
+/// General-purpose registers avoid store-forwarding stalls from a partially initialized vector
+/// buffer. The returned halves may overlap and only their lowest `staged` bits are valid.
 #[inline(always)]
 fn staged_ends_bits<S: Simd, K: Kernel<S>>(
     simd: S,
     kernel: &K,
     short_haystack: &[u8],
 ) -> (u64, usize) {
-    /// The first and last `N` bytes of `haystack`, as two little-endian integers of `N` bytes
-    /// each, packed into the bottom of a word.
-    ///
-    /// `N` is at most four, so both fit; the eight-byte case is the one below that needs a
-    /// word each.
+    /// Packs the first and last `N` bytes into one word.
     #[inline]
     fn ends<const N: usize>(haystack: &[u8]) -> u64 {
         const { assert!(N <= 4) }
@@ -399,8 +311,6 @@ fn staged_ends_bits<S: Simd, K: Kernel<S>>(
     debug_assert!(!short_haystack.is_empty() && len < BLOCK_BYTES);
 
     let (words, staged) = match len {
-        // Eight bytes from each end fill both words, so this is the one case that reads them
-        // separately rather than packing a pair into one.
         8.. => {
             let first = u64::from_le_bytes(*short_haystack.first_chunk::<8>().unwrap());
             let last = u64::from_le_bytes(*short_haystack.last_chunk::<8>().unwrap());
@@ -427,8 +337,7 @@ fn short_tail_bits<S: Simd, K: Kernel<S>>(simd: S, kernel: &K, short_haystack: &
 /// Sums every lane of a vector.
 #[inline(always)]
 fn sum_lanes_64<S: Simd>(simd: S, counts: u8x64<S>) -> usize {
-    // For some reason, llvm does a good job with x86 with a simple loop, but neon really benefits
-    // from a custom kernel.
+    // NEON benefits from explicit pairwise widening; x86 optimizes the scalar loop well.
     #[cfg(target_arch = "aarch64")]
     if let Some(neon) = simd.level().as_neon() {
         use fearless_simd::u16x8;
@@ -485,10 +394,11 @@ pub(crate) fn scan<S: Simd, K: Kernel<S>>(simd: S) -> &'static Scan {
             assert!(size_of::<S>() == 0);
             assert!(align_of::<S>() == 1);
         };
-        // SAFETY: the assertion above makes this a zero-byte copy, and a zero-sized type has
-        // exactly one value; the caller guarantees the support that value stands for.
+        // SAFETY: `S` is zero-sized, and the caller guarantees target support.
         unsafe { transmute_copy(&()) }
     }
+    /// Scans for the next matching chunk.
+    ///
     /// # Safety
     ///
     /// The running target must support this module's level, and `data`'s live field
@@ -497,49 +407,53 @@ pub(crate) fn scan<S: Simd, K: Kernel<S>>(simd: S) -> &'static Scan {
         data: &KernelData,
         state: &mut IterState<'_>,
     ) -> MatchedBitset {
-        // SAFETY: the caller's obligations, both of which `build` below discharges:
-        // it is reached only through a `Level` that proves the support, and each arm
-        // pairs a kernel with the kind whose `KernelData` field that kernel reads.
+        // SAFETY: guaranteed by the caller.
         let simd = unsafe { token::<S>() };
         simd.vectorize(
             #[inline(always)]
             move || {
-                // SAFETY: as above.
+                // SAFETY: `data` has `K`'s live field.
                 let kernel = unsafe { K::from_data(simd, data) };
                 find_next(simd, state, kernel)
             },
         )
     }
 
+    /// Counts all matching bytes.
+    ///
     /// # Safety
     ///
-    /// As in [`find_next`].
+    /// The running target must support `S`, and `data` must have the field `K` reads as its
+    /// live field.
     unsafe fn count_all_impl<S: Simd, K: Kernel<S>>(data: &KernelData, haystack: &[u8]) -> usize {
-        // SAFETY: as in `find_next`.
+        // SAFETY: guaranteed by the caller.
         let simd = unsafe { token::<S>() };
         simd.vectorize(
             #[inline(always)]
             move || {
-                // SAFETY: as above.
+                // SAFETY: `data` has `K`'s live field.
                 let kernel = unsafe { K::from_data(simd, data) };
                 count(simd, haystack, kernel)
             },
         )
     }
 
+    /// Finds the first matching byte.
+    ///
     /// # Safety
     ///
-    /// As in [`find_next`].
+    /// The running target must support `S`, and `data` must have the field `K` reads as its
+    /// live field.
     unsafe fn find_first_impl<S: Simd, K: Kernel<S>>(
         data: &KernelData,
         haystack: &[u8],
     ) -> Option<usize> {
-        // SAFETY: as in `find_next`.
+        // SAFETY: guaranteed by the caller.
         let simd = unsafe { token::<S>() };
         simd.vectorize(
             #[inline(always)]
             move || {
-                // SAFETY: as above.
+                // SAFETY: `data` has `K`'s live field.
                 let kernel = unsafe { K::from_data(simd, data) };
                 find_first(simd, haystack, kernel)
             },

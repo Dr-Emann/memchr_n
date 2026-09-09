@@ -1,10 +1,6 @@
-//! Times the sub-word tail path of the word-at-a-time family in isolation.
+//! Measures [`memchr_n::Backend::Scalar`] tail latency around the eight-byte word width.
 //!
-//! The counterpart of `vtail_probe` for [`memchr_n::Backend::Scalar`]. Lengths below eight
-//! take the staged path, and eight and above re-read the last whole word.
-//!
-//! The `memchr` rows are a reference point only: that crate always uses the widest
-//! backend the CPU has, so it is not scanning these tails the same way.
+//! `memchr` uses its widest available backend, so its rows are reference values only.
 
 mod timing;
 

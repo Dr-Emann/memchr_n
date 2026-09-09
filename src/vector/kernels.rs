@@ -4,20 +4,17 @@ use crate::{ConstantNibble, KernelData, NibbleLookup};
 use fearless_simd::prelude::*;
 use fearless_simd::{u8x16, u8x32, u8x64};
 
-/// Compares against each needle in turn, which beats a table lookup while the set is
-/// small enough that the comparisons stay cheaper than the lookup they replace.
+/// Compares each byte with up to three needles.
 #[derive(Copy, Clone)]
 pub(crate) struct AnyOf<S: Simd, const N: usize> {
     needles: [u8x16<S>; N],
-    /// The same needles, unsplatted, for [`Kernel::matches_byte`]. See [`plain`].
     bytes: [u8; N],
 }
 
 impl<S: Simd, const N: usize> Kernel<S> for AnyOf<S, N> {
     unsafe fn from_data(simd: S, data: &KernelData) -> Self {
         const { assert!(N <= 3, "`splatted_needles` holds three") }
-        // SAFETY: the caller guarantees `splatted_needles` is live, and the assertion above
-        // keeps the reads below inside it.
+        // SAFETY: the caller guarantees `splatted_needles` is live; `N <= 3` bounds the reads.
         let splatted = unsafe { &data.splatted_needles };
         Self {
             needles: core::array::from_fn(|i| u8x16::load_array_ref(simd, &splatted[i])),
@@ -44,7 +41,6 @@ impl<S: Simd, const N: usize> Kernel<S> for AnyOf<S, N> {
 pub(crate) struct OneRange<S: Simd> {
     start: u8x16<S>,
     last: u8x16<S>,
-    /// The same endpoints, unsplatted, for [`Kernel::matches_byte`]. See [`plain`].
     bounds: (u8, u8),
 }
 
@@ -65,9 +61,6 @@ impl<S: Simd> Kernel<S> for OneRange<S> {
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        // One subtraction would do instead of two compares, but the data here is a pair of
-        // bounds and not a start and a span, so spelling it as the pair keeps this reading
-        // like the vector kernel above.
         let (start, last) = self.bounds;
         start <= byte && byte <= last
     }
@@ -106,9 +99,7 @@ impl<S: Simd> Kernel<S> for SmallSet {
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        // The shuffle above is a table index, so a scalar one is the same index spelled with
-        // brackets. A member sets the same bit in both tables, so a shared bit means the two
-        // nibbles came from one member rather than from two different ones.
+        // A shared bit means both nibbles came from the same set member.
         let lo = self.lo_lookup.0[usize::from(byte & 0x0F)];
         let hi = self.hi_lookup.0[usize::from(byte >> 4)];
         lo & hi != 0
@@ -147,9 +138,7 @@ impl<S: Simd> Kernel<S> for SingleNibble {
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        // As in the vector kernel: the variable nibble picks the one member it could be, and
-        // the byte matches only by being that member. An unfilled slot holds a sentinel whose
-        // own variable nibble is not its index, so it cannot be picked by the byte it holds.
+        // Empty slots contain a sentinel whose variable nibble differs from its index.
         let variable_nibble = match self.which {
             ConstantNibble::Lo => byte >> 4,
             ConstantNibble::Hi => byte & 0x0F,
@@ -183,23 +172,13 @@ impl<S: Simd> Kernel<S> for AnyByte {
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        // The gather above is a bit test through two shuffles because a vector has no
-        // addressable table. One byte can just index the table it is a bit of.
         self.bitset.contains(byte)
     }
 }
 
 /// The byte a block of [`KernelData`] holds splatted, for [`Kernel::matches_byte`].
 ///
-/// # Why this borrows
-///
-/// The block has to stay in memory, which is why every caller reaches it through
-/// `&data.<field>` and loads its vector with `load_array_ref`. Copy the block out of the union
-/// first and it becomes a value LLVM owns, and one scalar read of it is then enough for LLVM
-/// to split the whole thing into sixteen: the single aligned load that fed the broadcast turns
-/// into a byte load and fifteen `vpinsrb`s to put the vector back together, on every call at
-/// every haystack length. That is worth 3.3ns against 8.2 on a 32-byte `OneRange` search — far
-/// more than the short-haystack probe this exists for can win back.
+/// Borrowing preserves an aligned vector load; copying generates scalar inserts.
 #[inline(always)]
 fn plain(splatted: &[u8; 16]) -> u8 {
     splatted[0]
@@ -219,7 +198,6 @@ fn membership_bits<S: Simd, V: SimdInt<S, Element = u8, ByteVector = V>>(
     match V::LEN {
         16 => {
             let indices = u8x16::from_slice(simd, indices.as_slice());
-            // TODO: When concat_swizzle_dyn is available, use it
             #[cfg(target_arch = "aarch64")]
             if let Some(neon) = simd.level().as_neon() {
                 let res = super::aarch64_swizzle_32_to_16(neon, table.into(), indices.into());

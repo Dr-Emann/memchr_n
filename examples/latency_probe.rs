@@ -1,9 +1,4 @@
-//! First-match latency, split into the two things that make it up.
-//!
-//! The offset sweep varies how far the scan has to look; the length sweep pins the match at
-//! offset 0 and varies the haystack length, so each row is the shortest path through
-//! `find_next` that a haystack of that length can take. Together they separate the fixed
-//! per-call cost from the work the scan does before it can answer.
+//! Measures first-match latency across match offsets and haystack lengths.
 
 mod timing;
 

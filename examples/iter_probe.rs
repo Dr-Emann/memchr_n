@@ -1,7 +1,4 @@
-//! Iteration throughput, as the minimum of many rounds rather than a mean.
-//!
-//! `iterate` in the benchmark suite measures the same thing, but a mean over a noisy host
-//! moves further between runs of one binary than the changes worth seeing move it.
+//! Measures iteration throughput using the fastest timed round.
 
 mod timing;
 
@@ -13,8 +10,6 @@ const SHERLOCK: &[u8] = include_bytes!("../benches/haystacks/sherlock/huge.txt")
 
 const ROUNDS: u32 = 60;
 
-/// By match density, sparse first. All are one to three needles, so `memchr` can spell every
-/// one of them.
 const SETS: [(&str, &[u8]); 6] = [
     ("never1", b"<"),
     ("rare1", b"z"),
@@ -24,8 +19,6 @@ const SETS: [(&str, &[u8]); 6] = [
     ("verycommon1", b" "),
 ];
 
-/// `memchr`'s own search for the same set, which is a whole call — that crate has no
-/// prebuilt form in its portable API.
 fn their_find(needles: &[u8], hay: &[u8]) -> Option<usize> {
     match *needles {
         [a] => memchr::memchr(a, hay),
@@ -35,11 +28,7 @@ fn their_find(needles: &[u8], hay: &[u8]) -> Option<usize> {
     }
 }
 
-/// `memchr`'s iterator over the same set.
-///
-/// Boxed, which costs an allocation per call — negligible against the microseconds a whole
-/// pass over the corpus takes, but not against a single `find`, which is why that one goes
-/// through [`their_find`] instead.
+// Boxing is negligible over a full corpus pass.
 fn their_iter<'h>(needles: &[u8], hay: &'h [u8]) -> Box<dyn Iterator<Item = usize> + 'h> {
     match *needles {
         [a] => Box::new(memchr::memchr_iter(a, hay)),
@@ -49,8 +38,6 @@ fn their_iter<'h>(needles: &[u8], hay: &'h [u8]) -> Box<dyn Iterator<Item = usiz
     }
 }
 
-/// Microseconds for one pass over the corpus, which is long enough that a round needs only
-/// the one.
 fn micros(f: impl FnMut() -> usize) -> f64 {
     best(ROUNDS, 1, f) * 1e6
 }

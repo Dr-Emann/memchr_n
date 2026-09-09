@@ -1,6 +1,4 @@
-//! Times the sub-chunk tail path of the vector family in isolation.
-//!
-//! `anybyte` has no `memchr` counterpart: that crate tops out at three needles.
+//! Measures vector-backend tail latency below the 64-byte chunk width.
 
 mod timing;
 

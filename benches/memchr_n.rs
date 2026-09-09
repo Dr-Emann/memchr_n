@@ -18,21 +18,13 @@ const HEX_LOWER: &[u8] = b"0123456789abcdef";
 const OURS: &str = "memchr_n";
 const THEIRS: &str = "memchr";
 
-/// The families a [`MemchrN`] can be built from. `memchr` has no counterpart to this axis, so
-/// its entries are emitted once per set rather than once per family.
 const BACKENDS: &[(&str, Backend)] = &[("auto", Backend::Auto), ("scalar", Backend::Scalar)];
 
 #[derive(Copy, Clone)]
 enum ByteSet {
     List(&'static [u8]),
     Range(u8, u8),
-    /// Every `step`th byte from `start` through `last`. Spelling a scattered set this way
-    /// keeps [`contains`](ByteSet::contains) obviously right where a long literal would not.
-    Stride {
-        start: u8,
-        last: u8,
-        step: u8,
-    },
+    Stride { start: u8, last: u8, step: u8 },
 }
 
 impl ByteSet {
@@ -66,7 +58,6 @@ impl ByteSet {
     }
 }
 
-/// The subset of byte sets the `memchr` crate can also express, via `memchr`/`memchr2`/`memchr3`.
 #[derive(Copy, Clone)]
 enum Needles {
     One(u8),
@@ -126,8 +117,6 @@ impl Needles {
     }
 }
 
-/// Byte sets ordered by match density, mirroring the `memchr` crate's sherlock benchmarks.
-/// All of them are 1-3 bytes so that every entry has a `memchr` counterpart.
 const DENSITY_SETS: &[(&str, ByteSet)] = &[
     ("never1", ByteSet::List(b"<")),
     ("rare1", ByteSet::List(b"z")),
@@ -140,11 +129,6 @@ const DENSITY_SETS: &[(&str, ByteSet)] = &[
     ("verycommon1", ByteSet::List(b" ")),
 ];
 
-/// One byte set per vector [`MemchrN`] specialization, so each SIMD kernel is measured directly.
-///
-/// Under [`Backend::Scalar`] the shuffle-based kinds are unreachable, so `small-set`,
-/// `single-nibble` and both `any-byte` entries all resolve to the byte-at-a-time kernel. They
-/// stay worth running there as a match-density sweep across that one kernel.
 const KIND_SETS: &[(&str, ByteSet)] = &[
     ("never", ByteSet::List(b"")),
     ("one-byte", ByteSet::List(b"z")),
@@ -177,11 +161,7 @@ const SIZE_SETS: &[(&str, ByteSet)] = &[
     ("any-byte-16", ByteSet::List(HEX_LOWER)),
 ];
 
-/// Byte sets for [`bench_find_first_sizes`], neither of which occurs in the corpus.
-///
-/// A set that matches would short-circuit somewhere in the first few bytes and measure nothing
-/// but call overhead. These force the scan to run to the end of the haystack, which is what
-/// puts a family's tail handling on the critical path.
+// Absent sets force tail handling onto the critical path.
 const FIRST_SETS: &[(&str, ByteSet)] = &[
     ("never1", ByteSet::List(b"<")),
     (
@@ -194,13 +174,7 @@ const FIRST_SETS: &[(&str, ByteSet)] = &[
     ),
 ];
 
-/// Haystack lengths for the two latency groups, shortest first.
-///
-/// The `len*` entries bracket the chunk boundaries the families actually use: 64 for the vector
-/// kernels, 32 for the byte-at-a-time ones. A family that handles the bytes past its last whole
-/// chunk differently from the chunks themselves shows up as a discontinuity there — 63 bytes
-/// costing more than 64, say — which the file-backed sizes alone would miss, since none of them
-/// land near a boundary.
+// Brackets 32- and 64-byte scan boundaries absent from the file-backed sizes.
 fn latency_haystacks() -> Vec<(String, &'static [u8])> {
     let mut haystacks = vec![("empty".to_owned(), &SHERLOCK_HUGE[..0])];
     for len in [31usize, 32, 33, 63, 64, 65, 127, 128] {
@@ -249,8 +223,6 @@ fn offset_sum(finder: &MemchrN, haystack: &[u8]) -> usize {
     sum
 }
 
-/// Guards against benchmarking a broken implementation, which would otherwise show up
-/// as a suspiciously fast result rather than a failure.
 fn verified_finder(set: ByteSet, backend: Backend, haystack: &[u8], label: &str) -> MemchrN {
     let finder = set.finder(backend);
     assert_eq!(
@@ -271,8 +243,6 @@ fn verified_finder(set: ByteSet, backend: Backend, haystack: &[u8], label: &str)
     finder
 }
 
-/// Returns [`None`] for sets `memchr` cannot express, so those benchmarks run
-/// unpaired rather than being dropped.
 fn verified_needles(set: ByteSet, haystack: &[u8], label: &str) -> Option<Needles> {
     let needles = Needles::from_set(set)?;
     assert_eq!(
@@ -293,10 +263,7 @@ fn verified_needles(set: ByteSet, haystack: &[u8], label: &str) -> Option<Needle
     Some(needles)
 }
 
-/// Both crates get their fastest public counting path here, which is not the same
-/// algorithm on each side: `memchr_iter().count()` is specialized, but
-/// `memchr2_iter`/`memchr3_iter` fall back to walking match by match, so their numbers
-/// degrade with match density. The `iterate` group compares the per-match paths.
+// `memchr_iter().count()` is specialized; its multi-needle iterators count match by match.
 fn bench_count(c: &mut Criterion) {
     let mut group = c.benchmark_group("count/sherlock");
     group.throughput(Throughput::Bytes(SHERLOCK_HUGE.len() as u64));
@@ -333,12 +300,6 @@ fn bench_find_first(c: &mut Criterion) {
     group.finish();
 }
 
-/// `find` against the iterator it used to be, on haystacks short enough that the per-call
-/// cost is the whole measurement.
-///
-/// This is where the two differ: `Iter::next` hands its state to the scan by pointer and
-/// takes back a bitmask to unpack, both of which a search that stops at the first match
-/// pays for and does not use.
 fn bench_first_call(c: &mut Criterion) {
     let mut group = c.benchmark_group("first-call");
     for &(name, set) in KIND_SETS {
@@ -385,8 +346,6 @@ fn bench_iterate(c: &mut Criterion) {
     group.finish();
 }
 
-/// Byte sets with no `memchr` counterpart, so this group measures each [`MemchrN`]
-/// specialization on its own.
 fn bench_kinds(c: &mut Criterion) {
     let mut group = c.benchmark_group("kind/sherlock");
     group.throughput(Throughput::Bytes(SHERLOCK_HUGE.len() as u64));
@@ -423,8 +382,6 @@ fn bench_corpora(c: &mut Criterion) {
     group.finish();
 }
 
-/// Per-call overhead as the haystack shrinks; deliberately reports latency rather than
-/// throughput, since that is what dominates for short inputs.
 fn bench_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("count/sizes");
     for &(name, set) in SIZE_SETS {
@@ -448,9 +405,6 @@ fn bench_sizes(c: &mut Criterion) {
     group.finish();
 }
 
-/// The find-first counterpart of [`bench_sizes`], and the only group that measures the
-/// scan-and-refill path rather than the counting one: `count` has its own loop that never
-/// touches how a family reports match positions or handles its tail.
 fn bench_find_first_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("find-first/sizes");
     for &(name, set) in FIRST_SETS {
@@ -474,8 +428,6 @@ fn bench_find_first_sizes(c: &mut Criterion) {
     group.finish();
 }
 
-/// `memchr` has no counterpart here: its equivalent prebuilt finders live behind
-/// arch-gated modules rather than the portable public API.
 fn bench_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("build");
     for &(name, set) in KIND_SETS {

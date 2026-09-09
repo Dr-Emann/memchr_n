@@ -1,4 +1,5 @@
 use crate::KernelData;
+use crate::bitset::Bitset;
 use crate::swar::{HIGH, Kernel, nonzero_bytes, splat};
 use core::range::RangeInclusive;
 
@@ -19,8 +20,7 @@ fn any_of_matches<const N: usize>(word: u64, splatted_needles: [u64; N]) -> u64 
 impl<const N: usize> Kernel for AnyOf<N> {
     unsafe fn from_data(data: &KernelData) -> Self {
         const { assert!(N <= 3, "`splatted_needles` holds three") }
-        // SAFETY: the caller guarantees `splatted_needles` is live, and the assertion above
-        // keeps the reads below inside it.
+        // SAFETY: the caller guarantees `splatted_needles` is live; `N <= 3` bounds the reads.
         let splatted = unsafe { data.splatted_needles };
         Self {
             splatted_needles: core::array::from_fn(|i| {
@@ -36,14 +36,13 @@ impl<const N: usize> Kernel for AnyOf<N> {
 
     #[inline]
     fn matches_byte(&self, byte: u8) -> bool {
-        // Every lane of a splatted needle holds it, so the lowest byte is the needle.
         self.splatted_needles
             .iter()
             .any(|&needle| needle as u8 == byte)
     }
 }
 
-/// Everything is precomputed so that `matches` stays branchless.
+/// Stores precomputed masks for branchless range matching.
 #[derive(Copy, Clone)]
 pub(crate) struct OneRange {
     /// Splatted range start, ready to subtract from a `HIGH`-saturated word.
@@ -78,28 +77,51 @@ impl Kernel for OneRange {
 
     #[inline]
     fn matches(&self, word: u64) -> u64 {
-        // A byte is in range exactly when `byte - start` wraps into `0..=span`.
+        // A byte is in range when `byte - start` wraps into `0..=span`.
         let shifted = ((word | HIGH) - self.start) ^ ((word ^ self.not_start) & HIGH);
 
         // `128 + span_low - shifted_low` stays inside the byte, so bit 7 answers
         // `span_low >= shifted_low` without borrowing into the next lane.
         let low_ge = (self.span_low - (shifted & !HIGH)) & HIGH;
         let clear_high = !shifted & HIGH;
-        // A byte past the halfway point is in range only when the span reaches that far:
-        // with the span's high bit set every shifted byte below 128 fits outright, and
-        // the ones above it fit when their low seven bits do; without it none of them do.
+        // The span's high bit selects which half of the wrapping byte domain is valid.
         (clear_high & low_ge) | (self.span_high & (clear_high | (shifted & low_ge)))
     }
 
     #[inline]
     fn matches_byte(&self, byte: u8) -> bool {
-        // The fields are the bounds pre-arranged for a word, so the bounds come back out of
-        // them: `start` has lost bit 7 to the saturation the subtraction above needs, but
-        // `not_start` is the whole splatted start complemented, and the span is its two
-        // halves in the two fields that carry them.
         let start = !self.not_start as u8;
         let span = (self.span_low as u8 & !0x80) | (self.span_high as u8 & 0x80);
         byte.wrapping_sub(start) <= span
+    }
+}
+
+/// Probes a 256-bit membership table one byte at a time.
+#[derive(Copy, Clone)]
+pub(crate) struct AnyByte {
+    bitset: Bitset,
+}
+
+impl Kernel for AnyByte {
+    unsafe fn from_data(data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `bitset` is live.
+        Self {
+            bitset: unsafe { data.bitset },
+        }
+    }
+
+    #[inline]
+    fn matches(&self, word: u64) -> u64 {
+        let mut marks = 0;
+        for (i, &byte) in word.to_ne_bytes().iter().enumerate() {
+            marks |= u64::from(self.matches_byte(byte)) << (i * 8 + 7);
+        }
+        marks
+    }
+
+    #[inline]
+    fn matches_byte(&self, byte: u8) -> bool {
+        self.bitset.contains(byte)
     }
 }
 
@@ -117,8 +139,7 @@ mod tests {
         }
     }
 
-    /// Zero and one neighbours are what catch a borrow leaking between lanes, which is
-    /// how the shorter `(w - LOW) & !w & HIGH` formulation goes wrong.
+    // Adjacent zeros and ones expose cross-lane borrows.
     fn hazardous_words(byte: u8) -> [[u8; WORD_BYTES]; 3] {
         [
             [byte; WORD_BYTES],
@@ -175,8 +196,7 @@ mod tests {
 
     #[test]
     fn range_marks_every_byte_of_awkward_ranges() {
-        // Spans either side of 128 are where the high-bit split in `matches` changes
-        // which branch of the selection applies.
+        // Covers both sides of the high-bit split.
         let ranges = [(0, 9), (0x80, 0xFF), (0, 0xFF), (0x7F, 0x81), (0x41, 0x41)];
         for (start, last) in ranges {
             let kernel = OneRange::new(RangeInclusive { start, last });
@@ -184,6 +204,27 @@ mod tests {
                 for bytes in hazardous_words(byte) {
                     assert_marks(&kernel, bytes, |b| start <= b && b <= last);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn any_byte_accepts_exactly_the_set() {
+        let sets: [Vec<u8>; 4] = [
+            Vec::new(),
+            vec![0x41],
+            (0..=u8::MAX).step_by(3).collect(),
+            (0x80..=u8::MAX).collect(),
+        ];
+        for set in sets {
+            let bitset = Bitset::from_bytes(&set);
+            let kernel = AnyByte { bitset };
+            for byte in 0..=u8::MAX {
+                assert_eq!(
+                    kernel.matches_byte(byte),
+                    set.contains(&byte),
+                    "{byte} in {set:?}"
+                );
             }
         }
     }

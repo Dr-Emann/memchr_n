@@ -1,23 +1,13 @@
 #![deny(clippy::inline_always)]
 
-//! Searching eight bytes at a time in a general-purpose register.
-//!
-//! This is what runs where there are no vectors to reach for: a target `fearless_simd`
-//! reports as its fallback level, where every lane operation is emulated one lane at a
-//! time, and an explicitly requested [`crate::Backend::Scalar`].
-//!
-//! The win over a plain byte loop comes from the kernels an arithmetic trick can express:
-//! one to three needles, or a range. A set that needs a table lookup has no such trick, because
-//! SWAR has no gather, so it goes to [`crate::bytewise`] instead.
+//! Searches eight bytes at a time for [`crate::Backend::Scalar`] and SIMD fallback levels.
 
 pub(crate) mod kernels;
 
 use crate::{IterState, KernelData, MatchedBitset, Scan};
 
-/// Bytes tested per general-purpose register.
 pub(crate) const WORD_BYTES: usize = 8;
 
-/// Bit 7 of every byte.
 const HIGH: u64 = splat(1 << 7);
 
 #[inline]
@@ -25,7 +15,7 @@ pub(crate) const fn splat(byte: u8) -> u64 {
     u64::from_ne_bytes([byte; WORD_BYTES])
 }
 
-/// Sets bit 7 of every non-zero byte. The bits below it are left as scratch.
+/// Sets bit 7 of every nonzero byte.
 ///
 /// `(b & 0x7f) + 0x7f` carries into bit 7 exactly when the low seven bits are non-zero
 /// and cannot carry out of the byte, so OR-ing `b` back in covers `0x80` as well.
@@ -34,45 +24,33 @@ const fn nonzero_bytes(word: u64) -> u64 {
     ((word & !HIGH) + !HIGH) | word
 }
 
-/// Gathers bit 7 of each byte into the low eight bits.
+/// Gathers bit 7 of each byte into the low byte.
 ///
-/// Bit `8i + 7` times the multiplier's bit at `49 - 7i` lands on bit `56 + i`. No two of
-/// the sixty-four partial products share a position, so nothing carries into the result,
-/// and every off-diagonal one lands either below bit 56 or past bit 63.
+/// The multiplier maps bit `8i + 7` to bit `56 + i`; other products fall outside the result.
 #[inline]
 pub(crate) const fn movemask(marks: u64) -> u64 {
     marks.wrapping_mul(0x0002_0408_1020_4081) >> 56
 }
 
-/// Tests [`WORD_BYTES`] bytes at a time, the word-at-a-time counterpart of [`crate::vector::Kernel`].
-///
-/// The result has bit 7 set in every matching byte and every other bit clear, which is
-/// the form both [`movemask`] and [`u64::count_ones`] consume.
+/// Tests [`WORD_BYTES`] bytes at a time and marks matches in each byte's high bit.
 pub(crate) trait Kernel: Copy {
     /// Reads this kernel out of the field of `data` that holds it.
     ///
     /// # Safety
     ///
-    /// As in [`crate::vector::Kernel::from_data`].
+    /// `data` must have the field this kernel reads as its live field.
     unsafe fn from_data(data: &KernelData) -> Self;
 
+    /// Marks each matching byte of `word` with `0x80` and each nonmatching byte with zero.
     fn matches(&self, word: u64) -> u64;
 
     /// Whether the byte set holds `byte`.
-    ///
-    /// As in [`crate::vector::Kernel::matches_byte`], and for the same haystack: one too
-    /// short to fill the unit the kernel works in. Here that is [`short_tail_bits`]'s two
-    /// staged ends and [`movemask`]'s multiply, against a compare per byte.
     fn matches_byte(&self, byte: u8) -> bool;
 }
 
-/// Matches `tail`, the final bytes of `haystack`, returning their bits at positions
-/// `0..tail.len()`.
+/// Returns match bits for the final partial word in `haystack`.
 ///
-/// Whole words are marked from the start of the tail, and whatever is left over is picked up
-/// by re-reading the last whole word of the haystack, so a tail costs one word per eight bytes
-/// rather than a whole chunk however short it is. Only a haystack too short to hold a whole
-/// word has to be staged, which [`short_tail_bits`] does.
+/// Re-reads the last full word when possible; shorter haystacks are staged.
 #[inline]
 fn tail_bits<K: Kernel>(kernel: &K, haystack: &[u8], tail: &[u8]) -> u64 {
     debug_assert!(!tail.is_empty() && tail.len() < WORD_BYTES);
@@ -84,17 +62,12 @@ fn tail_bits<K: Kernel>(kernel: &K, haystack: &[u8], tail: &[u8]) -> u64 {
     }
 }
 
-/// Matches a haystack shorter than one [`WORD_BYTES`], returning its bits at positions
-/// `0..haystack.len()`.
+/// Returns match bits for a haystack shorter than [`WORD_BYTES`].
 ///
-/// Staged the way [`crate::vector`]'s short tail is, for the same reason. Write `n` for the
-/// largest power of two that is at most the length: 4, 2 or 1. Copying the first and last `n`
-/// bytes covers the whole of it, because the two ends overlap in the middle, and both copies
-/// have a constant length and a constant destination. Sizing one copy to the length instead
-/// lowers to a `memcpy` call that costs more than the scan it feeds.
+/// Fixed-size copies of both ends avoid a `memcpy` call; overlapping bytes produce identical
+/// bits and are merged.
 #[inline]
 fn short_tail_bits<K: Kernel>(kernel: &K, haystack: &[u8]) -> u64 {
-    /// Copies the first and last `N` bytes of `haystack` into the front of a word.
     #[inline]
     fn stage<const N: usize>(haystack: &[u8]) -> [u8; WORD_BYTES] {
         const { assert!(N <= 8 / 2) }
@@ -124,12 +97,24 @@ fn short_tail_bits<K: Kernel>(kernel: &K, haystack: &[u8]) -> u64 {
 }
 
 #[inline]
-pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
+pub(crate) fn count_all<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
+    // Drain after 255 words to prevent byte-lane overflow.
+    const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
+
     let (words, tail) = haystack.as_chunks::<WORD_BYTES>();
 
     let mut total = 0;
-    for word in words {
-        total += kernel.matches(u64::from_le_bytes(*word)).count_ones() as usize;
+    for chunk in words.chunks(CHUNKS_PER_ACCUMULATOR) {
+        let mut counts = 0u64;
+
+        for word in chunk {
+            let matches = kernel.matches(u64::from_le_bytes(*word)) >> 7;
+            counts += matches;
+        }
+
+        for byte in counts.to_ne_bytes() {
+            total += usize::from(byte);
+        }
     }
     if !tail.is_empty() {
         total += short_tail_bits(&kernel, tail).count_ones() as usize;
@@ -139,26 +124,16 @@ pub(crate) fn count<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
 
 /// Returns the offset of the first matching byte of `haystack`.
 ///
-/// The counterpart of [`crate::vector::find_first`], and the same saving over
-/// [`find_next`]. A mark sits at bit 7 of its own byte, so the first matching lane is
-/// `trailing_zeros() / 8` — [`movemask`]'s multiply is only worth paying where every bit is
-/// wanted, and here only the lowest is.
+/// Uses the first marked byte directly instead of building a full [`movemask`].
 #[inline]
 pub(crate) fn find_first<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize> {
-    /// The offset within a word of its first marked byte.
     #[inline]
     fn first_lane(marks: u64) -> usize {
         debug_assert!(marks != 0);
         marks.trailing_zeros() as usize / 8
     }
 
-    // A haystack below one word is all of [`short_tail_bits`]: a staging buffer written as two
-    // narrow stores and read back as one word, [`movemask`]'s multiply, and the slide that
-    // puts the two ends back where they came from — to answer about at most seven bytes.
-    // Asking about them one at a time is shorter than that at every one of those lengths, and
-    // for a miss as much as for a match: 2.1ns to 4.2 against 4.5 to 5.0, measured through
-    // `Backend::Scalar` on an AVX2 host. So unlike the vector family's
-    // [`crate::vector::PROBE_BYTES`], this needs no cutoff.
+    // Byte-wise probing is faster than staging for fewer than eight bytes.
     if haystack.len() < WORD_BYTES {
         return haystack.iter().position(|&byte| kernel.matches_byte(byte));
     }
@@ -197,7 +172,7 @@ pub(crate) fn find_first<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize>
 #[inline]
 pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {
     let (haystack, mut from) = (state.haystack, state.pos);
-    // SAFETY: as in `crate::vector::find_next`.
+    // SAFETY: `state.pos` never exceeds the haystack length.
     let unscanned = unsafe { haystack.get_unchecked(from..) };
     let (words, tail) = unscanned.as_chunks::<WORD_BYTES>();
     let (pairs, words) = words.as_chunks::<2>();
@@ -236,30 +211,27 @@ pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> Matc
 /// The [`Scan`] whose entry points run `K`.
 pub(crate) fn scan<K: Kernel>() -> &'static Scan {
     unsafe fn find_next<K: Kernel>(data: &KernelData, state: &mut IterState<'_>) -> MatchedBitset {
-        // SAFETY: the `Scan` below stores this function only for the kind whose
-        // `KernelData` field `K` reads, which is what [`crate::word_build`] pairs them by.
+        // SAFETY: `MemchrN` pairs `K` with its live `KernelData` field.
         let kernel = unsafe { K::from_data(data) };
         self::find_next(state, kernel)
     }
 
     unsafe fn count_all<K: Kernel>(data: &KernelData, haystack: &[u8]) -> usize {
-        // SAFETY: as above.
+        // SAFETY: `MemchrN` pairs `K` with its live `KernelData` field.
         let kernel = unsafe { K::from_data(data) };
-        self::count(haystack, kernel)
+        self::count_all(haystack, kernel)
     }
 
     unsafe fn find_first<K: Kernel>(data: &KernelData, haystack: &[u8]) -> Option<usize> {
-        // SAFETY: as above.
+        // SAFETY: `MemchrN` pairs `K` with its live `KernelData` field.
         let kernel = unsafe { K::from_data(data) };
         self::find_first(haystack, kernel)
     }
 
-    &const {
-        Scan {
-            find_next: find_next::<K>,
-            count_all: count_all::<K>,
-            find_first: find_first::<K>,
-        }
+    &Scan {
+        find_next: find_next::<K>,
+        count_all: count_all::<K>,
+        find_first: find_first::<K>,
     }
 }
 

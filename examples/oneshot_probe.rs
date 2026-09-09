@@ -1,14 +1,6 @@
-//! Splits a one-shot search into the two things it pays for that a prebuilt one does not.
+//! Separates construction, prebuilt search, and combined one-shot search costs.
 //!
-//! `build` is a construction with nothing done to it. `prebuilt` is one search through a
-//! `MemchrN` that already exists, which is the floor. `oneshot` is construction and search
-//! together, so `oneshot - prebuilt - build` is what the two cost when neither can be
-//! optimised against the other — mostly the indirect call standing between them.
-//!
-//! Three haystacks per length. `hit` matches at offset 0, so the search returns as early as it
-//! can and the row is almost all fixed cost. `mid` matches halfway, which is what a scan that
-//! answers a byte at a time has to pay for the offsets it walks past. `miss` never matches, so
-//! the row is the whole scan.
+//! `overhead` is `oneshot - build - find`.
 
 mod timing;
 
@@ -21,7 +13,6 @@ const ITERS: u32 = 500;
 
 const LENS: [usize; 12] = [1, 4, 8, 12, 16, 32, 64, 128, 512, 4096, 65536, 1 << 20];
 
-/// The kinds a set can resolve to, one set each.
 const SETS: [(&str, &[u8]); 7] = [
     ("one-byte", b"z"),
     ("two-bytes", b"yz"),
@@ -32,10 +23,6 @@ const SETS: [(&str, &[u8]); 7] = [
     ("any-byte", b"0123456789abcdef"),
 ];
 
-/// The same search through `memchr`, for the sets it can spell.
-///
-/// It tops out at three needles and has no prebuilt form in its portable API, so this is
-/// their whole call against our prebuilt one — the comparison in their favour.
 fn theirs(needles: &[u8], hay: &[u8]) -> f64 {
     match *needles {
         [a] => best(ROUNDS, ITERS, || {
@@ -51,7 +38,6 @@ fn theirs(needles: &[u8], hay: &[u8]) -> f64 {
     }
 }
 
-/// Where the one match in a haystack sits, if there is one.
 #[derive(Copy, Clone)]
 enum Planted {
     Front,
@@ -69,8 +55,6 @@ impl Planted {
     }
 }
 
-/// A haystack of `len` bytes that no set above matches, with `needles[0]` planted where
-/// `planted` says.
 fn haystack(len: usize, needles: &[u8], planted: Planted) -> Vec<u8> {
     let mut hay = vec![b'.'; len];
     let offset = match planted {
