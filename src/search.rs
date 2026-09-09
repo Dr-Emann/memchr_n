@@ -10,6 +10,31 @@ pub(crate) struct SearchPlan {
     pub(crate) kernel_kind: KernelKind,
 }
 
+#[derive(Copy, Clone)]
+pub(crate) struct BitsetLookup {
+    byte_set: ByteSet,
+}
+
+impl BitsetLookup {
+    pub(crate) const fn new(byte_set: ByteSet) -> Self {
+        Self { byte_set }
+    }
+
+    pub(crate) unsafe fn from_data(kernel_data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `byte_set` is live.
+        Self::new(unsafe { kernel_data.byte_set })
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, byte: u8) -> bool {
+        self.byte_set.contains(byte)
+    }
+
+    pub(crate) fn byte_set(&self) -> &ByteSet {
+        &self.byte_set
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum KernelKind {
     BitsetLookup,
@@ -60,13 +85,13 @@ impl NibbleLookup {
 
 #[derive(Copy, Clone)]
 pub(crate) struct ScanOps {
-    pub(crate) find_next: unsafe fn(&KernelData, &mut IterState<'_>) -> MatchedBitset,
+    pub(crate) next_match_batch: unsafe fn(&KernelData, &mut IterState<'_>) -> MatchedBitset,
     pub(crate) count_all: unsafe fn(&KernelData, &[u8]) -> usize,
-    pub(crate) find_first: unsafe fn(&KernelData, &[u8]) -> Option<usize>,
+    pub(crate) first_match: unsafe fn(&KernelData, &[u8]) -> Option<usize>,
 }
 
 pub(crate) fn never_scan_ops() -> &'static ScanOps {
-    fn find_next(_data: &KernelData, state: &mut IterState<'_>) -> MatchedBitset {
+    fn next_match_batch(_data: &KernelData, state: &mut IterState<'_>) -> MatchedBitset {
         state.scan_offset = state.haystack.len();
         0
     }
@@ -75,13 +100,13 @@ pub(crate) fn never_scan_ops() -> &'static ScanOps {
         0
     }
 
-    fn find_first(_data: &KernelData, _haystack: &[u8]) -> Option<usize> {
+    fn first_match(_data: &KernelData, _haystack: &[u8]) -> Option<usize> {
         None
     }
 
     &ScanOps {
-        find_next,
+        next_match_batch,
         count_all,
-        find_first,
+        first_match,
     }
 }

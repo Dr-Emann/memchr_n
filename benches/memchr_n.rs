@@ -282,8 +282,8 @@ fn bench_count(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_find_first(c: &mut Criterion) {
-    let mut group = c.benchmark_group("find-first/sherlock");
+fn bench_first_match(c: &mut Criterion) {
+    let mut group = c.benchmark_group("first-match/sherlock");
     group.throughput(Throughput::Bytes(SHERLOCK_HUGE.len() as u64));
     for &(name, set) in DENSITY_SETS {
         let finder = verified_finder(set, Backend::Auto, SHERLOCK_HUGE, name);
@@ -405,8 +405,8 @@ fn bench_sizes(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_find_first_sizes(c: &mut Criterion) {
-    let mut group = c.benchmark_group("find-first/sizes");
+fn bench_first_match_sizes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("first-match/sizes");
     for &(name, set) in FIRST_SETS {
         for (size, haystack) in latency_haystacks() {
             for &(backend_name, backend) in BACKENDS {
@@ -441,12 +441,12 @@ fn bench_build(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_count,
-    bench_find_first,
+    bench_first_match,
     bench_iterate,
     bench_kinds,
     bench_corpora,
     bench_sizes,
-    bench_find_first_sizes,
+    bench_first_match_sizes,
     bench_build,
     bench_first_call,
 );

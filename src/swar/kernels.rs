@@ -1,5 +1,5 @@
+use crate::BitsetLookup;
 use crate::KernelData;
-use crate::bitset::ByteSet;
 use crate::swar::{HIGH, Kernel, nonzero_bytes, splat};
 use core::range::RangeInclusive;
 
@@ -96,18 +96,9 @@ impl Kernel for OneRange {
     }
 }
 
-/// Probes a 256-bit membership table one byte at a time.
-#[derive(Copy, Clone)]
-pub(crate) struct BitsetLookup {
-    byte_set: ByteSet,
-}
-
 impl Kernel for BitsetLookup {
     unsafe fn from_data(kernel_data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `byte_set` is live.
-        Self {
-            byte_set: unsafe { kernel_data.byte_set },
-        }
+        unsafe { BitsetLookup::from_data(kernel_data) }
     }
 
     #[inline]
@@ -121,13 +112,14 @@ impl Kernel for BitsetLookup {
 
     #[inline]
     fn matches_byte(&self, byte: u8) -> bool {
-        self.byte_set.contains(byte)
+        self.contains(byte)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitset::ByteSet;
     use crate::swar::WORD_BYTES;
 
     fn assert_marks<K: Kernel>(kernel: &K, bytes: [u8; WORD_BYTES], accepts: impl Fn(u8) -> bool) {
@@ -218,7 +210,7 @@ mod tests {
         ];
         for set in sets {
             let byte_set = ByteSet::from_bytes(&set);
-            let kernel = BitsetLookup { byte_set };
+            let kernel = BitsetLookup::new(byte_set);
             for byte in 0..=u8::MAX {
                 assert_eq!(
                     kernel.matches_byte(byte),

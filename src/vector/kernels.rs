@@ -1,6 +1,6 @@
 use super::Kernel;
 use crate::bitset::ByteSet;
-use crate::{FixedNibble, KernelData, NibbleLookup};
+use crate::{BitsetLookup, FixedNibble, KernelData, NibbleLookup};
 use fearless_simd::prelude::*;
 use fearless_simd::{u8x16, u8x32, u8x64};
 
@@ -148,17 +148,9 @@ impl<S: Simd> Kernel<S> for FixedNibbleSet {
     }
 }
 
-#[derive(Copy, Clone)]
-pub(crate) struct BitsetLookup {
-    byte_set: ByteSet,
-}
-
 impl<S: Simd> Kernel<S> for BitsetLookup {
     unsafe fn from_data(_simd: S, kernel_data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `byte_set` is live.
-        Self {
-            byte_set: unsafe { kernel_data.byte_set },
-        }
+        unsafe { BitsetLookup::from_data(kernel_data) }
     }
 
     #[inline(always)]
@@ -168,12 +160,12 @@ impl<S: Simd> Kernel<S> for BitsetLookup {
     ) -> V::Mask {
         let bits = V::block_splat(u8x16::from_fn(chunk.witness(), |i| 1 << (i % 8)));
         let bit = bits.swizzle_dyn_within_blocks(chunk & 0b0111);
-        !(bit & lookup_membership_bytes(&self.byte_set, chunk >> 3)).simd_eq(0)
+        !(bit & lookup_membership_bytes(self.byte_set(), chunk >> 3)).simd_eq(0)
     }
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        self.byte_set.contains(byte)
+        self.contains(byte)
     }
 }
 

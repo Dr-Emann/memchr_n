@@ -7,8 +7,8 @@ mod vector;
 
 use crate::bitset::ByteSet;
 use crate::search::{
-    FixedNibble, FixedNibbleTable, KernelData, KernelKind, NibbleLookup, ScanOps, SearchPlan,
-    never_scan_ops,
+    BitsetLookup, FixedNibble, FixedNibbleTable, KernelData, KernelKind, NibbleLookup, ScanOps,
+    SearchPlan, never_scan_ops,
 };
 use core::fmt;
 use core::ops::{Bound, RangeBounds};
@@ -19,9 +19,6 @@ use fearless_simd::dispatch;
 pub use fearless_simd::Level;
 #[cfg(not(feature = "manual_level"))]
 use fearless_simd::Level;
-
-// Bit `i` marks byte `i` of one scan.
-type MatchedBitset = u128;
 
 /// Selects the engine of kernels used to build a [`MemchrN`].
 ///
@@ -46,22 +43,6 @@ pub enum Backend {
     Level(Level),
 }
 
-impl Backend {
-    fn engine(self) -> Engine {
-        match self {
-            Backend::Auto => Engine::Vector(Level::new()),
-            Backend::Swar => Engine::Swar,
-            #[cfg(feature = "manual_level")]
-            Backend::Level(level) => Engine::Vector(level),
-        }
-    }
-}
-
-const _: () = {
-    const fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<MemchrN>();
-};
-
 /// Searches for bytes belonging to a fixed set.
 ///
 /// # Examples
@@ -84,28 +65,6 @@ impl fmt::Debug for MemchrN {
             .field("engine", &self.search.engine)
             .field("kernel_kind", &self.search.kernel_kind)
             .finish_non_exhaustive()
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-enum Engine {
-    Vector(Level),
-    Swar,
-}
-
-impl Engine {
-    #[must_use]
-    fn with_byte_shuffle(self) -> Self {
-        match self {
-            Engine::Vector(level) => {
-                if vector::has_byte_shuffle(level) {
-                    Engine::Vector(level)
-                } else {
-                    Engine::Swar
-                }
-            }
-            Engine::Swar => Engine::Swar,
-        }
     }
 }
 
@@ -176,6 +135,193 @@ impl MemchrN {
         Self::from_set(set, backend)
     }
 
+    /// Returns the offset of the first matching byte in `haystack`.
+    ///
+    /// Prefer [`iter`](Self::iter) rather than calling this function repeatedly
+    /// to iterate over the instances of matching bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memchr_n::MemchrN;
+    ///
+    /// let finder = MemchrN::new(b"aeiou");
+    /// assert_eq!(finder.find(b"rhythm and blues"), Some(7));
+    /// ```
+    #[inline]
+    pub fn find(&self, haystack: &[u8]) -> Option<usize> {
+        // SAFETY: `self.search` keeps the scan operations, kernel data, and supported SIMD level together.
+        unsafe { (self.search.scan_ops.first_match)(&self.search.kernel_data, haystack) }
+    }
+
+    /// Returns an [`Iter`] over the offsets of every matching byte in `haystack`.
+    ///
+    /// If only the first match is needed, prefer [`find`](Self::find).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memchr_n::MemchrN;
+    ///
+    /// let finder = MemchrN::new(b"aeiou");
+    /// assert_eq!(finder.iter(b"hello").collect::<Vec<_>>(), vec![1, 4]);
+    /// ```
+    #[inline]
+    pub fn iter<'a>(&'a self, haystack: &'a [u8]) -> Iter<'a> {
+        Iter {
+            finder: self,
+            state: IterState {
+                haystack,
+                scan_offset: 0,
+                match_base: 0,
+            },
+            match_bits: 0,
+        }
+    }
+}
+
+impl FromIterator<u8> for MemchrN {
+    fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
+        Self::from_set(ByteSet::from_iter(iter), Backend::Auto)
+    }
+}
+
+/// Iterates over the offsets of bytes matched by a [`MemchrN`].
+///
+/// Values of this type are created by [`MemchrN::iter`].
+///
+/// # Examples
+///
+/// ```
+/// use memchr_n::{Iter, MemchrN};
+///
+/// let finder = MemchrN::new(b"aeiou");
+/// let matches: Iter<'_> = finder.iter(b"hello");
+/// assert_eq!(matches.collect::<Vec<_>>(), vec![1, 4]);
+/// ```
+pub struct Iter<'a> {
+    finder: &'a MemchrN,
+    state: IterState<'a>,
+    match_bits: MatchedBitset,
+}
+
+type MatchedBitset = u128;
+
+struct IterState<'a> {
+    haystack: &'a [u8],
+    scan_offset: usize,
+    match_base: usize,
+}
+
+impl<'a> Iter<'a> {
+    #[inline]
+    fn refill(&mut self) -> Option<()> {
+        if self.state.scan_offset == self.state.haystack.len() {
+            return None;
+        }
+        // SAFETY: `SearchPlan` keeps the scan operations, kernel data, and supported SIMD level together.
+        self.match_bits = unsafe {
+            (self.finder.search.scan_ops.next_match_batch)(
+                &self.finder.search.kernel_data,
+                &mut self.state,
+            )
+        };
+        (self.match_bits != 0).then_some(())
+    }
+
+    #[inline]
+    fn take_lowest(&mut self) -> usize {
+        debug_assert!(self.match_bits != 0);
+
+        let bit = self.match_bits.trailing_zeros() as usize;
+        self.match_bits &= self.match_bits - 1;
+        self.state.match_base + bit
+    }
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.match_bits == 0 {
+            self.refill()?;
+        }
+        Some(self.take_lowest())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let min = self.match_bits.count_ones() as usize;
+        let max = min.checked_add(self.state.haystack.len() - self.state.scan_offset);
+        (min, max)
+    }
+
+    fn count(self) -> usize {
+        let mut total = self.match_bits.count_ones() as usize;
+        // SAFETY: `scan_offset` only ever moves to an offset a scan reached, so it is in bounds.
+        let unscanned = unsafe { self.state.haystack.get_unchecked(self.state.scan_offset..) };
+        if !unscanned.is_empty() {
+            // SAFETY: `SearchPlan` keeps the scan operations, kernel data, and supported SIMD level together.
+            total += unsafe {
+                (self.finder.search.scan_ops.count_all)(&self.finder.search.kernel_data, unscanned)
+            };
+        }
+        total
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let mut remaining = n;
+        loop {
+            let held = self.match_bits.count_ones() as usize;
+            if held > remaining {
+                break;
+            }
+            remaining -= held;
+            self.match_bits = 0;
+            self.refill()?;
+        }
+        for _ in 0..remaining {
+            self.match_bits &= self.match_bits - 1;
+        }
+        Some(self.take_lowest())
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum Engine {
+    Vector(Level),
+    Swar,
+}
+
+impl Backend {
+    fn engine(self) -> Engine {
+        match self {
+            Backend::Auto => Engine::Vector(Level::new()),
+            Backend::Swar => Engine::Swar,
+            #[cfg(feature = "manual_level")]
+            Backend::Level(level) => Engine::Vector(level),
+        }
+    }
+}
+
+impl Engine {
+    #[must_use]
+    fn with_byte_shuffle(self) -> Self {
+        match self {
+            Engine::Vector(level) => {
+                if vector::has_byte_shuffle(level) {
+                    Engine::Vector(level)
+                } else {
+                    Engine::Swar
+                }
+            }
+            Engine::Swar => Engine::Swar,
+        }
+    }
+}
+
+impl MemchrN {
     fn from_set(set: ByteSet, backend: Backend) -> Self {
         const MEMBERS_MAX: usize = 16;
 
@@ -316,7 +462,7 @@ impl MemchrN {
             Engine::Vector(level) => Self {
                 search: SearchPlan {
                     kernel_data,
-                    scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::BitsetLookup>(simd)),
+                    scan_ops: dispatch!(level, simd => vector::scan_ops::<_, BitsetLookup>(simd)),
                     engine,
                     kernel_kind,
                 },
@@ -324,7 +470,7 @@ impl MemchrN {
             Engine::Swar => Self {
                 search: SearchPlan {
                     kernel_data,
-                    scan_ops: swar::scan_ops::<swar::kernels::BitsetLookup>(),
+                    scan_ops: swar::scan_ops::<BitsetLookup>(),
                     engine,
                     kernel_kind,
                 },
@@ -340,50 +486,6 @@ impl MemchrN {
                 engine: Engine::Swar,
                 kernel_kind: KernelKind::Never,
             },
-        }
-    }
-
-    /// Returns the offset of the first matching byte in `haystack`.
-    ///
-    /// Prefer [`iter`](Self::iter) rather than calling this function repeatedly
-    /// to iterate over the instances of matching bytes.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use memchr_n::MemchrN;
-    ///
-    /// let finder = MemchrN::new(b"aeiou");
-    /// assert_eq!(finder.find(b"rhythm and blues"), Some(7));
-    /// ```
-    #[inline]
-    pub fn find(&self, haystack: &[u8]) -> Option<usize> {
-        // SAFETY: `self.search` keeps the scan operations, kernel data, and supported SIMD level together.
-        unsafe { (self.search.scan_ops.find_first)(&self.search.kernel_data, haystack) }
-    }
-
-    /// Returns an [`Iter`] over the offsets of every matching byte in `haystack`.
-    ///
-    /// If only the first match is needed, prefer [`find`](Self::find).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use memchr_n::MemchrN;
-    ///
-    /// let finder = MemchrN::new(b"aeiou");
-    /// assert_eq!(finder.iter(b"hello").collect::<Vec<_>>(), vec![1, 4]);
-    /// ```
-    #[inline]
-    pub fn iter<'a>(&'a self, haystack: &'a [u8]) -> Iter<'a> {
-        Iter {
-            finder: self,
-            state: IterState {
-                haystack,
-                scan_offset: 0,
-                match_base: 0,
-            },
-            match_bits: 0,
         }
     }
 }
@@ -411,12 +513,6 @@ fn inclusive_range(range: impl RangeBounds<u8>) -> Option<RangeInclusive<u8>> {
     Some(RangeInclusive { start, last })
 }
 
-impl FromIterator<u8> for MemchrN {
-    fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
-        Self::from_set(ByteSet::from_iter(iter), Backend::Auto)
-    }
-}
-
 fn extract_fixed_nibble_table(items: &[u8]) -> Option<FixedNibbleTable> {
     let first = *items.first()?;
     let (lo_nibble, hi_nibble) = (first & 0x0F, first >> 4);
@@ -428,7 +524,7 @@ fn extract_fixed_nibble_table(items: &[u8]) -> Option<FixedNibbleTable> {
     }
 
     // An empty slot must contain a byte whose variable nibble differs from its index.
-    // Zero works except at index zero, fixed_nibble uses the opposite one-bit nibble.
+    // Zero works except at index zero, which uses the opposite one-bit nibble.
     if lo_constant {
         let mut table = [0; 16];
         table[0] = 0x10;
@@ -454,105 +550,10 @@ fn extract_fixed_nibble_table(items: &[u8]) -> Option<FixedNibbleTable> {
     }
 }
 
-/// Iterates over the offsets of bytes matched by a [`MemchrN`].
-///
-/// Values of this type are created by [`MemchrN::iter`].
-///
-/// # Examples
-///
-/// ```
-/// use memchr_n::{Iter, MemchrN};
-///
-/// let finder = MemchrN::new(b"aeiou");
-/// let matches: Iter<'_> = finder.iter(b"hello");
-/// assert_eq!(matches.collect::<Vec<_>>(), vec![1, 4]);
-/// ```
-pub struct Iter<'a> {
-    finder: &'a MemchrN,
-    state: IterState<'a>,
-    match_bits: MatchedBitset,
-}
-
-struct IterState<'a> {
-    haystack: &'a [u8],
-    scan_offset: usize,
-    match_base: usize,
-}
-
-impl<'a> Iter<'a> {
-    #[inline]
-    fn refill(&mut self) -> Option<()> {
-        if self.state.scan_offset == self.state.haystack.len() {
-            return None;
-        }
-        // SAFETY: `SearchPlan` keeps the scan operations, kernel data, and supported SIMD level together.
-        self.match_bits = unsafe {
-            (self.finder.search.scan_ops.find_next)(
-                &self.finder.search.kernel_data,
-                &mut self.state,
-            )
-        };
-        (self.match_bits != 0).then_some(())
-    }
-
-    #[inline]
-    fn take_lowest(&mut self) -> usize {
-        debug_assert!(self.match_bits != 0);
-
-        let bit = self.match_bits.trailing_zeros() as usize;
-        self.match_bits &= self.match_bits - 1;
-        self.state.match_base + bit
-    }
-}
-
-impl<'a> Iterator for Iter<'a> {
-    type Item = usize;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.match_bits == 0 {
-            self.refill()?;
-        }
-        Some(self.take_lowest())
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let min = self.match_bits.count_ones() as usize;
-        let max = min.checked_add(self.state.haystack.len() - self.state.scan_offset);
-        (min, max)
-    }
-
-    fn count(self) -> usize {
-        let mut total = self.match_bits.count_ones() as usize;
-        // SAFETY: `scan_offset` only ever moves to an offset a scan reached, so it is in bounds.
-        let unscanned = unsafe { self.state.haystack.get_unchecked(self.state.scan_offset..) };
-        if !unscanned.is_empty() {
-            // SAFETY: `SearchPlan` keeps the scan operations, kernel data, and supported SIMD level together.
-            total += unsafe {
-                (self.finder.search.scan_ops.count_all)(&self.finder.search.kernel_data, unscanned)
-            };
-        }
-        total
-    }
-
-    #[inline]
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        let mut remaining = n;
-        loop {
-            let held = self.match_bits.count_ones() as usize;
-            if held > remaining {
-                break;
-            }
-            remaining -= held;
-            self.match_bits = 0;
-            self.refill()?;
-        }
-        for _ in 0..remaining {
-            self.match_bits &= self.match_bits - 1;
-        }
-        Some(self.take_lowest())
-    }
-}
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<MemchrN>();
+};
 
 #[cfg(test)]
 mod tests {

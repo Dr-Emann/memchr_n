@@ -37,7 +37,7 @@ pub(crate) trait Kernel<S: Simd>: Copy {
 
 /// Whether the target has a single-instruction dynamic byte shuffle.
 ///
-/// Shuffle-based kernels fall back to [`crate::swar::kernels::BitsetLookup`] without one.
+/// Shuffle-based kernels fall back to [`crate::BitsetLookup`] without one.
 pub(crate) fn has_byte_shuffle(level: Level) -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -50,12 +50,12 @@ pub(crate) fn has_byte_shuffle(level: Level) -> bool {
     }
 }
 
-/// Scans offset the current position until it finds matches or reaches the end.
+/// Scans from the current position until it finds matches or reaches the end.
 ///
 /// Chunk pairs share an [`any_true`](fearless_simd::SimdMask::any_true) check and are returned
 /// together so the second chunk is not rescanned.
 #[inline(always)]
-pub(crate) fn find_next<S: Simd, K: Kernel<S>>(
+pub(crate) fn next_match_batch<S: Simd, K: Kernel<S>>(
     simd: S,
     state: &mut IterState<'_>,
     kernel: K,
@@ -111,13 +111,13 @@ pub(crate) fn find_next<S: Simd, K: Kernel<S>>(
 ///
 /// Handles short haystacks and the first chunk before entering the paired scan loop.
 #[inline(always)]
-pub(crate) fn find_first<S: Simd, K: Kernel<S>>(
+pub(crate) fn first_match<S: Simd, K: Kernel<S>>(
     simd: S,
     haystack: &[u8],
     kernel: K,
 ) -> Option<usize> {
     if haystack.len() < CHUNK_BYTES {
-        return find_first_short(simd, haystack, kernel);
+        return first_match_short(simd, haystack, kernel);
     }
 
     let (chunks, _) = haystack.as_chunks::<CHUNK_BYTES>();
@@ -171,12 +171,12 @@ pub(crate) fn find_first<S: Simd, K: Kernel<S>>(
         .then(|| haystack.len() - CHUNK_BYTES + matched.to_bitmask().trailing_zeros() as usize)
 }
 
-/// [`find_first`] for a haystack shorter than one [`CHUNK_BYTES`].
+/// [`first_match`] for a haystack shorter than one [`CHUNK_BYTES`].
 ///
 /// Overlapping front and back vectors avoid a loop. Sub-vector haystacks use a scalar probe
 /// followed by staged ends.
 #[inline(always)]
-fn find_first_short<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) -> Option<usize> {
+fn first_match_short<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) -> Option<usize> {
     debug_assert!(haystack.len() < CHUNK_BYTES);
     let len = haystack.len();
 
@@ -403,7 +403,7 @@ pub(crate) fn scan_ops<S: Simd, K: Kernel<S>>(simd: S) -> &'static ScanOps {
     ///
     /// The running target must support this module's level, and `kernel_data`'s live field
     /// must be the one `K` reads.
-    unsafe fn find_next_impl<S: Simd, K: Kernel<S>>(
+    unsafe fn next_match_batch_impl<S: Simd, K: Kernel<S>>(
         kernel_data: &KernelData,
         state: &mut IterState<'_>,
     ) -> MatchedBitset {
@@ -414,7 +414,7 @@ pub(crate) fn scan_ops<S: Simd, K: Kernel<S>>(simd: S) -> &'static ScanOps {
             move || {
                 // SAFETY: `kernel_data` has `K`'s live field.
                 let kernel = unsafe { K::from_data(simd, kernel_data) };
-                find_next(simd, state, kernel)
+                next_match_batch(simd, state, kernel)
             },
         )
     }
@@ -447,7 +447,7 @@ pub(crate) fn scan_ops<S: Simd, K: Kernel<S>>(simd: S) -> &'static ScanOps {
     ///
     /// The running target must support `S`, and `kernel_data` must have the field `K` reads as its
     /// live field.
-    unsafe fn find_first_impl<S: Simd, K: Kernel<S>>(
+    unsafe fn first_match_impl<S: Simd, K: Kernel<S>>(
         kernel_data: &KernelData,
         haystack: &[u8],
     ) -> Option<usize> {
@@ -458,15 +458,15 @@ pub(crate) fn scan_ops<S: Simd, K: Kernel<S>>(simd: S) -> &'static ScanOps {
             move || {
                 // SAFETY: `kernel_data` has `K`'s live field.
                 let kernel = unsafe { K::from_data(simd, kernel_data) };
-                find_first(simd, haystack, kernel)
+                first_match(simd, haystack, kernel)
             },
         )
     }
     _ = simd;
 
     &ScanOps {
-        find_next: find_next_impl::<S, K>,
+        next_match_batch: next_match_batch_impl::<S, K>,
         count_all: count_all_impl::<S, K>,
-        find_first: find_first_impl::<S, K>,
+        first_match: first_match_impl::<S, K>,
     }
 }

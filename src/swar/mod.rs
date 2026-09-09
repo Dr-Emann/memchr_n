@@ -48,6 +48,118 @@ pub(crate) trait Kernel: Copy {
     fn matches_byte(&self, byte: u8) -> bool;
 }
 
+#[inline]
+pub(crate) fn next_match_batch<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {
+    let (haystack, mut offset) = (state.haystack, state.scan_offset);
+    // SAFETY: `state.scan_offset` never exceeds the haystack length.
+    let unscanned = unsafe { haystack.get_unchecked(offset..) };
+    let (words, tail) = unscanned.as_chunks::<WORD_BYTES>();
+    let (pairs, words) = words.as_chunks::<2>();
+
+    for [first_word, second_word] in pairs {
+        let first_match = kernel.matches(u64::from_le_bytes(*first_word));
+        let second_match = kernel.matches(u64::from_le_bytes(*second_word));
+        if (first_match | second_match) != 0 {
+            state.match_base = offset;
+            state.scan_offset = offset + 2 * WORD_BYTES;
+            return MatchedBitset::from(
+                movemask(first_match) | movemask(second_match) << WORD_BYTES,
+            );
+        }
+        offset += 2 * WORD_BYTES;
+    }
+    for word in words {
+        let marks = kernel.matches(u64::from_le_bytes(*word));
+        if marks != 0 {
+            state.match_base = offset;
+            state.scan_offset = offset + WORD_BYTES;
+            return MatchedBitset::from(movemask(marks));
+        }
+        offset += WORD_BYTES;
+    }
+
+    state.match_base = haystack.len() - tail.len();
+    state.scan_offset = haystack.len();
+    if tail.is_empty() {
+        0
+    } else {
+        tail_bits(&kernel, haystack, tail).into()
+    }
+}
+
+/// Returns the offset of the first matching byte of `haystack`.
+///
+/// Uses the first marked byte directly instead of building a full [`movemask`].
+#[inline]
+pub(crate) fn first_match<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize> {
+    #[inline]
+    fn first_lane(marks: u64) -> usize {
+        debug_assert!(marks != 0);
+        marks.trailing_zeros() as usize / 8
+    }
+
+    // Byte-wise probing is faster than staging for fewer than eight bytes.
+    if haystack.len() < WORD_BYTES {
+        return haystack.iter().position(|&byte| kernel.matches_byte(byte));
+    }
+
+    let (words, tail) = haystack.as_chunks::<WORD_BYTES>();
+    let (pairs, words) = words.as_chunks::<2>();
+
+    let mut offset = 0;
+    for [first_word, second_word] in pairs {
+        let first_match = kernel.matches(u64::from_le_bytes(*first_word));
+        let second_match = kernel.matches(u64::from_le_bytes(*second_word));
+        if (first_match | second_match) != 0 {
+            return Some(if first_match != 0 {
+                offset + first_lane(first_match)
+            } else {
+                offset + WORD_BYTES + first_lane(second_match)
+            });
+        }
+        offset += 2 * WORD_BYTES;
+    }
+    for word in words {
+        let marks = kernel.matches(u64::from_le_bytes(*word));
+        if marks != 0 {
+            return Some(offset + first_lane(marks));
+        }
+        offset += WORD_BYTES;
+    }
+
+    if tail.is_empty() {
+        return None;
+    }
+    let bits = tail_bits(&kernel, haystack, tail);
+    (bits != 0).then(|| haystack.len() - tail.len() + bits.trailing_zeros() as usize)
+}
+
+#[inline]
+pub(crate) fn count_all<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
+    // Drain after 255 words to prevent byte-lane overflow.
+    const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
+
+    let (words, tail) = haystack.as_chunks::<WORD_BYTES>();
+
+    let mut total = 0;
+    for batch in words.chunks(CHUNKS_PER_ACCUMULATOR) {
+        let mut counts = 0u64;
+
+        for word in batch {
+            let marks = kernel.matches(u64::from_le_bytes(*word)) >> 7;
+            counts += marks;
+        }
+
+        for byte in counts.to_ne_bytes() {
+            total += usize::from(byte);
+        }
+    }
+    if !tail.is_empty() {
+        total += short_tail_bits(&kernel, tail).count_ones() as usize;
+    }
+    total
+}
+
 /// Returns match bits for the final partial word in `haystack`.
 ///
 /// Re-reads the last full word when possible; shorter haystacks are staged.
@@ -96,127 +208,15 @@ fn short_tail_bits<K: Kernel>(kernel: &K, haystack: &[u8]) -> u64 {
     slide_ends(bits, staged_len, len)
 }
 
-#[inline]
-pub(crate) fn count_all<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
-    // Drain after 255 words to prevent byte-lane overflow.
-    const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
-
-    let (words, tail) = haystack.as_chunks::<WORD_BYTES>();
-
-    let mut total = 0;
-    for batch in words.chunks(CHUNKS_PER_ACCUMULATOR) {
-        let mut counts = 0u64;
-
-        for word in batch {
-            let marks = kernel.matches(u64::from_le_bytes(*word)) >> 7;
-            counts += marks;
-        }
-
-        for byte in counts.to_ne_bytes() {
-            total += usize::from(byte);
-        }
-    }
-    if !tail.is_empty() {
-        total += short_tail_bits(&kernel, tail).count_ones() as usize;
-    }
-    total
-}
-
-/// Returns the offset of the first matching byte of `haystack`.
-///
-/// Uses the first marked byte directly instead of building a full [`movemask`].
-#[inline]
-pub(crate) fn find_first<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize> {
-    #[inline]
-    fn first_lane(marks: u64) -> usize {
-        debug_assert!(marks != 0);
-        marks.trailing_zeros() as usize / 8
-    }
-
-    // Byte-wise probing is faster than staging for fewer than eight bytes.
-    if haystack.len() < WORD_BYTES {
-        return haystack.iter().position(|&byte| kernel.matches_byte(byte));
-    }
-
-    let (words, tail) = haystack.as_chunks::<WORD_BYTES>();
-    let (pairs, words) = words.as_chunks::<2>();
-
-    let mut offset = 0;
-    for [first_word, second_word] in pairs {
-        let first_match = kernel.matches(u64::from_le_bytes(*first_word));
-        let second_match = kernel.matches(u64::from_le_bytes(*second_word));
-        if (first_match | second_match) != 0 {
-            return Some(if first_match != 0 {
-                offset + first_lane(first_match)
-            } else {
-                offset + WORD_BYTES + first_lane(second_match)
-            });
-        }
-        offset += 2 * WORD_BYTES;
-    }
-    for word in words {
-        let marks = kernel.matches(u64::from_le_bytes(*word));
-        if marks != 0 {
-            return Some(offset + first_lane(marks));
-        }
-        offset += WORD_BYTES;
-    }
-
-    if tail.is_empty() {
-        return None;
-    }
-    let bits = tail_bits(&kernel, haystack, tail);
-    (bits != 0).then(|| haystack.len() - tail.len() + bits.trailing_zeros() as usize)
-}
-
-#[inline]
-pub(crate) fn find_next<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {
-    let (haystack, mut offset) = (state.haystack, state.scan_offset);
-    // SAFETY: `state.scan_offset` never exceeds the haystack length.
-    let unscanned = unsafe { haystack.get_unchecked(offset..) };
-    let (words, tail) = unscanned.as_chunks::<WORD_BYTES>();
-    let (pairs, words) = words.as_chunks::<2>();
-
-    for [first_word, second_word] in pairs {
-        let first_match = kernel.matches(u64::from_le_bytes(*first_word));
-        let second_match = kernel.matches(u64::from_le_bytes(*second_word));
-        if (first_match | second_match) != 0 {
-            state.match_base = offset;
-            state.scan_offset = offset + 2 * WORD_BYTES;
-            return MatchedBitset::from(
-                movemask(first_match) | movemask(second_match) << WORD_BYTES,
-            );
-        }
-        offset += 2 * WORD_BYTES;
-    }
-    for word in words {
-        let marks = kernel.matches(u64::from_le_bytes(*word));
-        if marks != 0 {
-            state.match_base = offset;
-            state.scan_offset = offset + WORD_BYTES;
-            return MatchedBitset::from(movemask(marks));
-        }
-        offset += WORD_BYTES;
-    }
-
-    state.match_base = haystack.len() - tail.len();
-    state.scan_offset = haystack.len();
-    if tail.is_empty() {
-        0
-    } else {
-        tail_bits(&kernel, haystack, tail).into()
-    }
-}
-
 /// The [`ScanOps`] whose entry points run `K`.
 pub(crate) fn scan_ops<K: Kernel>() -> &'static ScanOps {
-    unsafe fn find_next<K: Kernel>(
+    unsafe fn next_match_batch<K: Kernel>(
         kernel_data: &KernelData,
         state: &mut IterState<'_>,
     ) -> MatchedBitset {
         // SAFETY: `MemchrN` pairs `K` with its live `KernelData` field.
         let kernel = unsafe { K::from_data(kernel_data) };
-        self::find_next(state, kernel)
+        self::next_match_batch(state, kernel)
     }
 
     unsafe fn count_all<K: Kernel>(kernel_data: &KernelData, haystack: &[u8]) -> usize {
@@ -225,16 +225,16 @@ pub(crate) fn scan_ops<K: Kernel>() -> &'static ScanOps {
         self::count_all(haystack, kernel)
     }
 
-    unsafe fn find_first<K: Kernel>(kernel_data: &KernelData, haystack: &[u8]) -> Option<usize> {
+    unsafe fn first_match<K: Kernel>(kernel_data: &KernelData, haystack: &[u8]) -> Option<usize> {
         // SAFETY: `MemchrN` pairs `K` with its live `KernelData` field.
         let kernel = unsafe { K::from_data(kernel_data) };
-        self::find_first(haystack, kernel)
+        self::first_match(haystack, kernel)
     }
 
     &ScanOps {
-        find_next: find_next::<K>,
+        next_match_batch: next_match_batch::<K>,
         count_all: count_all::<K>,
-        find_first: find_first::<K>,
+        first_match: first_match::<K>,
     }
 }
 
