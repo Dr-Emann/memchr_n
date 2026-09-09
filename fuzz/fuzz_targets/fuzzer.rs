@@ -24,6 +24,10 @@ fn target(simd: bool, bitset: Bitset, data: &[u8]) {
     let mut count = 0;
     for idx in finder.iter(data) {
         let non_matching_start = prev.map_or(0, |prev| prev + 1);
+        assert_eq!(
+            finder.find(&data[non_matching_start..]),
+            Some(idx - non_matching_start)
+        );
         for &b in &data[non_matching_start..idx] {
             assert!(!bitset.get(b))
         }
