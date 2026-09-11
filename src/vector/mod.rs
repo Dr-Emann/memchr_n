@@ -13,7 +13,7 @@ const BLOCK_BYTES: usize = 16;
 /// Leading bytes probed before staging a sub-vector haystack.
 ///
 /// One probe improves front-match latency; additional probes slow misses and later matches.
-pub(crate) const PROBE_BYTES: usize = 1;
+const PROBE_BYTES: usize = 1;
 
 /// Tests a chunk of [`CHUNK_BYTES`] bytes against a byte set.
 pub(crate) trait Kernel<S: Simd>: Copy {
@@ -55,7 +55,7 @@ pub(crate) fn has_byte_shuffle(level: Level) -> bool {
 /// Chunk pairs share an [`any_true`](fearless_simd::SimdMask::any_true) check and are returned
 /// together so the second chunk is not rescanned.
 #[inline(always)]
-pub(crate) fn next_match_batch<S: Simd, K: Kernel<S>>(
+fn next_match_batch<S: Simd, K: Kernel<S>>(
     simd: S,
     state: &mut IterState<'_>,
     kernel: K,
@@ -111,7 +111,7 @@ pub(crate) fn next_match_batch<S: Simd, K: Kernel<S>>(
 ///
 /// Handles short haystacks and the first chunk before entering the paired scan loop.
 #[inline(always)]
-pub(crate) fn first_match<S: Simd, K: Kernel<S>>(
+fn first_match<S: Simd, K: Kernel<S>>(
     simd: S,
     haystack: &[u8],
     kernel: K,
@@ -298,7 +298,7 @@ kernel! {
 
 /// Counts every matching byte of `haystack`.
 #[inline(always)]
-pub(crate) fn count_all<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) -> usize {
+fn count_all<S: Simd, K: Kernel<S>>(simd: S, haystack: &[u8], kernel: K) -> usize {
     // Drain after 255 chunks to prevent byte-lane overflow.
     const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
 

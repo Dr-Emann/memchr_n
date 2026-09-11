@@ -6,12 +6,12 @@ pub(crate) mod kernels;
 
 use crate::{IterState, KernelData, MatchedBitset, ScanOps};
 
-pub(crate) const WORD_BYTES: usize = 8;
+const WORD_BYTES: usize = 8;
 
 const HIGH: u64 = splat(1 << 7);
 
 #[inline]
-pub(crate) const fn splat(byte: u8) -> u64 {
+const fn splat(byte: u8) -> u64 {
     u64::from_ne_bytes([byte; WORD_BYTES])
 }
 
@@ -28,7 +28,7 @@ const fn nonzero_bytes(word: u64) -> u64 {
 ///
 /// The multiplier maps bit `8i + 7` to bit `56 + i`; other products fall outside the result.
 #[inline]
-pub(crate) const fn movemask(marks: u64) -> u64 {
+const fn movemask(marks: u64) -> u64 {
     marks.wrapping_mul(0x0002_0408_1020_4081) >> 56
 }
 
@@ -49,7 +49,7 @@ pub(crate) trait Kernel: Copy {
 }
 
 #[inline]
-pub(crate) fn next_match_batch<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {
+fn next_match_batch<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {
     let (haystack, mut offset) = (state.haystack, state.scan_offset);
     // SAFETY: `state.scan_offset` never exceeds the haystack length.
     let unscanned = unsafe { haystack.get_unchecked(offset..) };
@@ -91,7 +91,7 @@ pub(crate) fn next_match_batch<K: Kernel>(state: &mut IterState<'_>, kernel: K) 
 ///
 /// Uses the first marked byte directly instead of building a full [`movemask`].
 #[inline]
-pub(crate) fn first_match<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize> {
+fn first_match<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize> {
     #[inline]
     fn first_lane(marks: u64) -> usize {
         debug_assert!(marks != 0);
@@ -135,7 +135,7 @@ pub(crate) fn first_match<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize
 }
 
 #[inline]
-pub(crate) fn count_all<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
+fn count_all<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
     // Drain after 255 words to prevent byte-lane overflow.
     const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
 
