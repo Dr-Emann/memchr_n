@@ -1,5 +1,5 @@
 use crate::BitsetLookup;
-use crate::KernelData;
+use crate::search::StoredKernel;
 use crate::swar::{HIGH, Kernel, nonzero_bytes, splat};
 use core::range::RangeInclusive;
 
@@ -17,18 +17,20 @@ fn any_of_matches<const N: usize>(word: u64, splatted_needles: [u64; N]) -> u64 
     !nonzero & HIGH
 }
 
-impl<const N: usize> Kernel for AnyOf<N> {
-    unsafe fn from_data(kernel_data: &KernelData) -> Self {
-        const { assert!(N <= 3, "`splatted_needles` holds three") }
-        // SAFETY: the caller guarantees `splatted_needles` is live; `N <= 3` bounds the reads.
-        let splatted = unsafe { kernel_data.splatted_needles };
-        Self {
-            splatted_needles: core::array::from_fn(|i| {
-                u64::from_ne_bytes(*splatted[i].first_chunk().unwrap())
-            }),
+impl<const N: usize> AnyOf<N> {
+    pub(crate) fn new(needles: [u8; N]) -> Self {
+        let mut splatted_needles = [0; N];
+        for (dst, needle) in splatted_needles.iter_mut().zip(needles) {
+            *dst = splat(needle);
         }
+        Self { splatted_needles }
     }
+}
 
+impl<const N: usize> Kernel for AnyOf<N>
+where
+    Self: StoredKernel,
+{
     #[inline]
     fn matches(&self, word: u64) -> u64 {
         any_of_matches(word, self.splatted_needles)
@@ -36,9 +38,12 @@ impl<const N: usize> Kernel for AnyOf<N> {
 
     #[inline]
     fn matches_byte(&self, byte: u8) -> bool {
-        self.splatted_needles
-            .iter()
-            .any(|&needle| needle as u8 == byte)
+        for &needle in &self.splatted_needles {
+            if needle as u8 == byte {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -47,15 +52,15 @@ pub(crate) struct NotByte {
     splatted_byte: u64,
 }
 
-impl Kernel for NotByte {
-    unsafe fn from_data(kernel_data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `splatted_needles` is live.
-        let splatted = unsafe { &kernel_data.splatted_needles };
+impl NotByte {
+    pub(crate) fn new(byte: u8) -> Self {
         Self {
-            splatted_byte: u64::from_ne_bytes(*splatted[0].first_chunk().unwrap()),
+            splatted_byte: splat(byte),
         }
     }
+}
 
+impl Kernel for NotByte {
     #[inline]
     fn matches(&self, word: u64) -> u64 {
         nonzero_bytes(word ^ self.splatted_byte) & HIGH
@@ -95,11 +100,6 @@ impl OneRange {
 }
 
 impl Kernel for OneRange {
-    unsafe fn from_data(kernel_data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `range_masks` is live.
-        unsafe { kernel_data.range_masks }
-    }
-
     #[inline]
     fn matches(&self, word: u64) -> u64 {
         // A byte is in range when `byte - start` wraps into `0..=span`.
@@ -122,10 +122,6 @@ impl Kernel for OneRange {
 }
 
 impl Kernel for BitsetLookup {
-    unsafe fn from_data(kernel_data: &KernelData) -> Self {
-        unsafe { BitsetLookup::from_data(kernel_data) }
-    }
-
     #[inline]
     fn matches(&self, word: u64) -> u64 {
         let mut marks = 0;

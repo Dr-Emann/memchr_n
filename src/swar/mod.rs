@@ -4,7 +4,8 @@
 
 pub(crate) mod kernels;
 
-use crate::{IterState, KernelData, MatchedBitset, ScanOps};
+use crate::search::StoredKernel;
+use crate::{IterState, KernelStorage, MatchedBitset, ScanOps};
 
 const WORD_BYTES: usize = 8;
 
@@ -33,14 +34,7 @@ const fn movemask(marks: u64) -> u64 {
 }
 
 /// Tests [`WORD_BYTES`] bytes at a time and marks matches in each byte's high bit.
-pub(crate) trait Kernel: Copy {
-    /// Reads this kernel out of the field of `kernel_data` that holds it.
-    ///
-    /// # Safety
-    ///
-    /// `kernel_data` must have the field this kernel reads as its live field.
-    unsafe fn from_data(kernel_data: &KernelData) -> Self;
-
+pub(crate) trait Kernel: StoredKernel {
     /// Marks each matching byte of `word` with `0x80` and each nonmatching byte with zero.
     fn matches(&self, word: u64) -> u64;
 
@@ -49,7 +43,7 @@ pub(crate) trait Kernel: Copy {
 }
 
 #[inline]
-fn next_match_batch<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedBitset {
+fn next_match_batch<K: Kernel>(state: &mut IterState<'_>, kernel: &K) -> MatchedBitset {
     let (haystack, mut offset) = (state.haystack, state.scan_offset);
     // SAFETY: `state.scan_offset` never exceeds the haystack length.
     let unscanned = unsafe { haystack.get_unchecked(offset..) };
@@ -83,7 +77,7 @@ fn next_match_batch<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedB
     if tail.is_empty() {
         0
     } else {
-        tail_bits(&kernel, haystack, tail).into()
+        tail_bits(kernel, haystack, tail).into()
     }
 }
 
@@ -91,7 +85,7 @@ fn next_match_batch<K: Kernel>(state: &mut IterState<'_>, kernel: K) -> MatchedB
 ///
 /// Uses the first marked byte directly instead of building a full [`movemask`].
 #[inline]
-fn first_match<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize> {
+fn first_match<K: Kernel>(haystack: &[u8], kernel: &K) -> Option<usize> {
     #[inline]
     fn first_lane(marks: u64) -> usize {
         debug_assert!(marks != 0);
@@ -130,12 +124,12 @@ fn first_match<K: Kernel>(haystack: &[u8], kernel: K) -> Option<usize> {
     if tail.is_empty() {
         return None;
     }
-    let bits = tail_bits(&kernel, haystack, tail);
+    let bits = tail_bits(kernel, haystack, tail);
     (bits != 0).then(|| haystack.len() - tail.len() + bits.trailing_zeros() as usize)
 }
 
 #[inline]
-fn count_all<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
+fn count_all<K: Kernel>(haystack: &[u8], kernel: &K) -> usize {
     // Drain after 255 words to prevent byte-lane overflow.
     const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
 
@@ -155,7 +149,7 @@ fn count_all<K: Kernel>(haystack: &[u8], kernel: K) -> usize {
         }
     }
     if !tail.is_empty() {
-        total += short_tail_bits(&kernel, tail).count_ones() as usize;
+        total += short_tail_bits(kernel, tail).count_ones() as usize;
     }
     total
 }
@@ -211,23 +205,26 @@ fn short_tail_bits<K: Kernel>(kernel: &K, haystack: &[u8]) -> u64 {
 /// The [`ScanOps`] whose entry points run `K`.
 pub(crate) fn scan_ops<K: Kernel>() -> &'static ScanOps {
     unsafe fn next_match_batch<K: Kernel>(
-        kernel_data: &KernelData,
+        kernel_storage: &KernelStorage,
         state: &mut IterState<'_>,
     ) -> MatchedBitset {
-        // SAFETY: `MemchrN` pairs `K` with its live `KernelData` field.
-        let kernel = unsafe { K::from_data(kernel_data) };
+        // SAFETY: `MemchrN` pairs `K` with its live `KernelStorage` field.
+        let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
         self::next_match_batch(state, kernel)
     }
 
-    unsafe fn count_all<K: Kernel>(kernel_data: &KernelData, haystack: &[u8]) -> usize {
-        // SAFETY: `MemchrN` pairs `K` with its live `KernelData` field.
-        let kernel = unsafe { K::from_data(kernel_data) };
+    unsafe fn count_all<K: Kernel>(kernel_storage: &KernelStorage, haystack: &[u8]) -> usize {
+        // SAFETY: `MemchrN` pairs `K` with its live `KernelStorage` field.
+        let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
         self::count_all(haystack, kernel)
     }
 
-    unsafe fn first_match<K: Kernel>(kernel_data: &KernelData, haystack: &[u8]) -> Option<usize> {
-        // SAFETY: `MemchrN` pairs `K` with its live `KernelData` field.
-        let kernel = unsafe { K::from_data(kernel_data) };
+    unsafe fn first_match<K: Kernel>(
+        kernel_storage: &KernelStorage,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        // SAFETY: `MemchrN` pairs `K` with its live `KernelStorage` field.
+        let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
         self::first_match(haystack, kernel)
     }
 

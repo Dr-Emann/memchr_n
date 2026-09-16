@@ -1,91 +1,107 @@
 use super::Kernel;
 use crate::bitset::ByteSet;
-use crate::{BitsetLookup, FixedNibble, KernelData, NibbleLookup};
+use crate::search::StoredKernel;
+use crate::{BitsetLookup, FixedNibble, FixedNibbleTable, NibbleLookup};
+use core::range::RangeInclusive;
 use fearless_simd::prelude::*;
 use fearless_simd::{u8x16, u8x32, u8x64};
 
 /// Compares each byte with up to three needles.
 #[derive(Copy, Clone)]
-pub(crate) struct AnyOf<S: Simd, const N: usize> {
-    needle_vectors: [u8x16<S>; N],
+pub(crate) struct AnyOf<const N: usize> {
+    splatted_needles: [[u8; 16]; N],
 }
 
-impl<S: Simd, const N: usize> Kernel<S> for AnyOf<S, N> {
-    unsafe fn from_data(simd: S, kernel_data: &KernelData) -> Self {
-        const { assert!(N <= 3, "`splatted_needles` holds three") }
-        // SAFETY: the caller guarantees `splatted_needles` is live; `N <= 3` bounds the reads.
-        let splatted = unsafe { &kernel_data.splatted_needles };
-        Self {
-            needle_vectors: core::array::from_fn(|i| u8x16::load_array_ref(simd, &splatted[i])),
+impl<const N: usize> AnyOf<N> {
+    pub(crate) fn new(needles: [u8; N]) -> Self {
+        let mut splatted_needles = [[0; 16]; N];
+        for (dst, needle) in splatted_needles.iter_mut().zip(needles) {
+            *dst = [needle; 16];
         }
+        Self { splatted_needles }
     }
+}
 
+impl<const N: usize> Kernel for AnyOf<N>
+where
+    Self: StoredKernel,
+{
     #[inline(always)]
-    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
-        let mut matched = V::Mask::splat(chunk.witness(), false);
-        for &needle in &self.needle_vectors {
-            matched |= chunk.simd_eq(V::block_splat(needle));
+    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
+        let simd = chunk.witness();
+        let mut matched = V::Mask::splat(simd, false);
+        for &needle in &self.splatted_needles {
+            matched |= chunk.simd_eq(V::block_splat(u8x16::load_array(simd, needle)));
         }
         matched
     }
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        self.needle_vectors.iter().map(|x| x[0]).any(|x| x == byte)
+        for needle in &self.splatted_needles {
+            if needle[0] == byte {
+                return true;
+            }
+        }
+        false
     }
 }
 
 #[derive(Copy, Clone)]
-pub(crate) struct NotByte<S: Simd> {
-    needle_vector: u8x16<S>,
+pub(crate) struct NotByte {
+    splatted_byte: [u8; 16],
 }
 
-impl<S: Simd> Kernel<S> for NotByte<S> {
-    unsafe fn from_data(simd: S, kernel_data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `splatted_needles` is live.
-        let splatted = unsafe { &kernel_data.splatted_needles };
+impl NotByte {
+    pub(crate) fn new(byte: u8) -> Self {
         Self {
-            needle_vector: u8x16::load_array_ref(simd, &splatted[0]),
+            splatted_byte: [byte; 16],
         }
     }
+}
 
+impl Kernel for NotByte {
     #[inline(always)]
-    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
-        !chunk.simd_eq(V::block_splat(self.needle_vector))
+    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
+        !chunk.simd_eq(V::block_splat(u8x16::load_array(
+            chunk.witness(),
+            self.splatted_byte,
+        )))
     }
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        byte != self.needle_vector[0]
+        byte != self.splatted_byte[0]
     }
 }
 
 #[derive(Copy, Clone)]
-pub(crate) struct OneRange<S: Simd> {
-    start_vector: u8x16<S>,
-    last_vector: u8x16<S>,
-    scalar_bounds: (u8, u8),
+pub(crate) struct OneRange {
+    splatted_start: [u8; 16],
+    splatted_last: [u8; 16],
 }
 
-impl<S: Simd> Kernel<S> for OneRange<S> {
-    unsafe fn from_data(simd: S, kernel_data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `splatted_bounds` is live.
-        let [start, last] = unsafe { &kernel_data.splatted_bounds };
+impl OneRange {
+    pub(crate) fn new(range: RangeInclusive<u8>) -> Self {
+        let RangeInclusive { start, last } = range;
         Self {
-            start_vector: u8x16::load_array_ref(simd, start),
-            last_vector: u8x16::load_array_ref(simd, last),
-            scalar_bounds: (splatted_byte(start), splatted_byte(last)),
+            splatted_start: [start; 16],
+            splatted_last: [last; 16],
         }
     }
+}
+
+impl Kernel for OneRange {
     #[inline(always)]
-    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
-        chunk.simd_ge(V::block_splat(self.start_vector))
-            & chunk.simd_le(V::block_splat(self.last_vector))
+    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
+        let simd = chunk.witness();
+        chunk.simd_ge(V::block_splat(u8x16::load_array(simd, self.splatted_start)))
+            & chunk.simd_le(V::block_splat(u8x16::load_array(simd, self.splatted_last)))
     }
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        let (start, last) = self.scalar_bounds;
+        let (start, last) = (self.splatted_start[0], self.splatted_last[0]);
         start <= byte && byte <= last
     }
 }
@@ -96,18 +112,18 @@ pub(crate) struct SmallSet {
     hi_lookup: NibbleLookup,
 }
 
-impl<S: Simd> Kernel<S> for SmallSet {
-    unsafe fn from_data(_simd: S, kernel_data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `nibble_lookups` is live.
-        let [lo_lookup, hi_lookup] = unsafe { kernel_data.nibble_lookups };
+impl SmallSet {
+    pub(crate) fn new(lo_lookup: NibbleLookup, hi_lookup: NibbleLookup) -> Self {
         Self {
             lo_lookup,
             hi_lookup,
         }
     }
+}
 
+impl Kernel for SmallSet {
     #[inline(always)]
-    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
+    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
         &self,
         chunk: V,
     ) -> V::Mask {
@@ -136,18 +152,22 @@ pub(crate) struct FixedNibbleSet {
     table: [u8; 16],
 }
 
-impl<S: Simd> Kernel<S> for FixedNibbleSet {
-    unsafe fn from_data(_simd: S, kernel_data: &KernelData) -> Self {
-        // SAFETY: the caller guarantees `fixed_nibble_table` is live.
-        let table = unsafe { kernel_data.fixed_nibble_table };
+impl FixedNibbleSet {
+    pub(crate) fn new(table: FixedNibbleTable) -> Self {
+        let FixedNibbleTable {
+            fixed_nibble,
+            table,
+        } = table;
         Self {
-            fixed_nibble: table.fixed_nibble,
-            table: table.table,
+            fixed_nibble,
+            table,
         }
     }
+}
 
+impl Kernel for FixedNibbleSet {
     #[inline(always)]
-    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
+    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
         &self,
         chunk: V,
     ) -> V::Mask {
@@ -171,13 +191,9 @@ impl<S: Simd> Kernel<S> for FixedNibbleSet {
     }
 }
 
-impl<S: Simd> Kernel<S> for BitsetLookup {
-    unsafe fn from_data(_simd: S, kernel_data: &KernelData) -> Self {
-        unsafe { BitsetLookup::from_data(kernel_data) }
-    }
-
+impl Kernel for BitsetLookup {
     #[inline(always)]
-    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
+    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
         &self,
         chunk: V,
     ) -> V::Mask {
@@ -190,14 +206,6 @@ impl<S: Simd> Kernel<S> for BitsetLookup {
     fn matches_byte(&self, byte: u8) -> bool {
         self.contains(byte)
     }
-}
-
-/// The byte a block of [`KernelData`] holds splatted, for [`Kernel::matches_byte`].
-///
-/// Borrowing preserves an aligned vector load; copying generates scalar inserts.
-#[inline(always)]
-fn splatted_byte(splatted: &[u8; 16]) -> u8 {
-    splatted[0]
 }
 
 /// Looks each byte's high five bits up in the 256-bit table, giving the table byte

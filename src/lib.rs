@@ -8,7 +8,7 @@ mod vector;
 
 use crate::bitset::ByteSet;
 use crate::search::{
-    BitsetLookup, FixedNibble, FixedNibbleTable, KernelData, KernelKind, NibbleLookup, ScanOps,
+    BitsetLookup, FixedNibble, FixedNibbleTable, KernelKind, KernelStorage, NibbleLookup, ScanOps,
     SearchPlan, never_scan_ops,
 };
 use core::fmt;
@@ -181,7 +181,7 @@ impl MemchrN {
     #[inline]
     pub fn find(&self, haystack: &[u8]) -> Option<usize> {
         // SAFETY: `self.search` keeps the scan operations, kernel data, and supported SIMD level together.
-        unsafe { (self.search.scan_ops.first_match)(&self.search.kernel_data, haystack) }
+        unsafe { (self.search.scan_ops.first_match)(&self.search.kernel_storage, haystack) }
     }
 
     /// Returns an [`Iter`] over the offsets of every matching byte in `haystack`.
@@ -252,7 +252,7 @@ impl<'a> Iter<'a> {
         // SAFETY: `SearchPlan` keeps the scan operations, kernel data, and supported SIMD level together.
         self.match_bits = unsafe {
             (self.finder.search.scan_ops.next_match_batch)(
-                &self.finder.search.kernel_data,
+                &self.finder.search.kernel_storage,
                 &mut self.state,
             )
         };
@@ -293,7 +293,10 @@ impl<'a> Iterator for Iter<'a> {
         if !unscanned.is_empty() {
             // SAFETY: `SearchPlan` keeps the scan operations, kernel data, and supported SIMD level together.
             total += unsafe {
-                (self.finder.search.scan_ops.count_all)(&self.finder.search.kernel_data, unscanned)
+                (self.finder.search.scan_ops.count_all)(
+                    &self.finder.search.kernel_storage,
+                    unscanned,
+                )
             };
         }
         total
@@ -384,30 +387,29 @@ impl MemchrN {
         }
     }
 
-    fn of_needles<const N: usize>(engine: Engine, needles: [u8; N]) -> Self {
+    fn of_needles<const N: usize>(engine: Engine, needles: [u8; N]) -> Self
+    where
+        swar::kernels::AnyOf<N>: search::StoredKernel,
+        vector::kernels::AnyOf<N>: search::StoredKernel,
+    {
         let kernel_kind = match N {
             1 => KernelKind::OneByte,
             2 => KernelKind::TwoBytes,
             3 => KernelKind::ThreeBytes,
             _ => unreachable!(),
         };
-        let mut splatted_needles = [[0; _]; 3];
-        for (dst, needle) in splatted_needles.iter_mut().zip(needles) {
-            *dst = [needle; _];
-        }
-        let kernel_data = KernelData { splatted_needles };
         match engine {
             Engine::Vector(level) => Self {
                 search: SearchPlan {
-                    kernel_data,
-                    scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::AnyOf<_, N>>(simd)),
+                    kernel_storage: vector::kernels::AnyOf::new(needles).into(),
+                    scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::AnyOf<N>>(simd)),
                     engine,
                     kernel_kind,
                 },
             },
             Engine::Swar => Self {
                 search: SearchPlan {
-                    kernel_data,
+                    kernel_storage: swar::kernels::AnyOf::new(needles).into(),
                     scan_ops: swar::scan_ops::<swar::kernels::AnyOf<N>>(),
                     engine,
                     kernel_kind,
@@ -417,18 +419,19 @@ impl MemchrN {
     }
 
     fn of_not_byte(engine: Engine, byte: u8) -> Self {
-        let kernel_data = KernelData {
-            splatted_needles: [[byte; 16], [0; 16], [0; 16]],
-        };
-        let scan_ops = match engine {
-            Engine::Vector(level) => {
-                dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::NotByte<_>>(simd))
-            }
-            Engine::Swar => swar::scan_ops::<swar::kernels::NotByte>(),
+        let (kernel_storage, scan_ops) = match engine {
+            Engine::Vector(level) => (
+                vector::kernels::NotByte::new(byte).into(),
+                dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::NotByte>(simd)),
+            ),
+            Engine::Swar => (
+                swar::kernels::NotByte::new(byte).into(),
+                swar::scan_ops::<swar::kernels::NotByte>(),
+            ),
         };
         Self {
             search: SearchPlan {
-                kernel_data,
+                kernel_storage,
                 scan_ops,
                 engine,
                 kernel_kind: KernelKind::NotByte,
@@ -441,19 +444,15 @@ impl MemchrN {
         match engine {
             Engine::Vector(level) => Self {
                 search: SearchPlan {
-                    kernel_data: KernelData {
-                        splatted_bounds: [[range.start; _], [range.last; _]],
-                    },
-                    scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::OneRange<_>>(simd)),
+                    kernel_storage: vector::kernels::OneRange::new(range).into(),
+                    scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::OneRange>(simd)),
                     engine,
                     kernel_kind,
                 },
             },
             Engine::Swar => Self {
                 search: SearchPlan {
-                    kernel_data: KernelData {
-                        range_masks: swar::kernels::OneRange::new(range),
-                    },
+                    kernel_storage: swar::kernels::OneRange::new(range).into(),
                     scan_ops: swar::scan_ops::<swar::kernels::OneRange>(),
                     engine,
                     kernel_kind,
@@ -480,9 +479,7 @@ impl MemchrN {
         }
         Some(Self {
             search: SearchPlan {
-                kernel_data: KernelData {
-                    nibble_lookups: [lo_lookup, hi_lookup],
-                },
+                kernel_storage: vector::kernels::SmallSet::new(lo_lookup, hi_lookup).into(),
                 scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::SmallSet>(simd)),
                 engine,
                 kernel_kind: KernelKind::SmallSet,
@@ -500,7 +497,7 @@ impl MemchrN {
         let fixed_nibble_table = extract_fixed_nibble_table(possible_set)?;
         Some(Self {
             search: SearchPlan {
-                kernel_data: KernelData { fixed_nibble_table },
+                kernel_storage: vector::kernels::FixedNibbleSet::new(fixed_nibble_table).into(),
                 scan_ops: dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::FixedNibbleSet>(simd)),
                 engine,
                 kernel_kind: KernelKind::FixedNibble,
@@ -510,11 +507,12 @@ impl MemchrN {
 
     fn of_bitset_lookup(engine: Engine, byte_set: ByteSet) -> Self {
         let engine = engine.with_byte_shuffle();
-        let (kernel_kind, kernel_data) = (KernelKind::BitsetLookup, KernelData { byte_set });
+        let (kernel_kind, kernel_storage) =
+            (KernelKind::BitsetLookup, BitsetLookup::new(byte_set).into());
         match engine {
             Engine::Vector(level) => Self {
                 search: SearchPlan {
-                    kernel_data,
+                    kernel_storage,
                     scan_ops: dispatch!(level, simd => vector::scan_ops::<_, BitsetLookup>(simd)),
                     engine,
                     kernel_kind,
@@ -522,7 +520,7 @@ impl MemchrN {
             },
             Engine::Swar => Self {
                 search: SearchPlan {
-                    kernel_data,
+                    kernel_storage,
                     scan_ops: swar::scan_ops::<BitsetLookup>(),
                     engine,
                     kernel_kind,
@@ -534,7 +532,7 @@ impl MemchrN {
     fn of_never() -> Self {
         Self {
             search: SearchPlan {
-                kernel_data: KernelData { no_data: () },
+                kernel_storage: ().into(),
                 scan_ops: never_scan_ops(),
                 engine: Engine::Swar,
                 kernel_kind: KernelKind::Never,
@@ -646,6 +644,22 @@ mod tests {
         assert_eq!(offsets(1..3, &haystack), vec![1, 2]);
         assert_eq!(offsets(1..=3, &haystack), vec![1, 2, 3]);
         assert_eq!(offsets(254.., &haystack), vec![4, 5]);
+    }
+
+    #[test]
+    fn range_matches_single_bytes_across_both_bounds() {
+        for backend in [Backend::Auto, Backend::Swar] {
+            for (start, last) in [(b'0', b'9'), (0, 127), (127, 130), (128, 255), (0, 255)] {
+                let searcher = MemchrN::from_range_with_backend(start..=last, backend);
+                for byte in 0..=u8::MAX {
+                    let expected = start <= byte && byte <= last;
+                    let haystack = [byte];
+                    assert_eq!(searcher.find(&haystack), expected.then_some(0));
+                    assert_eq!(searcher.iter(&haystack).next(), expected.then_some(0));
+                    assert_eq!(searcher.iter(&haystack).count(), usize::from(expected));
+                }
+            }
+        }
     }
 
     #[test]
