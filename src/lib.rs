@@ -99,6 +99,35 @@ impl MemchrN {
         Self::from_set(ByteSet::from_bytes(bytes), backend)
     }
 
+    /// Builds a searcher for every byte except `byte` using the best supported kernels.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memchr_n::MemchrN;
+    ///
+    /// let finder = MemchrN::from_not_byte(b' ');
+    /// assert_eq!(finder.find(b"   hello"), Some(3));
+    /// ```
+    #[inline]
+    pub fn from_not_byte(byte: u8) -> Self {
+        Self::from_not_byte_with_backend(byte, Backend::Auto)
+    }
+
+    /// Builds a searcher for every byte except `byte` using `backend`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memchr_n::{Backend, MemchrN};
+    ///
+    /// let finder = MemchrN::from_not_byte_with_backend(b' ', Backend::Swar);
+    /// assert_eq!(finder.iter(b" a b ").collect::<Vec<_>>(), vec![1, 3]);
+    /// ```
+    pub fn from_not_byte_with_backend(byte: u8, backend: Backend) -> Self {
+        Self::of_not_byte(backend.engine(), byte)
+    }
+
     /// Builds a searcher for the bytes in a [`RangeBounds<u8>`] using the best supported kernels.
     ///
     /// An empty range matches nothing.
@@ -344,6 +373,9 @@ impl MemchrN {
                     .unwrap_or_else(|| Self::of_bitset_lookup(engine, set)),
             }
         } else {
+            if let Some(byte) = set.excluded_byte() {
+                return Self::of_not_byte(engine, byte);
+            }
             // Ranges remain cheap even when too large for a named-member kernel.
             match set.as_contiguous_range() {
                 Some(range) => Self::of_range(engine, range),
@@ -380,6 +412,26 @@ impl MemchrN {
                     engine,
                     kernel_kind,
                 },
+            },
+        }
+    }
+
+    fn of_not_byte(engine: Engine, byte: u8) -> Self {
+        let kernel_data = KernelData {
+            splatted_needles: [[byte; 16], [0; 16], [0; 16]],
+        };
+        let scan_ops = match engine {
+            Engine::Vector(level) => {
+                dispatch!(level, simd => vector::scan_ops::<_, vector::kernels::NotByte<_>>(simd))
+            }
+            Engine::Swar => swar::scan_ops::<swar::kernels::NotByte>(),
+        };
+        Self {
+            search: SearchPlan {
+                kernel_data,
+                scan_ops,
+                engine,
+                kernel_kind: KernelKind::NotByte,
             },
         }
     }
@@ -1049,5 +1101,97 @@ mod tests {
         let len = 64 * (512 + 3);
         let haystack = vec![b'x'; len];
         assert_eq!(searcher.iter(&haystack).count(), len);
+    }
+
+    fn assert_not_byte(searcher: &MemchrN, excluded: u8, haystack: &[u8]) {
+        let mut expected = Vec::new();
+        for (offset, &byte) in haystack.iter().enumerate() {
+            if byte != excluded {
+                expected.push(offset);
+            }
+        }
+        assert_eq!(searcher.find(haystack), expected.first().copied());
+        assert_eq!(searcher.iter(haystack).collect::<Vec<_>>(), expected);
+        assert_eq!(searcher.iter(haystack).count(), expected.len());
+        for n in [0, 1, 7, 63, 64, 127, 128, haystack.len()] {
+            let mut iter = searcher.iter(haystack);
+            assert_eq!(iter.nth(n), expected.get(n).copied());
+            assert_eq!(iter.count(), expected.len().saturating_sub(n + 1));
+        }
+        let mut iter = searcher.iter(haystack);
+        let taken = usize::from(iter.next().is_some());
+        assert_eq!(iter.count(), expected.len() - taken);
+    }
+
+    #[test]
+    fn not_byte_constructors_and_selection_agree() {
+        let haystack: Vec<u8> = (0..=u8::MAX).collect();
+        for excluded in 0..=u8::MAX {
+            let mut bytes = Vec::new();
+            for byte in 0..=u8::MAX {
+                if byte != excluded {
+                    bytes.extend([byte, byte]);
+                }
+            }
+            for backend in [Backend::Auto, Backend::Swar] {
+                for searcher in [
+                    MemchrN::from_not_byte_with_backend(excluded, backend),
+                    MemchrN::new_with_backend(&bytes, backend),
+                ] {
+                    assert_eq!(format!("{:?}", searcher.search.kernel_kind), "NotByte");
+                    assert_not_byte(&searcher, excluded, &haystack);
+                    for byte in 0..=u8::MAX {
+                        assert_eq!(searcher.find(&[byte]), (byte != excluded).then_some(0));
+                    }
+                }
+                for (range, excluded) in [(1..=255, 0), (0..=254, 255)] {
+                    let searcher = MemchrN::from_range_with_backend(range, backend);
+                    assert_eq!(format!("{:?}", searcher.search.kernel_kind), "NotByte");
+                    assert_not_byte(&searcher, excluded, &haystack);
+                }
+            }
+            let searcher = MemchrN::from_not_byte(excluded);
+            assert_not_byte(&searcher, excluded, &haystack);
+            let searcher: MemchrN = bytes.into_iter().collect();
+            assert_eq!(format!("{:?}", searcher.search.kernel_kind), "NotByte");
+            assert_not_byte(&searcher, excluded, &haystack);
+        }
+    }
+
+    #[test]
+    fn not_byte_handles_alignment_tails_and_match_density() {
+        for excluded in [0, 1, b' ', 127, 128, 254, 255] {
+            for backend in [Backend::Auto, Backend::Swar] {
+                let searcher = MemchrN::from_not_byte_with_backend(excluded, backend);
+                for len in [
+                    0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192,
+                    193, 255, 256, 257, 513,
+                ] {
+                    for alignment in 0..64 {
+                        let mut storage = vec![excluded; len + 64];
+                        let haystack = &mut storage[alignment..alignment + len];
+                        assert_not_byte(&searcher, excluded, haystack);
+                        if len != 0 {
+                            for offset in [0, len / 2, len - 1] {
+                                haystack[offset] = excluded.wrapping_add(1);
+                                assert_not_byte(&searcher, excluded, haystack);
+                                haystack[offset] = excluded;
+                            }
+                        }
+                        haystack.fill(excluded.wrapping_add(1));
+                        assert_not_byte(&searcher, excluded, haystack);
+                        for offset in (0..len).step_by(3) {
+                            haystack[offset] = excluded;
+                        }
+                        assert_not_byte(&searcher, excluded, haystack);
+                    }
+                }
+                assert_not_byte(
+                    &searcher,
+                    excluded,
+                    &vec![excluded.wrapping_add(1); 64 * 515],
+                );
+            }
+        }
     }
 }

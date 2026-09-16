@@ -62,6 +62,21 @@ impl ByteSet {
         self.0[table_index] & (1 << bit_index) != 0
     }
 
+    pub(crate) fn excluded_byte(&self) -> Option<u8> {
+        let mut excluded = None;
+        for i in 0..TABLE_BYTES / 8 {
+            let missing = !self.word(i);
+            if missing == 0 {
+                continue;
+            }
+            if excluded.is_some() || missing.count_ones() != 1 {
+                return None;
+            }
+            excluded = Some((i * 64) as u8 + missing.trailing_zeros() as u8);
+        }
+        excluded
+    }
+
     pub(crate) const fn as_contiguous_range(&self) -> Option<RangeInclusive<u8>> {
         let mut first = None;
         let mut last = 0;
@@ -139,5 +154,37 @@ impl FromIterator<u8> for ByteSet {
         let mut set = Self::new();
         set.extend(iter);
         set
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_exactly_one_excluded_byte() {
+        assert_eq!(ByteSet::new().excluded_byte(), None);
+        let mut full = ByteSet::new();
+        for byte in 0..=u8::MAX {
+            full.add(byte);
+        }
+        assert_eq!(full.excluded_byte(), None);
+        for excluded in 0..=u8::MAX {
+            let mut set = ByteSet::new();
+            for byte in 0..=u8::MAX {
+                if byte != excluded {
+                    set.add(byte);
+                }
+            }
+            assert_eq!(set.excluded_byte(), Some(excluded));
+            for second in 0..=u8::MAX {
+                if second == excluded {
+                    continue;
+                }
+                let mut set = set;
+                set.0[usize::from(second / 8)] &= !(1 << (second % 8));
+                assert_eq!(set.excluded_byte(), None);
+            }
+        }
     }
 }

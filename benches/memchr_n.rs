@@ -13,12 +13,14 @@ const THEIRS: &str = "memchr";
 enum ByteSet {
     List(&'static [u8]),
     Range(u8, u8),
+    NotByte(u8),
 }
 
 impl ByteSet {
     fn finder(self, backend: Backend) -> MemchrN {
         match self {
             ByteSet::List(bytes) => MemchrN::new_with_backend(bytes, backend),
+            ByteSet::NotByte(byte) => MemchrN::from_not_byte_with_backend(byte, backend),
             ByteSet::Range(start, end) => MemchrN::from_range_with_backend(start..=end, backend),
         }
     }
@@ -26,6 +28,7 @@ impl ByteSet {
     fn contains(self, byte: u8) -> bool {
         match self {
             ByteSet::List(bytes) => bytes.contains(&byte),
+            ByteSet::NotByte(excluded) => byte != excluded,
             ByteSet::Range(start, end) => start <= byte && byte <= end,
         }
     }
@@ -94,12 +97,14 @@ impl Needles {
 enum BuildCase {
     Bytes(&'static [u8]),
     Range(u8, u8),
+    NotByte(u8),
 }
 
 impl BuildCase {
     fn build(self) -> MemchrN {
         match self {
             Self::Bytes(bytes) => MemchrN::new(bytes),
+            Self::NotByte(byte) => MemchrN::from_not_byte(byte),
             Self::Range(start, end) => MemchrN::from_range(start..=end),
         }
     }
@@ -108,6 +113,7 @@ impl BuildCase {
 const BUILD_CASES: &[(&str, BuildCase)] = &[
     ("empty", BuildCase::Bytes(b"")),
     ("one-byte", BuildCase::Bytes(b"z")),
+    ("not-byte", BuildCase::NotByte(b' ')),
     ("three-bytes", BuildCase::Bytes(b"zRJ")),
     ("one-range", BuildCase::Range(b'0', b'9')),
     ("small-set", BuildCase::Bytes(b"aeiouAEI")),
@@ -118,6 +124,7 @@ const BUILD_CASES: &[(&str, BuildCase)] = &[
 
 const COUNT_CASES: &[(&str, ByteSet)] = &[
     ("rare-one", ByteSet::List(b"z")),
+    ("not-byte", ByteSet::NotByte(b' ')),
     ("common-one", ByteSet::List(b"a")),
     ("rare-two", ByteSet::List(b"zR")),
     ("common-three", ByteSet::List(b"ato")),
@@ -130,6 +137,7 @@ const COUNT_CASES: &[(&str, ByteSet)] = &[
 
 const ITERATE_CASES: &[(&str, ByteSet)] = &[
     ("rare-one", ByteSet::List(b"z")),
+    ("not-byte", ByteSet::NotByte(b' ')),
     ("common-one", ByteSet::List(b"a")),
     ("common-three", ByteSet::List(b"ato")),
     ("bitset-16", ByteSet::List(HEX_LOWER)),
@@ -219,6 +227,7 @@ fn planted_haystack(set: ByteSet, offset: Option<usize>) -> [u8; 128] {
     };
     let byte = match set {
         ByteSet::List(bytes) => bytes[0],
+        ByteSet::NotByte(byte) => byte.wrapping_add(1),
         ByteSet::Range(start, _) => start,
     };
     haystack[offset] = byte;
@@ -271,7 +280,11 @@ fn bench_find(c: &mut Criterion) {
         });
     }
 
-    for (name, set) in [("one-byte", one_byte), ("bitset-16", bitset)] {
+    for (name, set) in [
+        ("one-byte", one_byte),
+        ("bitset-16", bitset),
+        ("not-byte", ByteSet::NotByte(b'.')),
+    ] {
         for len in [4096, 65536] {
             let haystack = vec![b'.'; len];
             let label = format!("{name}/miss-{len}");

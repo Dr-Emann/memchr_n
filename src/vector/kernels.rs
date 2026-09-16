@@ -36,6 +36,31 @@ impl<S: Simd, const N: usize> Kernel<S> for AnyOf<S, N> {
 }
 
 #[derive(Copy, Clone)]
+pub(crate) struct NotByte<S: Simd> {
+    needle_vector: u8x16<S>,
+}
+
+impl<S: Simd> Kernel<S> for NotByte<S> {
+    unsafe fn from_data(simd: S, kernel_data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `splatted_needles` is live.
+        let splatted = unsafe { &kernel_data.splatted_needles };
+        Self {
+            needle_vector: u8x16::load_array_ref(simd, &splatted[0]),
+        }
+    }
+
+    #[inline(always)]
+    fn matches<V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
+        !chunk.simd_eq(V::block_splat(self.needle_vector))
+    }
+
+    #[inline(always)]
+    fn matches_byte(&self, byte: u8) -> bool {
+        byte != self.needle_vector[0]
+    }
+}
+
+#[derive(Copy, Clone)]
 pub(crate) struct OneRange<S: Simd> {
     start_vector: u8x16<S>,
     last_vector: u8x16<S>,

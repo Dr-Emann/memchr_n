@@ -42,6 +42,31 @@ impl<const N: usize> Kernel for AnyOf<N> {
     }
 }
 
+#[derive(Copy, Clone)]
+pub(crate) struct NotByte {
+    splatted_byte: u64,
+}
+
+impl Kernel for NotByte {
+    unsafe fn from_data(kernel_data: &KernelData) -> Self {
+        // SAFETY: the caller guarantees `splatted_needles` is live.
+        let splatted = unsafe { &kernel_data.splatted_needles };
+        Self {
+            splatted_byte: u64::from_ne_bytes(*splatted[0].first_chunk().unwrap()),
+        }
+    }
+
+    #[inline]
+    fn matches(&self, word: u64) -> u64 {
+        nonzero_bytes(word ^ self.splatted_byte) & HIGH
+    }
+
+    #[inline]
+    fn matches_byte(&self, byte: u8) -> bool {
+        byte != self.splatted_byte as u8
+    }
+}
+
 /// Stores precomputed masks for branchless range matching.
 #[derive(Copy, Clone)]
 pub(crate) struct OneRange {
@@ -217,6 +242,20 @@ mod tests {
                     set.contains(&byte),
                     "{byte} in {set:?}"
                 );
+            }
+        }
+    }
+    #[test]
+    fn not_byte_marks_exactly_the_other_bytes() {
+        for excluded in 0..=u8::MAX {
+            let kernel = NotByte {
+                splatted_byte: splat(excluded),
+            };
+            for byte in 0..=u8::MAX {
+                assert_eq!(kernel.matches_byte(byte), byte != excluded);
+                for bytes in hazardous_words(byte) {
+                    assert_marks(&kernel, bytes, |b| b != excluded);
+                }
             }
         }
     }

@@ -41,6 +41,7 @@ pub(crate) enum KernelKind {
     SmallSet,
     FixedNibble,
     OneByte,
+    NotByte,
     TwoBytes,
     ThreeBytes,
     OneRange,

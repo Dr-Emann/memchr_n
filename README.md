@@ -12,6 +12,7 @@ This section gives a brief high level overview of what this crate offers.
 The [`MemchrN`] type is the entrypoint of the library. It offers a few means of construction:
 
 - [`MemchrN::new`] creates a new `MemchrN` from a slice of bytes.
+- [`MemchrN::from_not_byte`] creates a new `MemchrN` which matches every byte except the given byte.
 - [`MemchrN::from_range`] creates a new `MemchrN` which will match any byte in the given range.
 - [`MemchrN::from_iter`] (also usable as `collection.collect()`) creates a new `MemchrN` from an
   arbitrary iterator of bytes.
