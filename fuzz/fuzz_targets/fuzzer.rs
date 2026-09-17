@@ -20,24 +20,22 @@ impl ByteSet {
 
 fn target(allow_simd: bool, byte_set: ByteSet, haystack: &[u8]) {
     let finder = finder_for_byte_set(allow_simd, &byte_set);
-    let mut previous_match = None;
-    let mut count = 0;
-    for idx in finder.iter(haystack) {
-        let non_matching_start = previous_match.map_or(0, |previous_match| previous_match + 1);
-        assert_eq!(
-            finder.find(&haystack[non_matching_start..]),
-            Some(idx - non_matching_start)
-        );
-        for &byte in &haystack[non_matching_start..idx] {
-            assert!(!byte_set.contains(byte))
+    let mut expected = Vec::new();
+    for (offset, &byte) in haystack.iter().enumerate() {
+        if byte_set.contains(byte) {
+            expected.push(offset);
         }
-        assert!(byte_set.contains(haystack[idx]));
-        count += 1;
-
-        previous_match = Some(idx);
     }
 
-    assert_eq!(finder.iter(haystack).count(), count);
+    assert_eq!(finder.iter(haystack).collect::<Vec<_>>(), expected);
+    assert_eq!(finder.iter(haystack).count(), expected.len());
+
+    let mut start = 0;
+    for offset in expected {
+        assert_eq!(finder.find(&haystack[start..]), Some(offset - start));
+        start = offset + 1;
+    }
+    assert_eq!(finder.find(&haystack[start..]), None);
 }
 
 fn finder_for_byte_set(allow_simd: bool, byte_set: &ByteSet) -> memchr_n::MemchrN {
@@ -52,5 +50,12 @@ fn finder_for_byte_set(allow_simd: bool, byte_set: &ByteSet) -> memchr_n::Memchr
             chunk &= chunk - 1;
         }
     }
-    memchr_n::MemchrN::new_with_backend(&bytes, if allow_simd { Backend::Auto } else { Backend::Swar })
+    memchr_n::MemchrN::new_with_backend(
+        &bytes,
+        if allow_simd {
+            Backend::Auto
+        } else {
+            Backend::Swar
+        },
+    )
 }
