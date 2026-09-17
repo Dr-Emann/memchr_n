@@ -228,6 +228,7 @@ impl FromIterator<u8> for MemchrN {
 /// let matches: Iter<'_> = finder.iter(b"hello");
 /// assert_eq!(matches.collect::<Vec<_>>(), vec![1, 4]);
 /// ```
+#[derive(Clone, Debug)]
 pub struct Iter<'a> {
     finder: &'a MemchrN,
     state: IterState<'a>,
@@ -236,6 +237,7 @@ pub struct Iter<'a> {
 
 type MatchedBitset = u128;
 
+#[derive(Clone, Debug)]
 struct IterState<'a> {
     haystack: &'a [u8],
     scan_offset: usize,
@@ -319,6 +321,8 @@ impl<'a> Iterator for Iter<'a> {
         Some(self.take_lowest())
     }
 }
+
+impl core::iter::FusedIterator for Iter<'_> {}
 
 #[derive(Copy, Clone, Debug)]
 enum Engine {
