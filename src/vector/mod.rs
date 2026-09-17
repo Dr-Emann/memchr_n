@@ -377,6 +377,7 @@ fn staged_ends_bits<S: Simd, K: Kernel>(
         2..4 => ([ends::<2>(short_haystack), 0], 2),
         0..2 => ([ends::<1>(short_haystack), 0], 1),
     };
+    let words = [words[0].to_le(), words[1].to_le()];
     let ends: u8x16<S> = u64x2::load_array(simd, words).bitcast();
     (kernel.matches(ends).to_bitmask(), staged_len)
 }
@@ -532,5 +533,32 @@ pub(crate) fn scan_ops<S: Simd, K: Kernel>(simd: S) -> &'static ScanOps {
         next_match_batch: next_match_batch_impl::<S, K>,
         count_all: count_all_impl::<S, K>,
         first_match: first_match_impl::<S, K>,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_short_inputs_preserve_offsets() {
+        fn check<S: Simd>(simd: S) {
+            for needle in [0, b'x', u8::MAX] {
+                let kernel = kernels::AnyOf::new([needle]);
+                for len in 1..BLOCK_BYTES {
+                    let mut haystack = vec![needle.wrapping_add(1); len];
+                    assert_eq!(short_tail_bits(simd, &kernel, &haystack), 0);
+                    assert_eq!(first_match_short(simd, &haystack, &kernel), None);
+                    for offset in 0..len {
+                        haystack[offset] = needle;
+                        assert_eq!(short_tail_bits(simd, &kernel, &haystack), 1 << offset);
+                        assert_eq!(first_match_short(simd, &haystack, &kernel), Some(offset));
+                        haystack[offset] = needle.wrapping_add(1);
+                    }
+                }
+            }
+        }
+
+        fearless_simd::dispatch!(Level::new(), simd => check(simd));
     }
 }
