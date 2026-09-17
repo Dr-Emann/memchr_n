@@ -65,6 +65,19 @@ impl ByteSet {
         self.0[table_index] & (1 << bit_index) != 0
     }
 
+    /// Returns the set as a 16-by-16 bit matrix indexed by high and low nibble.
+    ///
+    /// Bit `lo` of `rows[hi]` is set exactly when the byte `(hi << 4) | lo` is a member.
+    /// Each row occupies two consecutive storage bytes; little-endian decoding keeps
+    /// low nibbles 0 through 7 in the low byte and 8 through 15 in the high byte.
+    pub(crate) fn nibble_rows(&self) -> [u16; 16] {
+        let mut rows = [0; 16];
+        for (hi, row) in rows.iter_mut().enumerate() {
+            *row = u16::from_le_bytes([self.0[hi * 2], self.0[hi * 2 + 1]]);
+        }
+        rows
+    }
+
     pub(crate) fn excluded_byte(&self) -> Option<u8> {
         let mut excluded = None;
         for i in 0..TABLE_BYTES / 8 {

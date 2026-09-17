@@ -137,7 +137,8 @@ impl Kernel for SmallSet {
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        // A shared bit means both nibbles came from the same set member.
+        // Each bit represents a group containing every combination of its high and
+        // low nibbles, so a shared bit proves this byte belongs to the set.
         let lo = self.lo_lookup.0[usize::from(byte & 0x0F)];
         let hi = self.hi_lookup.0[usize::from(byte >> 4)];
         lo & hi != 0
