@@ -1,0 +1,22 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.1](https://github.com/Dr-Emann/memchr_n/compare/v0.1.0...v0.1.1) - 2026-09-17
+
+### Added
+- Add Clone, Debug, and FusedIterator for Iter (by @Dr-Emann)
+
+### Fixed
+- Select SWAR automatically when SIMD is unavailable (by @Dr-Emann)
+- Preserve byte order when staging short vector inputs (by @Dr-Emann)
+- Preserve byte order in SWAR bitset lookup (by @Dr-Emann)
+
+### Other
+- Centralize the SearchPlan invariant (by @Dr-Emann)
+- Lower MSRV to Rust 1.89 (by @Dr-Emann)
