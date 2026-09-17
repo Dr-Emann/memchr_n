@@ -6,10 +6,12 @@ mod search;
 mod swar;
 mod vector;
 
-use crate::bitset::{ByteRange, ByteSet};
+use crate::bitset::{ByteRange, inclusive_range};
 use crate::search::{BitsetLookup, FixedNibble, FixedNibbleTable, NibbleLookup, SearchPlan};
 use core::fmt;
-use core::ops::{Bound, RangeBounds};
+use core::ops::RangeBounds;
+
+pub use bitset::ByteSet;
 
 #[cfg(feature = "manual_level")]
 pub use fearless_simd::Level;
@@ -91,7 +93,75 @@ impl MemchrN {
     /// assert_eq!(finder.find(b"well, hello!"), Some(11));
     /// ```
     pub fn new_with_backend(bytes: &[u8], backend: Backend) -> Self {
-        Self::from_set(ByteSet::from_bytes(bytes), backend)
+        Self::from_byte_set_with_backend(ByteSet::from_bytes(bytes), backend)
+    }
+
+    /// Builds a searcher for the members of `set` using the best supported kernels.
+    ///
+    /// A [`ByteSet`] describes any set of byte values, so this is the most general way to build a
+    /// searcher. An empty set never matches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memchr_n::{ByteSet, MemchrN};
+    ///
+    /// let mut set = ByteSet::from_bytes(b"_");
+    /// set.add_range(b'a'..=b'z');
+    ///
+    /// let finder = MemchrN::from_byte_set(set);
+    /// assert_eq!(finder.find(b"  x"), Some(2));
+    /// ```
+    #[inline]
+    pub fn from_byte_set(set: ByteSet) -> Self {
+        Self::from_byte_set_with_backend(set, Backend::Auto)
+    }
+
+    /// Builds a searcher for the members of `set` using `backend`.
+    ///
+    /// An empty set never matches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memchr_n::{Backend, ByteSet, MemchrN};
+    ///
+    /// let mut set = ByteSet::full();
+    /// set.remove_range(b'a'..=b'z');
+    ///
+    /// let finder = MemchrN::from_byte_set_with_backend(set, Backend::Swar);
+    /// assert_eq!(finder.find(b"hello world"), Some(5));
+    /// ```
+    pub fn from_byte_set_with_backend(set: ByteSet, backend: Backend) -> Self {
+        const MEMBERS_MAX: usize = 16;
+
+        let engine = backend.engine();
+        let mut members = [0; MEMBERS_MAX];
+        let Some(count) = set.write_members(&mut members) else {
+            if let Some(byte) = set.excluded_byte() {
+                return Self::of_not_byte(engine, byte);
+            }
+            // Ranges remain cheap even when too large for a named-member kernel.
+            if let Some(range) = set.as_contiguous_range() {
+                return Self::of_range(engine, range);
+            }
+            return Self::of_small_set(engine, &set)
+                .unwrap_or_else(|| Self::of_bitset_lookup(engine, set));
+        };
+
+        let members = &members[..usize::from(count)];
+        match *members {
+            [] => Self::of_never(),
+            [first] => Self::of_needles(engine, [first]),
+            [first, second] => Self::of_needles(engine, [first, second]),
+            [first, second, third] => Self::of_needles(engine, [first, second, third]),
+            [start, .., last] if usize::from(last - start) + 1 == members.len() => {
+                Self::of_range(engine, ByteRange { start, last })
+            }
+            _ => Self::of_fixed_nibble_set(engine, members)
+                .or_else(|| Self::of_small_set(engine, &set))
+                .unwrap_or_else(|| Self::of_bitset_lookup(engine, set)),
+        }
     }
 
     /// Builds a searcher for every byte except `byte` using the best supported kernels.
@@ -155,9 +225,9 @@ impl MemchrN {
     pub fn from_range_with_backend(range: impl RangeBounds<u8>, backend: Backend) -> Self {
         let mut set = ByteSet::new();
         if let Some(range) = inclusive_range(range) {
-            set.add_range(range);
+            set.add_byte_range(range);
         }
-        Self::from_set(set, backend)
+        Self::from_byte_set_with_backend(set, backend)
     }
 
     /// Returns the offset of the first matching byte in `haystack`.
@@ -206,7 +276,7 @@ impl MemchrN {
 
 impl FromIterator<u8> for MemchrN {
     fn from_iter<T: IntoIterator<Item = u8>>(iter: T) -> Self {
-        Self::from_set(ByteSet::from_iter(iter), Backend::Auto)
+        Self::from_byte_set(ByteSet::from_iter(iter))
     }
 }
 
@@ -390,38 +460,6 @@ impl Engine {
 }
 
 impl MemchrN {
-    fn from_set(set: ByteSet, backend: Backend) -> Self {
-        const MEMBERS_MAX: usize = 16;
-
-        let engine = backend.engine();
-        let mut members = [0; MEMBERS_MAX];
-        if let Some(count) = set.write_members(&mut members) {
-            let members = &members[..usize::from(count)];
-
-            match *members {
-                [] => Self::of_never(),
-                [first] => Self::of_needles(engine, [first]),
-                [first, second] => Self::of_needles(engine, [first, second]),
-                [first, second, third] => Self::of_needles(engine, [first, second, third]),
-                [start, .., last] if usize::from(last - start) + 1 == members.len() => {
-                    Self::of_range(engine, ByteRange { start, last })
-                }
-                _ => Self::of_fixed_nibble_set(engine, members)
-                    .or_else(|| Self::of_small_set(engine, &set))
-                    .unwrap_or_else(|| Self::of_bitset_lookup(engine, set)),
-            }
-        } else {
-            if let Some(byte) = set.excluded_byte() {
-                return Self::of_not_byte(engine, byte);
-            }
-            // Ranges remain cheap even when too large for a named-member kernel.
-            if let Some(range) = set.as_contiguous_range() {
-                return Self::of_range(engine, range);
-            }
-            Self::of_small_set(engine, &set).unwrap_or_else(|| Self::of_bitset_lookup(engine, set))
-        }
-    }
-
     fn of_needles<const N: usize>(engine: Engine, needles: [u8; N]) -> Self
     where
         swar::kernels::AnyOf<N>: swar::Kernel,
@@ -497,23 +535,6 @@ impl MemchrN {
             search: SearchPlan::never(),
         }
     }
-}
-
-fn inclusive_range(range: impl RangeBounds<u8>) -> Option<ByteRange> {
-    let start = match range.start_bound() {
-        Bound::Included(start) => *start,
-        Bound::Excluded(start) => start.checked_add(1)?,
-        Bound::Unbounded => u8::MIN,
-    };
-    let last = match range.end_bound() {
-        Bound::Included(last) => *last,
-        Bound::Excluded(last) => last.checked_sub(1)?,
-        Bound::Unbounded => u8::MAX,
-    };
-    if start > last {
-        return None;
-    }
-    Some(ByteRange { start, last })
 }
 
 /// Builds exact membership lookups for [`vector::kernels::SmallSet`], in low/high order.
@@ -646,6 +667,7 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::ops::Bound;
 
     // Construction is cheap enough to use per search, so keep the value within one cache line.
     #[test]
@@ -695,7 +717,10 @@ mod tests {
 
         let byte_set = ByteSet::from_bytes(&DIAGONAL_SET);
         assert!(extract_nibble_lookups(&byte_set).is_none());
-        let debug = format!("{:?}", MemchrN::from_set(byte_set, Backend::Auto));
+        let debug = format!(
+            "{:?}",
+            MemchrN::from_byte_set_with_backend(byte_set, Backend::Auto)
+        );
         assert!(debug.contains("BitsetLookup"), "{debug}");
     }
 
@@ -831,11 +856,11 @@ mod tests {
     }
 
     #[test]
-    fn add_range_matches_adding_each_byte() {
+    fn add_byte_range_matches_adding_each_byte() {
         for start in 0..=u8::MAX {
             for last in start..=u8::MAX {
                 let mut ranged = ByteSet::new();
-                ranged.add_range(ByteRange { start, last });
+                ranged.add_byte_range(ByteRange { start, last });
 
                 let mut one_at_a_time = ByteSet::new();
                 for byte in start..=last {
@@ -848,16 +873,16 @@ mod tests {
     }
 
     #[test]
-    fn add_range_of_empty_range_adds_nothing() {
+    fn add_byte_range_of_empty_range_adds_nothing() {
         let mut set = ByteSet::from_bytes(b"abc");
         let before = set;
-        set.add_range(ByteRange { start: 10, last: 9 });
+        set.add_byte_range(ByteRange { start: 10, last: 9 });
         assert_eq!(set, before);
     }
 
     fn members(set: &ByteSet) -> Vec<u8> {
         let all: Vec<u8> = (0..=u8::MAX).collect();
-        MemchrN::from_set(*set, Backend::Auto)
+        MemchrN::from_byte_set_with_backend(*set, Backend::Auto)
             .iter(&all)
             .map(|offset| all[offset])
             .collect()
@@ -868,8 +893,11 @@ mod tests {
         assert_eq!(members(bulk), members(one_at_a_time), "{case}");
         for backend in [Backend::Auto, Backend::Swar] {
             assert_eq!(
-                format!("{:?}", MemchrN::from_set(*bulk, backend)),
-                format!("{:?}", MemchrN::from_set(*one_at_a_time, backend)),
+                format!("{:?}", MemchrN::from_byte_set_with_backend(*bulk, backend)),
+                format!(
+                    "{:?}",
+                    MemchrN::from_byte_set_with_backend(*one_at_a_time, backend)
+                ),
                 "{case} on {backend:?}"
             );
         }
@@ -916,7 +944,7 @@ mod tests {
         for seed in seeds {
             for (start, last) in [(0u8, 255u8), (0x80, 0xFF), (10, 40), (100, 124), (60, 200)] {
                 let mut ranged = ByteSet::from_bytes(seed);
-                ranged.add_range(ByteRange { start, last });
+                ranged.add_byte_range(ByteRange { start, last });
 
                 let mut one_at_a_time = ByteSet::from_bytes(seed);
                 for byte in start..=last {
@@ -929,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn add_two_ranges_matches_adding_each_byte() {
+    fn add_two_byte_ranges_matches_adding_each_byte() {
         // Includes bitset word boundaries and both ends of the byte domain.
         let bounds = [0u8, 1, 7, 23, 24, 25, 63, 64, 127, 128, 200, 254, 255];
         for &first_start in &bounds {
@@ -937,11 +965,11 @@ mod tests {
                 for &second_start in &bounds {
                     for &second_last in bounds.iter().filter(|&&b| b >= second_start) {
                         let mut ranged = ByteSet::new();
-                        ranged.add_range(ByteRange {
+                        ranged.add_byte_range(ByteRange {
                             start: first_start,
                             last: first_last,
                         });
-                        ranged.add_range(ByteRange {
+                        ranged.add_byte_range(ByteRange {
                             start: second_start,
                             last: second_last,
                         });
@@ -967,7 +995,7 @@ mod tests {
     #[test]
     fn add_keeps_a_byte_disjoint_from_an_existing_range() {
         let mut set = ByteSet::new();
-        set.add_range(ByteRange {
+        set.add_byte_range(ByteRange {
             start: 0,
             last: 100,
         });
@@ -976,16 +1004,85 @@ mod tests {
     }
 
     #[test]
-    fn add_range_works_in_const_context() {
+    fn add_byte_range_works_in_const_context() {
         const DIGITS: ByteSet = {
             let mut set = ByteSet::new();
-            set.add_range(ByteRange {
+            set.add_byte_range(ByteRange {
                 start: b'0',
                 last: b'9',
             });
             set
         };
         assert_eq!(members(&DIGITS), b"0123456789");
+    }
+
+    #[track_caller]
+    fn assert_same_finder(built: &MemchrN, expected: &MemchrN, case: &str) {
+        let all: Vec<u8> = (0..=u8::MAX).collect();
+        assert_eq!(
+            built.iter(&all).collect::<Vec<_>>(),
+            expected.iter(&all).collect::<Vec<_>>(),
+            "{case}"
+        );
+        // Equal members alone would miss representation-selection regressions.
+        assert_eq!(format!("{built:?}"), format!("{expected:?}"), "{case}");
+    }
+
+    #[test]
+    fn from_byte_set_matches_the_dedicated_constructors() {
+        let mut vowels = ByteSet::new();
+        for &byte in b"aeiou" {
+            vowels.add(byte);
+        }
+        let mut digits = ByteSet::new();
+        digits.add_range(b'0'..=b'9');
+        let mut not_dot = ByteSet::from_bytes(b".");
+        not_dot.invert();
+        let mut printable = ByteSet::full();
+        printable.remove_range(0..=b' ' - 1);
+        printable.remove(0x7F);
+        printable.remove_range(0x80..=0xFF);
+
+        assert_same_finder(
+            &MemchrN::from_byte_set(vowels),
+            &MemchrN::new(b"aeiou"),
+            "list",
+        );
+        assert_same_finder(
+            &MemchrN::from_byte_set(digits),
+            &MemchrN::from_range(b'0'..=b'9'),
+            "range",
+        );
+        assert_same_finder(
+            &MemchrN::from_byte_set(not_dot),
+            &MemchrN::from_not_byte(b'.'),
+            "complement",
+        );
+        assert_same_finder(
+            &MemchrN::from_byte_set(printable),
+            &MemchrN::from_range(b' '..0x7F),
+            "range carved out of a full set",
+        );
+        assert_same_finder(
+            &MemchrN::from_byte_set(ByteSet::new()),
+            &MemchrN::new(b""),
+            "empty",
+        );
+    }
+
+    #[test]
+    fn from_byte_set_honors_the_backend() {
+        let mut set = ByteSet::new();
+        set.add_range(b'a'..=b'f');
+        set.add_range(b'0'..=b'9');
+
+        for backend in [Backend::Auto, Backend::Swar] {
+            assert_same_finder(
+                &MemchrN::from_byte_set_with_backend(set, backend),
+                &MemchrN::new_with_backend(b"0123456789abcdef", backend),
+                &format!("{backend:?}"),
+            );
+        }
     }
 
     fn build_word(bytes: &[u8]) -> MemchrN {
