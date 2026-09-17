@@ -232,6 +232,10 @@ pub struct Iter<'a> {
 
 type MatchedBitset = u128;
 
+/// A haystack and the window of it covered by the current match batch.
+///
+/// The batch spans `match_base..scan_offset`, which is never wider than a [`MatchedBitset`], so
+/// any offset below `scan_offset` is reachable as a shift of the bitset.
 #[derive(Clone, Debug)]
 struct IterState<'a> {
     haystack: &'a [u8],
@@ -240,12 +244,43 @@ struct IterState<'a> {
 }
 
 impl<'a> Iter<'a> {
+    /// Discards remaining matches before the byte offset `idx`.
+    ///
+    /// The next call to [`next`](Iterator::next) yields the first remaining match
+    /// at or after `idx`. An index at or before the last yielded offset has no
+    /// effect, and advancing never rewinds the iterator. An index at or beyond
+    /// the haystack length exhausts the iterator.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memchr_n::MemchrN;
+    ///
+    /// let finder = MemchrN::new(b"aeiou");
+    /// let mut matches = finder.iter(b"hello world");
+    /// assert_eq!(matches.next(), Some(1));
+    /// matches.advance_to(4);
+    /// assert_eq!(matches.next(), Some(4));
+    /// matches.advance_to(1);
+    /// assert_eq!(matches.next(), Some(7));
+    /// ```
+    #[inline]
+    pub fn advance_to(&mut self, idx: usize) {
+        if idx >= self.state.scan_offset {
+            self.match_bits = 0;
+            self.state.scan_offset = idx.min(self.state.haystack.len());
+            self.state.match_base = self.state.scan_offset;
+        } else if idx > self.state.match_base {
+            self.match_bits &= MatchedBitset::MAX << (idx - self.state.match_base);
+        }
+    }
+
     #[inline]
     fn refill(&mut self) -> Option<()> {
         if self.state.scan_offset == self.state.haystack.len() {
             return None;
         }
-        // SAFETY: `scan_offset` only ever moves to an offset a scan reached, so it is in bounds.
+        // SAFETY: scans and `advance_to` keep `scan_offset` within the haystack length.
         self.match_bits = unsafe { self.finder.search.next_match_batch(&mut self.state) };
         (self.match_bits != 0).then_some(())
     }
@@ -279,7 +314,7 @@ impl<'a> Iterator for Iter<'a> {
 
     fn count(self) -> usize {
         let mut total = self.match_bits.count_ones() as usize;
-        // SAFETY: `scan_offset` only ever moves to an offset a scan reached, so it is in bounds.
+        // SAFETY: scans and `advance_to` keep `scan_offset` within the haystack length.
         let unscanned = unsafe { self.state.haystack.get_unchecked(self.state.scan_offset..) };
         if !unscanned.is_empty() {
             total += self.finder.search.count_all(unscanned);
@@ -876,6 +911,76 @@ mod tests {
                     "{len}"
                 );
                 assert_eq!(searcher.iter(&haystack).count(), len, "{len}");
+            }
+        }
+    }
+
+    #[test]
+    fn advance_to_preserves_matches_at_and_after_the_index() {
+        for backend in [Backend::Auto, Backend::Swar] {
+            let finder = MemchrN::new_with_backend(b"x", backend);
+            for len in [0, 1, 7, 8, 15, 16, 17, 63, 64, 65, 127, 128, 129, 257] {
+                let haystack = vec![b'x'; len];
+                for consumed in 0..=len {
+                    let mut iter = finder.iter(&haystack);
+                    for offset in 0..consumed {
+                        assert_eq!(iter.next(), Some(offset));
+                    }
+                    for idx in 0..=len + 1 {
+                        let mut iter = iter.clone();
+                        iter.advance_to(idx);
+                        let start = consumed.max(idx).min(len);
+                        assert_eq!(iter.clone().count(), len - start);
+                        let (min, max) = iter.size_hint();
+                        assert!(min <= len - start);
+                        assert!(max.unwrap() >= len - start);
+                        for expected in start..len {
+                            assert_eq!(iter.next(), Some(expected));
+                        }
+                        assert_eq!(iter.next(), None);
+                        iter.advance_to(0);
+                        assert_eq!(iter.next(), None);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_advance_to_matches_naive() {
+        for set in sets() {
+            for backend in [Backend::Auto, Backend::Swar] {
+                let finder = MemchrN::new_with_backend(&set, backend);
+                let haystack = haystack(1000);
+                let expected = naive(&set, &haystack);
+                let mut position = 0;
+                let mut iter = finder.iter(&haystack);
+                for idx in [
+                    0,
+                    17,
+                    3,
+                    17,
+                    64,
+                    127,
+                    128,
+                    129,
+                    400,
+                    256,
+                    999,
+                    usize::MAX,
+                    0,
+                ] {
+                    iter.advance_to(idx);
+                    while position < expected.len() && expected[position] < idx {
+                        position += 1;
+                    }
+                    assert_eq!(iter.clone().count(), expected.len() - position);
+                    iter.advance_to(0);
+                    assert_eq!(iter.next(), expected.get(position).copied());
+                    position = (position + 1).min(expected.len());
+                    assert_eq!(iter.nth(1), expected.get(position + 1).copied());
+                    position = (position + 2).min(expected.len());
+                }
             }
         }
     }

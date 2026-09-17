@@ -80,7 +80,11 @@ impl SearchPlan {
         debug_assert!(state.scan_offset <= state.haystack.len());
         // SAFETY: the constructors pair `scan_ops` with the kernel in `kernel_storage` and with a
         // SIMD level this target supports; the caller guarantees the scan offset is in bounds.
-        unsafe { (self.scan_ops.next_match_batch)(&self.kernel_storage, state) }
+        let bits = unsafe { (self.scan_ops.next_match_batch)(&self.kernel_storage, state) };
+        debug_assert!(state.scan_offset <= state.haystack.len());
+        debug_assert!(state.match_base <= state.haystack.len());
+        debug_assert!(state.scan_offset - state.match_base <= MatchedBitset::BITS as usize);
+        bits
     }
 }
 
@@ -231,6 +235,7 @@ pub(crate) struct ScanOps {
 fn never_scan_ops() -> &'static ScanOps {
     fn next_match_batch(_data: &KernelStorage, state: &mut IterState<'_>) -> MatchedBitset {
         state.scan_offset = state.haystack.len();
+        state.match_base = state.scan_offset;
         0
     }
 

@@ -27,6 +27,11 @@ There are two main things you can do with a [`MemchrN`]:
 - [`MemchrN::iter`] returns an iterator which iterates over the positions of every byte in a haystack that belongs
   to the set.
 
+The [`Iter`] returned by [`MemchrN::iter`] can also be skipped forward with [`Iter::advance_to`], which discards
+the matches before a byte offset. This is cheaper than calling `next` until the offset is reached: if the offset
+falls within the batch of matches already found, it simply drops those matches, and otherwise it restarts the
+search at that offset without examining the bytes in between.
+
 ## Performance
 
 `memchr-n` manages to generally be faster than [`memchr`] for the same number of needles, despite supporting any
