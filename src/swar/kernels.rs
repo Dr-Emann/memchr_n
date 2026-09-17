@@ -124,7 +124,7 @@ impl Kernel for BitsetLookup {
     #[inline]
     fn matches(&self, word: u64) -> u64 {
         let mut marks = 0;
-        for (i, &byte) in word.to_ne_bytes().iter().enumerate() {
+        for (i, &byte) in word.to_le_bytes().iter().enumerate() {
             marks |= u64::from(self.matches_byte(byte)) << (i * 8 + 7);
         }
         marks
@@ -237,6 +237,9 @@ mod tests {
                     set.contains(&byte),
                     "{byte} in {set:?}"
                 );
+                for bytes in hazardous_words(byte) {
+                    assert_marks(&kernel, bytes, |byte| set.contains(&byte));
+                }
             }
         }
     }
