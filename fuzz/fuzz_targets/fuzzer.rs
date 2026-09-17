@@ -1,25 +1,22 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use memchr_n::Backend;
+use memchr_n::{Backend, ByteSet};
 
 fuzz_target!(|haystack: (bool, [u64; 4], &[u8])| {
     let (allow_simd, byte_set, haystack) = haystack;
-    target(allow_simd, ByteSet(byte_set), haystack);
+    target(allow_simd, byte_set, haystack);
 });
 
-struct ByteSet([u64; 4]);
+fn target(allow_simd: bool, words: [u64; 4], haystack: &[u8]) {
+    let byte_set = byte_set_from_words(words);
+    let backend = if allow_simd {
+        Backend::Auto
+    } else {
+        Backend::Swar
+    };
+    let finder = memchr_n::MemchrN::from_byte_set_with_backend(byte_set, backend);
 
-impl ByteSet {
-    fn contains(&self, byte: u8) -> bool {
-        let word_idx = byte / 64;
-        let bit_idx = byte % 64;
-        (self.0[word_idx as usize] & (1 << bit_idx)) != 0
-    }
-}
-
-fn target(allow_simd: bool, byte_set: ByteSet, haystack: &[u8]) {
-    let finder = finder_for_byte_set(allow_simd, &byte_set);
     let mut expected = Vec::new();
     for (offset, &byte) in haystack.iter().enumerate() {
         if byte_set.contains(byte) {
@@ -38,24 +35,14 @@ fn target(allow_simd: bool, byte_set: ByteSet, haystack: &[u8]) {
     assert_eq!(finder.find(&haystack[start..]), None);
 }
 
-fn finder_for_byte_set(allow_simd: bool, byte_set: &ByteSet) -> memchr_n::MemchrN {
-    let mut bytes = Vec::new();
-    for (i, mut chunk) in byte_set.0.iter().copied().enumerate() {
+fn byte_set_from_words(words: [u64; 4]) -> ByteSet {
+    let mut byte_set = ByteSet::new();
+    for (i, mut word) in words.into_iter().enumerate() {
         let base = (i * 64) as u8;
-        while chunk != 0 {
-            let bit = chunk.trailing_zeros() as u8;
-
-            bytes.push(base + bit);
-
-            chunk &= chunk - 1;
+        while word != 0 {
+            byte_set.add(base + word.trailing_zeros() as u8);
+            word &= word - 1;
         }
     }
-    memchr_n::MemchrN::new_with_backend(
-        &bytes,
-        if allow_simd {
-            Backend::Auto
-        } else {
-            Backend::Swar
-        },
-    )
+    byte_set
 }

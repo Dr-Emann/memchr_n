@@ -16,6 +16,37 @@ The [`MemchrN`] type is the entrypoint of the library. It offers a few means of 
 - [`MemchrN::from_range`] creates a new `MemchrN` which will match any byte in the given range.
 - [`MemchrN::from_iter`] (also usable as `collection.collect()`) creates a new `MemchrN` from an
   arbitrary iterator of bytes.
+- [`MemchrN::from_byte_set`] creates a new `MemchrN` from a [`ByteSet`], which describes an arbitrary
+  set of byte values.
+
+A [`ByteSet`] is built up a byte, a range, or a slice at a time, and sets combine with the bit
+operators (`|`, `&`, `^`, `-`, and `!`), so it can describe sets the other constructors cannot.
+Every `ByteSet` method is usable in a `const` context, so a set can be built once as a `const`:
+
+```rust
+use memchr_n::{ByteSet, MemchrN};
+
+const NOT_IDENTIFIER: ByteSet = {
+    let mut set = ByteSet::from_bytes(b"_");
+    set.add_range(b'0'..=b'9');
+    set.add_range(b'a'..=b'z');
+    set.add_range(b'A'..=b'Z');
+    set.invert();
+    set
+};
+
+let finder = MemchrN::from_byte_set(NOT_IDENTIFIER);
+assert_eq!(finder.find(b"some_name(x)"), Some(9));
+
+let mut hex = ByteSet::new();
+hex.add_range(b'0'..=b'9');
+hex.add_range(b'a'..=b'f');
+let mut lower = ByteSet::new();
+lower.add_range(b'a'..=b'z');
+
+let finder = MemchrN::from_byte_set(lower - hex);
+assert_eq!(finder.find(b"deadbeef zoo"), Some(9));
+```
 
 Creating a [`MemchrN`] does the work of identifying the optimal way to search for that set of bytes:
 constructing a [`MemchrN`] is somewhat expensive. Once a [`MemchrN`] is created, it should be reused,
