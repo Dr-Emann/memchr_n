@@ -4,8 +4,8 @@
 
 pub(crate) mod kernels;
 
-use crate::search::StoredKernel;
-use crate::{IterState, KernelStorage, MatchedBitset, ScanOps};
+use crate::search::{KernelStorage, ScanOps, StoredKernel};
+use crate::{IterState, MatchedBitset};
 
 const WORD_BYTES: usize = 8;
 

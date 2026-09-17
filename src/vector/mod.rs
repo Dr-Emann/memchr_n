@@ -1,7 +1,7 @@
 pub(crate) mod kernels;
 
-use crate::search::StoredKernel;
-use crate::{IterState, KernelStorage, MatchedBitset, ScanOps};
+use crate::search::{KernelStorage, ScanOps, StoredKernel};
+use crate::{IterState, MatchedBitset};
 use core::mem::transmute_copy;
 use fearless_simd::prelude::*;
 use fearless_simd::{Level, i8x16, i8x64, kernel, u8x16, u8x32, u8x64, u64x2};
