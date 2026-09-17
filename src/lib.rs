@@ -6,14 +6,13 @@ mod search;
 mod swar;
 mod vector;
 
-use crate::bitset::ByteSet;
+use crate::bitset::{ByteRange, ByteSet};
 use crate::search::{
     BitsetLookup, FixedNibble, FixedNibbleTable, KernelKind, KernelStorage, NibbleLookup, ScanOps,
     SearchPlan, never_scan_ops,
 };
 use core::fmt;
 use core::ops::{Bound, RangeBounds};
-use core::range::RangeInclusive;
 use fearless_simd::dispatch;
 
 #[cfg(feature = "manual_level")]
@@ -369,7 +368,7 @@ impl MemchrN {
                 [first, second] => Self::of_needles(engine, [first, second]),
                 [first, second, third] => Self::of_needles(engine, [first, second, third]),
                 [start, .., last] if usize::from(last - start) + 1 == members.len() => {
-                    Self::of_range(engine, RangeInclusive { start, last })
+                    Self::of_range(engine, ByteRange { start, last })
                 }
                 _ => Self::of_small_set(engine, members)
                     .or_else(|| Self::of_fixed_nibble_set(engine, members))
@@ -439,7 +438,7 @@ impl MemchrN {
         }
     }
 
-    fn of_range(engine: Engine, range: RangeInclusive<u8>) -> Self {
+    fn of_range(engine: Engine, range: ByteRange) -> Self {
         let kernel_kind = KernelKind::OneRange;
         match engine {
             Engine::Vector(level) => Self {
@@ -541,27 +540,21 @@ impl MemchrN {
     }
 }
 
-fn inclusive_range(range: impl RangeBounds<u8>) -> Option<RangeInclusive<u8>> {
+fn inclusive_range(range: impl RangeBounds<u8>) -> Option<ByteRange> {
     let start = match range.start_bound() {
-        Bound::Included(start) => Some(*start),
-        Bound::Excluded(start) => start.checked_add(1),
-        Bound::Unbounded => Some(u8::MIN),
+        Bound::Included(start) => *start,
+        Bound::Excluded(start) => start.checked_add(1)?,
+        Bound::Unbounded => u8::MIN,
     };
     let last = match range.end_bound() {
-        Bound::Included(last) => Some(*last),
-        Bound::Excluded(last) => last.checked_sub(1),
-        Bound::Unbounded => Some(u8::MAX),
-    };
-    let Some(start) = start else {
-        return None;
-    };
-    let Some(last) = last else {
-        return None;
+        Bound::Included(last) => *last,
+        Bound::Excluded(last) => last.checked_sub(1)?,
+        Bound::Unbounded => u8::MAX,
     };
     if start > last {
         return None;
     }
-    Some(RangeInclusive { start, last })
+    Some(ByteRange { start, last })
 }
 
 fn extract_fixed_nibble_table(items: &[u8]) -> Option<FixedNibbleTable> {
@@ -683,7 +676,7 @@ mod tests {
         for start in 0..=u8::MAX {
             for last in start..=u8::MAX {
                 let mut ranged = ByteSet::new();
-                ranged.add_range(RangeInclusive { start, last });
+                ranged.add_range(ByteRange { start, last });
 
                 let mut one_at_a_time = ByteSet::new();
                 for byte in start..=last {
@@ -699,7 +692,7 @@ mod tests {
     fn add_range_of_empty_range_adds_nothing() {
         let mut set = ByteSet::from_bytes(b"abc");
         let before = set;
-        set.add_range(RangeInclusive { start: 10, last: 9 });
+        set.add_range(ByteRange { start: 10, last: 9 });
         assert_eq!(set, before);
     }
 
@@ -764,7 +757,7 @@ mod tests {
         for seed in seeds {
             for (start, last) in [(0u8, 255u8), (0x80, 0xFF), (10, 40), (100, 124), (60, 200)] {
                 let mut ranged = ByteSet::from_bytes(seed);
-                ranged.add_range(RangeInclusive { start, last });
+                ranged.add_range(ByteRange { start, last });
 
                 let mut one_at_a_time = ByteSet::from_bytes(seed);
                 for byte in start..=last {
@@ -785,11 +778,11 @@ mod tests {
                 for &second_start in &bounds {
                     for &second_last in bounds.iter().filter(|&&b| b >= second_start) {
                         let mut ranged = ByteSet::new();
-                        ranged.add_range(RangeInclusive {
+                        ranged.add_range(ByteRange {
                             start: first_start,
                             last: first_last,
                         });
-                        ranged.add_range(RangeInclusive {
+                        ranged.add_range(ByteRange {
                             start: second_start,
                             last: second_last,
                         });
@@ -815,7 +808,7 @@ mod tests {
     #[test]
     fn add_keeps_a_byte_disjoint_from_an_existing_range() {
         let mut set = ByteSet::new();
-        set.add_range(RangeInclusive {
+        set.add_range(ByteRange {
             start: 0,
             last: 100,
         });
@@ -827,7 +820,7 @@ mod tests {
     fn add_range_works_in_const_context() {
         const DIGITS: ByteSet = {
             let mut set = ByteSet::new();
-            set.add_range(RangeInclusive {
+            set.add_range(ByteRange {
                 start: b'0',
                 last: b'9',
             });

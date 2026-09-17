@@ -46,4 +46,8 @@ However, because `memchr-n` does use wider simd, there is a trade-off in latency
 mitigated by the `MemchrN::find` method, but for very early matches, or very small haystacks, `memchr-n` may still
 be slower than [`memchr`].
 
+## Minimum supported Rust version
+
+This crate requires Rust 1.89 or later.
+
 [`memchr`]: https://docs.rs/memchr

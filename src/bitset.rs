@@ -1,7 +1,11 @@
-use core::range::RangeInclusive;
-
 const TABLE_BITS: usize = 256;
 const TABLE_BYTES: usize = TABLE_BITS / u8::BITS as usize;
+
+#[derive(Copy, Clone)]
+pub(crate) struct ByteRange {
+    pub(crate) start: u8,
+    pub(crate) last: u8,
+}
 
 #[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub(crate) struct ByteSet([u8; TABLE_BYTES]);
@@ -32,8 +36,7 @@ impl ByteSet {
         self.0[table_index] |= mask;
     }
 
-    pub(crate) const fn add_range(&mut self, range: RangeInclusive<u8>) {
-        let RangeInclusive { start, last } = range;
+    pub(crate) const fn add_range(&mut self, ByteRange { start, last }: ByteRange) {
         if start > last {
             return;
         }
@@ -77,7 +80,7 @@ impl ByteSet {
         excluded
     }
 
-    pub(crate) const fn as_contiguous_range(&self) -> Option<RangeInclusive<u8>> {
+    pub(crate) const fn as_contiguous_range(&self) -> Option<ByteRange> {
         let mut first = None;
         let mut last = 0;
         let mut count = 0;
@@ -102,7 +105,7 @@ impl ByteSet {
         if count != last - first + 1 {
             return None;
         }
-        Some(RangeInclusive {
+        Some(ByteRange {
             start: first as u8,
             last: last as u8,
         })

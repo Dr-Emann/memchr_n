@@ -1,7 +1,7 @@
 use crate::BitsetLookup;
+use crate::bitset::ByteRange;
 use crate::search::StoredKernel;
 use crate::swar::{HIGH, Kernel, nonzero_bytes, splat};
-use core::range::RangeInclusive;
 
 #[derive(Copy, Clone)]
 pub(crate) struct AnyOf<const N: usize> {
@@ -86,8 +86,7 @@ pub(crate) struct OneRange {
 }
 
 impl OneRange {
-    pub(crate) fn new(range: RangeInclusive<u8>) -> Self {
-        let RangeInclusive { start, last } = range;
+    pub(crate) fn new(ByteRange { start, last }: ByteRange) -> Self {
         let span = last.wrapping_sub(start);
         let start = splat(start);
         Self {
@@ -191,7 +190,7 @@ mod tests {
     fn range_marks_boundaries_of_every_range() {
         for start in 0..=u8::MAX {
             for last in start..=u8::MAX {
-                let kernel = OneRange::new(RangeInclusive { start, last });
+                let kernel = OneRange::new(ByteRange { start, last });
                 let probes = [
                     0,
                     start.wrapping_sub(1),
@@ -212,7 +211,7 @@ mod tests {
         // Covers both sides of the high-bit split.
         let ranges = [(0, 9), (0x80, 0xFF), (0, 0xFF), (0x7F, 0x81), (0x41, 0x41)];
         for (start, last) in ranges {
-            let kernel = OneRange::new(RangeInclusive { start, last });
+            let kernel = OneRange::new(ByteRange { start, last });
             for byte in 0..=u8::MAX {
                 for bytes in hazardous_words(byte) {
                     assert_marks(&kernel, bytes, |b| start <= b && b <= last);

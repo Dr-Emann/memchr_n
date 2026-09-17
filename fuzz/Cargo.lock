@@ -29,7 +29,8 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "fearless_simd"
 version = "1.0.0-rc.1"
-source = "git+https://github.com/linebender/fearless_simd.git#dfae6d52c0ac339f50b84cfad75b7284236494db"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50a2d1ad65a201b433ff546990c72c804305bb2162f8c09707dd7f9125210b55"
 
 [[package]]
 name = "find-msvc-tools"

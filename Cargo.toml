@@ -2,8 +2,8 @@
 name = "memchr-n"
 version = "0.1.0"
 edition = "2024"
-# Required for `core::range::RangeInclusive`. We could go lower otherwise.
-rust-version = "1.95"
+# Matches the minimum supported Rust version of fearless_simd.
+rust-version = "1.89"
 authors = ["Zachary Dremann <dremann@gmail.com>"]
 description = "Fast SIMD-accelerated search and iteration over the bytes belonging to an arbitrary set of byte values"
 repository = "https://github.com/Dr-Emann/memchr_n"

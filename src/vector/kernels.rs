@@ -1,8 +1,7 @@
 use super::Kernel;
-use crate::bitset::ByteSet;
+use crate::bitset::{ByteRange, ByteSet};
 use crate::search::StoredKernel;
 use crate::{BitsetLookup, FixedNibble, FixedNibbleTable, NibbleLookup};
-use core::range::RangeInclusive;
 use fearless_simd::prelude::*;
 use fearless_simd::{u8x16, u8x32, u8x64};
 
@@ -82,8 +81,7 @@ pub(crate) struct OneRange {
 }
 
 impl OneRange {
-    pub(crate) fn new(range: RangeInclusive<u8>) -> Self {
-        let RangeInclusive { start, last } = range;
+    pub(crate) fn new(ByteRange { start, last }: ByteRange) -> Self {
         Self {
             splatted_start: [start; 16],
             splatted_last: [last; 16],
