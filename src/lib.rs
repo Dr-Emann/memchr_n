@@ -329,7 +329,14 @@ enum Engine {
 impl Backend {
     fn engine(self) -> Engine {
         match self {
-            Backend::Auto => Engine::Vector(Level::new()),
+            Backend::Auto => {
+                let level = Level::new();
+                if level.is_fallback() {
+                    Engine::Swar
+                } else {
+                    Engine::Vector(level)
+                }
+            }
             Backend::Swar => Engine::Swar,
             #[cfg(feature = "manual_level")]
             Backend::Level(level) => Engine::Vector(level),
@@ -617,6 +624,37 @@ mod tests {
     fn debug_names_the_chosen_kernel() {
         let debug = format!("{:?}", MemchrN::new(b"az"));
         assert!(debug.contains("TwoBytes"), "{debug}");
+    }
+
+    #[test]
+    fn auto_uses_swar_when_simd_is_unavailable() {
+        for finder in [
+            MemchrN::new(b"x"),
+            MemchrN::new(b"xy"),
+            MemchrN::new(b"xyz"),
+            MemchrN::from_range(b'0'..=b'9'),
+            MemchrN::from_not_byte(b'.'),
+        ] {
+            let uses_swar = match finder.search.engine {
+                Engine::Swar => true,
+                Engine::Vector(level) => {
+                    assert!(!level.is_fallback());
+                    false
+                }
+            };
+            assert_eq!(uses_swar, Level::new().is_fallback());
+        }
+    }
+
+    #[cfg(feature = "manual_level")]
+    #[test]
+    fn explicit_level_preserves_the_vector_engine() {
+        let level = Level::baseline();
+        let finder = MemchrN::new_with_backend(b"x", Backend::Level(level));
+        match finder.search.engine {
+            Engine::Vector(selected) => assert_eq!(selected.is_fallback(), level.is_fallback()),
+            Engine::Swar => panic!("explicit SIMD level was replaced with SWAR"),
+        }
     }
 
     #[test]
