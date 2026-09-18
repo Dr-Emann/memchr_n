@@ -59,7 +59,10 @@ impl SearchPlan {
     pub(crate) fn first_match(&self, haystack: &[u8]) -> Option<usize> {
         // SAFETY: the constructors pair `scan_ops` with the kernel in `kernel_storage` and with a
         // SIMD level this target supports.
-        unsafe { (self.scan_ops.first_match)(&self.kernel_storage, haystack) }
+        let res = unsafe { (self.scan_ops.first_match)(&self.kernel_storage, haystack) };
+        // SAFETY: `ScanOps::first_match` guarantees every returned offset is within `haystack`.
+        unsafe { core::hint::assert_unchecked(res.is_none_or(|idx| idx < haystack.len())) };
+        res
     }
 
     /// Counts the matching bytes in `haystack`.
@@ -67,7 +70,10 @@ impl SearchPlan {
     pub(crate) fn count_all(&self, haystack: &[u8]) -> usize {
         // SAFETY: the constructors pair `scan_ops` with the kernel in `kernel_storage` and with a
         // SIMD level this target supports.
-        unsafe { (self.scan_ops.count_all)(&self.kernel_storage, haystack) }
+        let res = unsafe { (self.scan_ops.count_all)(&self.kernel_storage, haystack) };
+        // SAFETY: `ScanOps::count_all` guarantees a count no greater than `haystack.len()`.
+        unsafe { core::hint::assert_unchecked(res <= haystack.len()) };
+        res
     }
 
     /// Scans from `state.scan_offset` until it finds matches or reaches the end.
@@ -78,9 +84,14 @@ impl SearchPlan {
     #[inline]
     pub(crate) unsafe fn next_match_batch(&self, state: &mut IterState<'_>) -> MatchedBitset {
         debug_assert!(state.scan_offset <= state.haystack.len());
+        let haystack_len = state.haystack.len();
         // SAFETY: the constructors pair `scan_ops` with the kernel in `kernel_storage` and with a
         // SIMD level this target supports; the caller guarantees the scan offset is in bounds.
         let bits = unsafe { (self.scan_ops.next_match_batch)(&self.kernel_storage, state) };
+        // The compiler doesn't know the haystack doesn't change when it's passed through the indirect call.
+        // by letting it know the length is unchanged, we can omit a bounds check for the caller.
+        // SAFETY: `ScanOps::next_match_batch` guarantees the haystack is unchanged.
+        unsafe { core::hint::assert_unchecked(state.haystack.len() == haystack_len) };
         debug_assert!(state.scan_offset <= state.haystack.len());
         debug_assert!(state.match_base <= state.haystack.len());
         debug_assert!(state.scan_offset - state.match_base <= MatchedBitset::BITS as usize);
@@ -225,11 +236,52 @@ impl NibbleLookup {
     }
 }
 
+/// Scan entry points whose result guarantees may be relied on by unsafe code.
+///
+/// Callers must supply the expected live kernel field and ensure target SIMD support.
+/// Implementors must uphold each operation's guarantees for any haystack, including empty ones.
 #[derive(Copy, Clone)]
 pub(crate) struct ScanOps {
-    pub(crate) next_match_batch: unsafe fn(&KernelStorage, &mut IterState<'_>) -> MatchedBitset,
-    pub(crate) count_all: unsafe fn(&KernelStorage, &[u8]) -> usize,
-    pub(crate) first_match: unsafe fn(&KernelStorage, &[u8]) -> Option<usize>,
+    /// Returns the next batch's matches as bits relative to `match_base`, or zero at exhaustion.
+    ///
+    /// Implementors must preserve the haystack, skip no matches, and advance `scan_offset`
+    /// unless already at the end. The updated bounds must satisfy
+    /// `old_scan_offset <= match_base <= scan_offset <= haystack.len()` and span at most
+    /// `MatchedBitset::BITS` bytes. Only matching bytes in that span may have set bits.
+    /// A zero result must leave `scan_offset == haystack.len()`.
+    ///
+    /// # Safety
+    ///
+    /// In addition to the shared requirements, callers must ensure `scan_offset <= haystack.len()`.
+    next_match_batch: unsafe fn(&KernelStorage, &mut IterState<'_>) -> MatchedBitset,
+
+    /// Returns the exact number of matching bytes, at most `haystack.len()`.
+    /// Callers need only satisfy the shared requirements.
+    count_all: unsafe fn(&KernelStorage, &[u8]) -> usize,
+
+    /// Returns the lowest matching index, strictly below `haystack.len()`, or `None` if absent.
+    /// Callers need only satisfy the shared requirements.
+    first_match: unsafe fn(&KernelStorage, &[u8]) -> Option<usize>,
+}
+
+impl ScanOps {
+    /// Creates a table of scan entry points.
+    ///
+    /// # Safety
+    ///
+    /// All entry points must use the same kernel and SIMD level and uphold the contracts of
+    /// [`Self::next_match_batch`], [`Self::count_all`], and [`Self::first_match`].
+    pub(crate) const unsafe fn new(
+        next_match_batch: unsafe fn(&KernelStorage, &mut IterState<'_>) -> MatchedBitset,
+        count_all: unsafe fn(&KernelStorage, &[u8]) -> usize,
+        first_match: unsafe fn(&KernelStorage, &[u8]) -> Option<usize>,
+    ) -> Self {
+        Self {
+            next_match_batch,
+            count_all,
+            first_match,
+        }
+    }
 }
 
 fn never_scan_ops() -> &'static ScanOps {
@@ -247,10 +299,9 @@ fn never_scan_ops() -> &'static ScanOps {
         None
     }
 
-    &ScanOps {
-        next_match_batch,
-        count_all,
-        first_match,
+    &const {
+        // SAFETY: these entry points never match or read the kernel; batches exhaust the haystack.
+        unsafe { ScanOps::new(next_match_batch, count_all, first_match) }
     }
 }
 
