@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/Dr-Emann/memchr_n/compare/v0.1.2...v0.1.3) - 2026-09-18
+
+### Added
+- Use grouped nibble lookups for larger byte sets ([#7](https://github.com/Dr-Emann/memchr_n/pull/7)) (by @Dr-Emann) - #7
+
+### Other
+- Eliminate bounds checks when indexing iterator results ([#8](https://github.com/Dr-Emann/memchr_n/pull/8)) (by @Dr-Emann) - #8
+
 ## [0.1.2](https://github.com/Dr-Emann/memchr_n/compare/v0.1.1...v0.1.2) - 2026-09-17
 
 ### Added
