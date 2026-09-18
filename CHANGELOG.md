@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/Dr-Emann/memchr_n/compare/v0.1.3...v0.1.4) - 2026-09-18
+
+### Added
+- Introduce a ByteSet which can build a set of bytes incrementally, and at const time (by @Dr-Emann) - #10
+
 ## [0.1.3](https://github.com/Dr-Emann/memchr_n/compare/v0.1.2...v0.1.3) - 2026-09-18
 
 ### Added
