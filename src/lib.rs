@@ -291,7 +291,13 @@ impl<'a> Iter<'a> {
 
         let bit = self.match_bits.trailing_zeros() as usize;
         self.match_bits &= self.match_bits - 1;
-        self.state.match_base + bit
+        let res = self.state.match_base + bit;
+
+        // SAFETY: callers ensure `match_bits` is nonzero. `ScanOps::next_match_batch` guarantees
+        // each set bit names an in-bounds byte relative to `match_base`; consuming or skipping
+        // matches only clears bits.
+        unsafe { core::hint::assert_unchecked(res < self.state.haystack.len()) };
+        res
     }
 }
 

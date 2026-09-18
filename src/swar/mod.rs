@@ -228,10 +228,9 @@ pub(crate) fn scan_ops<K: Kernel>() -> &'static ScanOps {
         self::first_match(haystack, kernel)
     }
 
-    &ScanOps {
-        next_match_batch: next_match_batch::<K>,
-        count_all: count_all::<K>,
-        first_match: first_match::<K>,
+    &const {
+        // SAFETY: all entry points use `K`; word scans and masked tails preserve the scan contracts.
+        unsafe { ScanOps::new(next_match_batch::<K>, count_all::<K>, first_match::<K>) }
     }
 }
 

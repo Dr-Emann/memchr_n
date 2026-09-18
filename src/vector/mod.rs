@@ -529,10 +529,16 @@ pub(crate) fn scan_ops<S: Simd, K: Kernel>(simd: S) -> &'static ScanOps {
     }
     _ = simd;
 
-    &ScanOps {
-        next_match_batch: next_match_batch_impl::<S, K>,
-        count_all: count_all_impl::<S, K>,
-        first_match: first_match_impl::<S, K>,
+    &const {
+        // SAFETY: all entry points use `K` and `S`; vector scans and masked tails preserve
+        // the scan contracts.
+        unsafe {
+            ScanOps::new(
+                next_match_batch_impl::<S, K>,
+                count_all_impl::<S, K>,
+                first_match_impl::<S, K>,
+            )
+        }
     }
 }
 
