@@ -406,8 +406,8 @@ impl MemchrN {
                 [start, .., last] if usize::from(last - start) + 1 == members.len() => {
                     Self::of_range(engine, ByteRange { start, last })
                 }
-                _ => Self::of_small_set(engine, members)
-                    .or_else(|| Self::of_fixed_nibble_set(engine, members))
+                _ => Self::of_fixed_nibble_set(engine, members)
+                    .or_else(|| Self::of_small_set(engine, &set))
                     .unwrap_or_else(|| Self::of_bitset_lookup(engine, set)),
             }
         } else {
@@ -415,10 +415,10 @@ impl MemchrN {
                 return Self::of_not_byte(engine, byte);
             }
             // Ranges remain cheap even when too large for a named-member kernel.
-            match set.as_contiguous_range() {
-                Some(range) => Self::of_range(engine, range),
-                None => Self::of_bitset_lookup(engine, set),
+            if let Some(range) = set.as_contiguous_range() {
+                return Self::of_range(engine, range);
             }
+            Self::of_small_set(engine, &set).unwrap_or_else(|| Self::of_bitset_lookup(engine, set))
         }
     }
 
@@ -454,22 +454,14 @@ impl MemchrN {
         Self { search }
     }
 
-    fn of_small_set(engine: Engine, possible_set: &[u8]) -> Option<Self> {
-        if possible_set.len() > 8 {
-            return None;
-        }
+    fn of_small_set(engine: Engine, byte_set: &ByteSet) -> Option<Self> {
         let Engine::Vector(level) = engine else {
             return None;
         };
         if !vector::has_byte_shuffle(level) {
             return None;
         }
-        let mut lo_lookup = NibbleLookup::default();
-        let mut hi_lookup = NibbleLookup::default();
-        for (i, &item) in possible_set.iter().enumerate() {
-            lo_lookup.set(item & 0x0F, i as u8);
-            hi_lookup.set(item >> 4, i as u8);
-        }
+        let (lo_lookup, hi_lookup) = extract_nibble_lookups(byte_set)?;
         Some(Self {
             search: SearchPlan::vector(level, vector::kernels::SmallSet::new(lo_lookup, hi_lookup)),
         })
@@ -522,6 +514,91 @@ fn inclusive_range(range: impl RangeBounds<u8>) -> Option<ByteRange> {
         return None;
     }
     Some(ByteRange { start, last })
+}
+
+/// Builds exact membership lookups for [`vector::kernels::SmallSet`], in low/high order.
+///
+/// The kernel accepts a byte when `lo_lookup[byte & 0x0F] & hi_lookup[byte >> 4] != 0`.
+/// Each lookup entry is a `u8`, so there are eight bits available to identify groups of
+/// bytes. A bit matches every combination of the high and low nibbles carrying it:
+/// a rectangle in the 16-by-16 nibble matrix. For example, one bit can represent all
+/// four bytes `{0x12, 0x13, 0xA2, 0xA3}` by marking high nibbles `{1, A}` and low
+/// nibbles `{2, 3}`. The limit is eight groups, not eight bytes.
+///
+/// First, give each distinct nonempty row mask its own bit. High nibbles with the
+/// same row mask share that bit, and every low nibble in the mask carries it too.
+/// Because the rows are identical, every combination matched by the bit belongs
+/// to the set. If this needs more than eight bits, transpose the matrix and group
+/// identical columns instead, then return the lookups in the same low/high order.
+///
+/// This is a heuristic, not a search for a minimum rectangle cover. If both passes
+/// need more than eight bits, return `None` so the caller uses a bitset lookup;
+/// a different choice of overlapping rectangles might still fit in eight bits.
+fn extract_nibble_lookups(byte_set: &ByteSet) -> Option<(NibbleLookup, NibbleLookup)> {
+    let rows = byte_set.nibble_rows();
+    if let Some((hi_lookup, lo_lookup)) = group_nibbles_by_mask(&rows) {
+        return Some((lo_lookup, hi_lookup));
+    }
+
+    let mut columns = [0u16; 16];
+    for (hi, &row) in rows.iter().enumerate() {
+        let mut row = row;
+        while row != 0 {
+            let lo = row.trailing_zeros();
+            columns[lo as usize] |= 1 << hi;
+            row &= row - 1;
+        }
+    }
+    group_nibbles_by_mask(&columns)
+}
+
+/// Encodes at most eight distinct nonempty masks as two intersecting nibble lookups.
+///
+/// Returns `(key_lookup, member_lookup)` such that their entries share a bit exactly
+/// when `member_masks[key_nibble]` contains `member`. Each distinct mask gets a unique bit, stored
+/// at every key with that mask and at every member it contains. A key gets only its
+/// own mask's bit; a member can carry bits from several masks. Empty masks get no
+/// bit, and a ninth distinct nonempty mask returns `None`.
+///
+/// For rows, keys are high nibbles and members are low nibbles. For columns, these
+/// roles reverse. Sharing a bit only between identical masks prevents a key from
+/// accepting members that belong exclusively to another mask.
+fn group_nibbles_by_mask(member_masks: &[u16; 16]) -> Option<(NibbleLookup, NibbleLookup)> {
+    const MAX_GROUPS: usize = 8;
+
+    let mut key_lookup = NibbleLookup::default();
+    let mut member_lookup = NibbleLookup::default();
+    let mut group_masks = [0u16; MAX_GROUPS];
+    let mut group_count = 0;
+
+    for (key_nibble, &member_mask) in member_masks.iter().enumerate() {
+        if member_mask == 0 {
+            continue;
+        }
+        let existing_group = group_masks[..group_count]
+            .iter()
+            .position(|&candidate| candidate == member_mask)
+            .map(|idx| idx as u8);
+        let group_index = match existing_group {
+            Some(group_index) => group_index,
+            None => {
+                if group_count == MAX_GROUPS {
+                    return None;
+                }
+                let group_index = group_count as u8;
+                group_masks[group_count] = member_mask;
+                group_count += 1;
+                let mut remaining_member_mask = member_mask;
+                while remaining_member_mask != 0 {
+                    member_lookup.set(remaining_member_mask.trailing_zeros() as u8, group_index);
+                    remaining_member_mask &= remaining_member_mask - 1;
+                }
+                group_index
+            }
+        };
+        key_lookup.set(key_nibble as u8, group_index);
+    }
+    Some((key_lookup, member_lookup))
 }
 
 fn extract_fixed_nibble_table(items: &[u8]) -> Option<FixedNibbleTable> {
@@ -584,6 +661,90 @@ mod tests {
     fn debug_names_the_chosen_kernel() {
         let debug = format!("{:?}", MemchrN::new(b"az"));
         assert!(debug.contains("TwoBytes"), "{debug}");
+    }
+
+    #[track_caller]
+    fn assert_nibble_lookups_match(set: &[u8]) {
+        let (lo_lookup, hi_lookup) = extract_nibble_lookups(&ByteSet::from_bytes(set))
+            .expect("the set should fit in eight nibble groups");
+        for byte in 0..=u8::MAX {
+            let matched =
+                lo_lookup.0[usize::from(byte & 0x0F)] & hi_lookup.0[usize::from(byte >> 4)] != 0;
+            assert_eq!(matched, set.contains(&byte), "byte {byte:#04x} in {set:?}");
+        }
+    }
+
+    #[test]
+    fn nibble_lookups_admit_exactly_their_set() {
+        for set in [
+            &[][..],
+            &[0xFF],
+            &[0x12, 0x13, 0xA2, 0xA3],
+            &[0x12, 0x13, 0xA2, 0xA3, 0xB3, 0xB4],
+        ] {
+            assert_nibble_lookups_match(set);
+        }
+    }
+
+    // Diagonal entries cannot share a group without also matching off-diagonal bytes.
+    const DIAGONAL_SET: [u8; 9] = [0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+    #[test]
+    fn nibble_lookups_respect_the_eight_group_limit() {
+        assert_nibble_lookups_match(&DIAGONAL_SET[1..]);
+
+        let byte_set = ByteSet::from_bytes(&DIAGONAL_SET);
+        assert!(extract_nibble_lookups(&byte_set).is_none());
+        let debug = format!("{:?}", MemchrN::from_set(byte_set, Backend::Auto));
+        assert!(debug.contains("BitsetLookup"), "{debug}");
+    }
+
+    // Column lo contains rows {lo, lo + 1}, giving eight columns but nine distinct rows.
+    fn column_grouped_set() -> Vec<u8> {
+        let mut set = Vec::new();
+        for lo in 0..8u8 {
+            set.push((lo << 4) | lo);
+            set.push(((lo + 1) << 4) | lo);
+        }
+        set
+    }
+
+    #[test]
+    fn nibble_lookups_try_columns_when_rows_exceed_eight_groups() {
+        let set = column_grouped_set();
+        let byte_set = ByteSet::from_bytes(&set);
+        assert!(group_nibbles_by_mask(&byte_set.nibble_rows()).is_none());
+        assert_nibble_lookups_match(&set);
+    }
+
+    fn shuffling_vector_engine() -> bool {
+        match Backend::Auto.engine() {
+            Engine::Vector(level) => vector::has_byte_shuffle(level),
+            Engine::Swar => false,
+        }
+    }
+
+    #[test]
+    fn character_classes_use_the_small_set_kernel() {
+        for (name, set) in character_classes() {
+            assert_nibble_lookups_match(&set);
+            if shuffling_vector_engine() {
+                let debug = format!("{:?}", MemchrN::new(&set));
+                assert!(debug.contains("SmallSet"), "{name}: {debug}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_shared_nibble_prefers_the_fixed_nibble_kernel() {
+        if !shuffling_vector_engine() {
+            return;
+        }
+        // Both kernels accept these sets; FixedNibble needs one lookup instead of two.
+        for set in [[0x03, 0x23, 0x53, 0xA3], [0x51, 0x53, 0x56, 0x5F]] {
+            let debug = format!("{:?}", MemchrN::new(&set));
+            assert!(debug.contains("FixedNibble"), "{set:?}: {debug}");
+        }
     }
 
     #[test]
@@ -845,6 +1006,34 @@ mod tests {
         offsets
     }
 
+    fn ascii_class(keep: fn(&u8) -> bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for byte in 0..=127u8 {
+            if keep(&byte) {
+                bytes.push(byte);
+            }
+        }
+        bytes
+    }
+
+    /// Common byte classes that fit in eight groups despite some having more than eight bytes.
+    fn character_classes() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("alphanumeric", ascii_class(u8::is_ascii_alphanumeric)),
+            ("alphabetic", ascii_class(u8::is_ascii_alphabetic)),
+            ("punctuation", ascii_class(u8::is_ascii_punctuation)),
+            ("hex digit", ascii_class(u8::is_ascii_hexdigit)),
+            ("whitespace", ascii_class(u8::is_ascii_whitespace)),
+            ("url unsafe", b" \"<>#%{}|".to_vec()),
+            (
+                "shell metacharacter",
+                b"|&;<>()$`\\\"' \t\n*?[#~=%".to_vec(),
+            ),
+            ("regex metacharacter", b"\\.+*?()|[]{}^$".to_vec()),
+            ("c escape", b"\\\"\n\r\t\x07\x08\x0c\x0b\0".to_vec()),
+        ]
+    }
+
     fn sets() -> Vec<Vec<u8>> {
         vec![
             vec![],
@@ -854,6 +1043,10 @@ mod tests {
             b"aeiouAEI".to_vec(),
             b"abcdefghjl".to_vec(),
             b"0123456789abcdef".to_vec(),
+            ascii_class(u8::is_ascii_alphanumeric),
+            ascii_class(u8::is_ascii_punctuation),
+            column_grouped_set(),
+            DIAGONAL_SET.to_vec(),
             (b'0'..=b'9').collect(),
             (0x80..=0xFF).collect(),
             (0..=255u8).step_by(3).collect(),
