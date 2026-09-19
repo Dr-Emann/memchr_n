@@ -395,7 +395,20 @@ fn short_tail_bits<S: Simd, K: Kernel>(simd: S, kernel: &K, short_haystack: &[u8
 /// Sums every lane of a vector.
 #[inline(always)]
 fn sum_lanes_64<S: Simd>(simd: S, counts: u8x64<S>) -> usize {
-    // NEON benefits from explicit pairwise widening; x86 optimizes the scalar loop well.
+    // With AVX2 and up, llvm does well, but for lower levels, we can do better.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if simd.level().as_avx2().is_none()
+        && let Some(sse2) = simd.level().as_sse2()
+    {
+        let (l, r) = counts.split();
+        let ((a, b), (c, d)) = (l.split(), r.split());
+        let a: u64x2<_> = x86_sum_widen(sse2, a.into()).simd_into(simd);
+        let b: u64x2<_> = x86_sum_widen(sse2, b.into()).simd_into(simd);
+        let c: u64x2<_> = x86_sum_widen(sse2, c.into()).simd_into(simd);
+        let d: u64x2<_> = x86_sum_widen(sse2, d.into()).simd_into(simd);
+        return ((a + b) + (c + d)).reduce_sum() as usize;
+    }
+    // NEON benefits from explicit pairwise widening.
     #[cfg(target_arch = "aarch64")]
     if let Some(neon) = simd.level().as_neon() {
         use fearless_simd::u16x8;
@@ -414,6 +427,21 @@ fn sum_lanes_64<S: Simd>(simd: S, counts: u8x64<S>) -> usize {
         total += usize::from(lane);
     }
     total
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+kernel! {
+    #[inline(always)]
+    fn x86_sum_widen(simd: Sse2, lanes: [u8; 16]) -> [u64; 2] {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::*;
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::*;
+
+        let lanes = u8x16::load_array(simd, lanes);
+        let summed: u64x2<_> = _mm_sad_epu8(lanes.into(), _mm_setzero_si128()).simd_into(simd);
+        summed.into()
+    }
 }
 
 kernel! {
