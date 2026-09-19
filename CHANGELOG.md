@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/Dr-Emann/memchr_n/compare/v0.1.5...v0.1.6) - 2026-09-19
+
+### Other
+- Update readme performance section ([#16](https://github.com/Dr-Emann/memchr_n/pull/16)) (by @Dr-Emann) - #16
+- *(deps)* Update to fearless-simd 1.0.0-rc.2 ([#17](https://github.com/Dr-Emann/memchr_n/pull/17)) (by @Dr-Emann) - #17 ([#17](https://github.com/Dr-Emann/memchr-n/issues/17) [#17](https://github.com/Dr-Emann/memchr-n/issues/17) )
+
+### Performance
+- Preserve SIMD scan arguments in registers ([#19](https://github.com/Dr-Emann/memchr_n/pull/19)) (by @Dr-Emann) - #19
+
 ## [0.1.5](https://github.com/Dr-Emann/memchr_n/compare/v0.1.4...v0.1.5) - 2026-09-19
 
 ### Performance
