@@ -1,6 +1,6 @@
 [package]
 name = "memchr-n"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 # Matches the minimum supported Rust version of fearless_simd.
 rust-version = "1.89"
