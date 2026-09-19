@@ -5,6 +5,7 @@ use crate::{IterState, MatchedBitset};
 use core::mem::transmute_copy;
 use fearless_simd::prelude::*;
 use fearless_simd::{Level, i8x16, i8x64, kernel, u8x16, u8x32, u8x64, u64x2};
+use fearless_simd_macros::simd;
 
 const CHUNK_BYTES: usize = 64;
 const _: () = assert!(MatchedBitset::BITS as usize >= CHUNK_BYTES * 2);
@@ -49,10 +50,11 @@ pub(crate) fn has_byte_shuffle(level: Level) -> bool {
 /// Chunk pairs share an [`any_true`](fearless_simd::SimdMask::any_true) check and are returned
 /// together so the second chunk is not rescanned.
 #[inline(always)]
+#[simd]
 fn next_match_batch<S: Simd, K: Kernel>(
     simd: S,
-    state: &mut IterState<'_>,
     kernel: &K,
+    state: &mut IterState<'_>,
 ) -> MatchedBitset {
     let (haystack, mut offset) = (state.haystack, state.scan_offset);
     // SAFETY: `state.scan_offset` never exceeds the haystack length.
@@ -105,6 +107,7 @@ fn next_match_batch<S: Simd, K: Kernel>(
 ///
 /// Handles short haystacks and the first chunk before entering the paired scan loop.
 #[inline(always)]
+#[simd]
 fn first_match<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -> Option<usize> {
     if haystack.len() < CHUNK_BYTES {
         return first_match_short(simd, haystack, kernel);
@@ -288,6 +291,7 @@ kernel! {
 
 /// Counts every matching byte of `haystack`.
 #[inline(always)]
+#[simd]
 fn count_all<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -> usize {
     // Drain after 255 chunks to prevent byte-lane overflow.
     const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
@@ -495,14 +499,9 @@ pub(crate) fn scan_ops<S: Simd, K: Kernel>(simd: S) -> &'static ScanOps {
     ) -> MatchedBitset {
         // SAFETY: guaranteed by the caller.
         let simd = unsafe { token::<S>() };
-        simd.vectorize(
-            #[inline(always)]
-            move || {
-                // SAFETY: `kernel_storage` has `K`'s live field.
-                let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
-                next_match_batch(simd, state, kernel)
-            },
-        )
+        // SAFETY: `kernel_storage` has `K`'s live field.
+        let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
+        next_match_batch(simd, kernel, state)
     }
 
     /// Counts all matching bytes.
@@ -517,14 +516,9 @@ pub(crate) fn scan_ops<S: Simd, K: Kernel>(simd: S) -> &'static ScanOps {
     ) -> usize {
         // SAFETY: guaranteed by the caller.
         let simd = unsafe { token::<S>() };
-        simd.vectorize(
-            #[inline(always)]
-            move || {
-                // SAFETY: `kernel_storage` has `K`'s live field.
-                let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
-                count_all(simd, haystack, kernel)
-            },
-        )
+        // SAFETY: `kernel_storage` has `K`'s live field.
+        let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
+        count_all(simd, haystack, kernel)
     }
 
     /// Finds the first matching byte.
@@ -539,21 +533,9 @@ pub(crate) fn scan_ops<S: Simd, K: Kernel>(simd: S) -> &'static ScanOps {
     ) -> Option<usize> {
         // SAFETY: guaranteed by the caller.
         let simd = unsafe { token::<S>() };
-        #[cfg(target_arch = "aarch64")]
-        if simd.level().as_neon().is_some() && cfg!(target_feature = "neon") {
-            // SAFETY: `kernel_storage` has `K`'s live field.
-            let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
-            return first_match(simd, haystack, kernel);
-        }
-
-        simd.vectorize(
-            #[inline(always)]
-            move || {
-                // SAFETY: `kernel_storage` has `K`'s live field.
-                let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
-                first_match(simd, haystack, kernel)
-            },
-        )
+        // SAFETY: `kernel_storage` has `K`'s live field.
+        let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
+        first_match(simd, haystack, kernel)
     }
     _ = simd;
 

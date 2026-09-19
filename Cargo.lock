@@ -197,6 +197,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93cba5fa02824e5d3ef137031efa604eafe7ce8a52b8dbfcdd9943eec39fa4fc"
 
 [[package]]
+name = "fearless_simd_macros"
+version = "0.1.0-rc.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb9881ad2fa628c91cd0aa359a0712ba7c78ebf722e13de47b3525c4150973bc"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -281,6 +292,7 @@ version = "0.1.5"
 dependencies = [
  "criterion",
  "fearless_simd",
+ "fearless_simd_macros",
  "memchr",
 ]
 
