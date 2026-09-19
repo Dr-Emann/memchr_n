@@ -19,9 +19,14 @@ The [`MemchrN`] type is the entrypoint of the library. It offers a few means of 
 - [`MemchrN::from_byte_set`] creates a new `MemchrN` from a [`ByteSet`], which describes an arbitrary
   set of byte values.
 
-A [`ByteSet`] is built up a byte, a range, or a slice at a time, and sets combine with the bit
-operators (`|`, `&`, `^`, `-`, and `!`), so it can describe sets the other constructors cannot.
-Every `ByteSet` method is usable in a `const` context, so a set can be built once as a `const`:
+
+A [`ByteSet`] is built up a byte, a range, or a slice at a time, and can be combined with the operators
+(`|`, `&`, `^`, `-`, and `!`). This makes sets convenient to describe through unions, intersections, differences,
+and complements.
+
+All public inherent `ByteSet` methods are usable in a `const` context, so a set can be built once as a `const`.
+In constant expressions, use the named methods such as `union`, `difference`, and `invert` instead of the overloaded
+operators:
 
 ```rust
 use memchr_n::{ByteSet, MemchrN};
@@ -48,9 +53,10 @@ let finder = MemchrN::from_byte_set(lower - hex);
 assert_eq!(finder.find(b"deadbeef zoo"), Some(9));
 ```
 
-Creating a [`MemchrN`] does the work of identifying the optimal way to search for that set of bytes:
-constructing a [`MemchrN`] is somewhat expensive. Once a [`MemchrN`] is created, it should be reused,
-it may be useful to store it in a `OnceLock` or the like globally if you have a known set of bytes to search for.
+Creating a [`MemchrN`] selects and prepares a specialized search strategy based on the bytes to be matched and
+available CPU features. Construction can be relatively expensive compared with an individual search, so reuse the
+searcher when possible. For a fixed byte set used throughout a program, consider storing it globally in a
+`LazyLock` or `OnceLock`.
 
 There are two main things you can do with a [`MemchrN`]:
 
@@ -65,22 +71,42 @@ search at that offset without examining the bytes in between.
 
 ## Performance
 
-`memchr-n` manages to generally be faster than [`memchr`] for the same number of needles, despite supporting any
-number of needles to search for. This is largely because [`memchr`] uses simd to find the next match, using simd
-to check many bytes at once, but on finding a match, it returns the first match, and the next match is found by
-starting the search over from the next byte after the first match. `memchr-n` instead keeps the result of the simd
-search, and iterates directly over the positions of the matches already found, only beginning the next search once
-all known matches found via simd have been iterated over.
+[`MemchrN`] is optimized for repeated searches with the same set of bytes, iterating over the matching positions,
+and counting matches. The set of bytes is fixed at construction time, at which point a specialized search strategy
+is selected, so reuse a constructed [`MemchrN`] instance to amortize that cost.
 
-This means `memchr-n` can be much faster when iterating over the matches when matches are dense. However, because
-`memchr-n` has less of a trade off for sparse matches, it is able to go wider than [`memchr`], and check more bytes
-simultaneously with simd, since it's not throwing away that information on the first match: [`memchr`] has to toe
-the line between using wide simd to quickly skip ranges of non-matching bytes, without wasting too much work in the
-case a match is found, but `memchr-n` does not have the same trade-off.
+### Iterating Over Matches
 
-However, because `memchr-n` does use wider simd, there is a trade-off in latency to first match. This is somewhat
-mitigated by the `MemchrN::find` method, but for very early matches, or very small haystacks, `memchr-n` may still
-be slower than [`memchr`].
+When iterating over matches, the results of each SIMD batch are retained in a bitmask. Each step of the iteration
+removes the first set bit. Only when the batch is exhausted does the next batch of SIMD operations run again.
+
+[`memchr`]'s iterators, on the other hand, find a SIMD batch in a similar way, but once the first match is found,
+the next iteration step must begin searching again starting from the next byte after the first match, even if the
+first batch actually already had located that match. Avoiding these repeated searches can make `memchr-n` significantly
+faster when matches are densely populated.
+
+Both libraries compare multiple vectors per search-loop iteration. `memchr-n` processes up to 128 bytes per batch
+and retains all matching positions from that batch. This lets it amortize the batch's work across multiple results.
+
+### Counting Matches
+
+Calling `finder.iter(haystack).count()` uses a dedicated counting implementation instead of iterating over the matches.
+It accumulates into byte lane SIMD registers, only reducing to a single count when necessary.
+
+[`memchr`] also has a specialized counting implementation, but only for a single needle, but its SIMD implementation
+reduces the matching positions to a bitset and counts them each step. By keeping the counts in SIMD registers and
+avoiding reduction for every step, `memchr-n` can be quite a bit faster than [`memchr`] for counting matches.
+Because [`memchr`] does not have a specialized implementation for counting with two or three needles, `memchr-n` can
+be much faster than [`memchr`] for counting matches of multiple needles.
+
+### Finding the First Match
+
+Use `MemchrN::find` when only the first match is needed. It has a separate implementation that checks an initial chunk
+before entering the larger batch loop and uses smaller searches for short haystacks.
+
+Batching favors throughput, but can do extra work before returning an early match. For very early matches or small
+haystacks, `memchr-n` may be slower than [`memchr`]. Relative performance depends on the CPU, byte set, haystack
+length, match density, and operation being performed.
 
 ## Minimum supported Rust version
 
