@@ -15,7 +15,7 @@ categories = ["algorithms", "text-processing"]
 manual_level = []
 
 [dependencies]
-fearless_simd = "1.0.0-rc.1"
+fearless_simd = "1.0.0-rc.2"
 
 [dev-dependencies]
 criterion = "0.8"

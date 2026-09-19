@@ -237,7 +237,7 @@ fn first_match_short<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -
 #[inline(always)]
 fn first_matching_lane<S: Simd, M: SimdMask<S, Element = i8>>(matched: M) -> Option<usize> {
     #[cfg(target_arch = "aarch64")]
-    if let Some(neon) = matched.witness().level().as_neon() {
+    if let Some(neon) = matched.token().level().as_neon() {
         match M::LEN {
             16 => {
                 let mut lanes = [0; 16];

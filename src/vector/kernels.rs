@@ -27,7 +27,7 @@ where
 {
     #[inline(always)]
     fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
-        let simd = chunk.witness();
+        let simd = chunk.token();
         let mut matched = V::Mask::splat(simd, false);
         for &needle in &self.splatted_needles {
             matched |= chunk.simd_eq(V::block_splat(u8x16::load_array(simd, needle)));
@@ -63,7 +63,7 @@ impl Kernel for NotByte {
     #[inline(always)]
     fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
         !chunk.simd_eq(V::block_splat(u8x16::load_array(
-            chunk.witness(),
+            chunk.token(),
             self.splatted_byte,
         )))
     }
@@ -92,7 +92,7 @@ impl OneRange {
 impl Kernel for OneRange {
     #[inline(always)]
     fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
-        let simd = chunk.witness();
+        let simd = chunk.token();
         chunk.simd_ge(V::block_splat(u8x16::load_array(simd, self.splatted_start)))
             & chunk.simd_le(V::block_splat(u8x16::load_array(simd, self.splatted_last)))
     }
@@ -125,7 +125,7 @@ impl Kernel for SmallSet {
         &self,
         chunk: V,
     ) -> V::Mask {
-        let simd = chunk.witness();
+        let simd = chunk.token();
         let lo_lookup = V::block_splat(u8x16::load_array(simd, self.lo_lookup.0));
         let hi_lookup = V::block_splat(u8x16::load_array(simd, self.hi_lookup.0));
 
@@ -170,7 +170,7 @@ impl Kernel for FixedNibbleSet {
         &self,
         chunk: V,
     ) -> V::Mask {
-        let table = V::block_splat(u8x16::simd_from(chunk.witness(), self.table));
+        let table = V::block_splat(u8x16::simd_from(chunk.token(), self.table));
         let non_const_nibbles = match self.fixed_nibble {
             FixedNibble::Low => chunk >> 4,
             FixedNibble::High => chunk & 0x0F,
@@ -196,7 +196,7 @@ impl Kernel for BitsetLookup {
         &self,
         chunk: V,
     ) -> V::Mask {
-        let bits = V::block_splat(u8x16::from_fn(chunk.witness(), |i| 1 << (i % 8)));
+        let bits = V::block_splat(u8x16::from_fn(chunk.token(), |i| 1 << (i % 8)));
         let bit = bits.swizzle_dyn_within_blocks(chunk & 0b0111);
         !(bit & lookup_membership_bytes(self.byte_set(), chunk >> 3)).simd_eq(0)
     }
@@ -214,7 +214,7 @@ fn lookup_membership_bytes<S: Simd, V: SimdInt<S, Element = u8, ByteVector = V>>
     byte_set: &ByteSet,
     indices: V,
 ) -> V {
-    let simd = indices.witness();
+    let simd = indices.token();
     let table = u8x32::load_array_ref(simd, byte_set.as_array());
 
     const { assert!(V::LEN == 16 || V::LEN == 32 || V::LEN == 64) }
