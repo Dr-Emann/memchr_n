@@ -7,6 +7,7 @@ commit_parsers = [
     { message = "^changed", group = "changed" },
     { message = "^deprecated", group = "deprecated" },
     { message = "^fix", group = "fixed" },
+    { message = "^perf", group = "performance" },
     { message = "^security", group = "security" },
     { message = "^ci", skip = true },
     { message = "^chore.*bindings", skip = true },
