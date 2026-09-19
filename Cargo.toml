@@ -16,6 +16,7 @@ manual_level = []
 
 [dependencies]
 fearless_simd = "1.0.0-rc.2"
+fearless_simd_macros = "0.1.0-rc.1"
 
 [dev-dependencies]
 criterion = "0.8"
