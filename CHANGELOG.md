@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/Dr-Emann/memchr_n/compare/v0.1.6...v0.1.7) - 2026-09-22
+
+### Other
+- Update to fearless_simd 1.0 (by @Dr-Emann) - #20
+
 ## [0.1.6](https://github.com/Dr-Emann/memchr_n/compare/v0.1.5...v0.1.6) - 2026-09-19
 
 ### Other
