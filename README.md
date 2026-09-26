@@ -108,6 +108,24 @@ Batching favors throughput, but can do extra work before returning an early matc
 haystacks, `memchr-n` may be slower than [`memchr`]. Relative performance depends on the CPU, byte set, haystack
 length, match density, and operation being performed.
 
+## Safety
+
+The public API is safe: callers have no safety invariants to uphold. The library uses a small amount of `unsafe`
+for four purposes:
+
+- Dispatching between search strategies through a manually implemented trait object: a union holds the strategy
+  inline, avoiding a heap allocation, and a function table supplies its operations. Construction always pairs the
+  stored strategy with the correct function table by construction.
+- Reconstructing SIMD capability tokens. A token present when constructing a search strategy proves that its SIMD
+  instructions are supported. The strategy can therefore recreate that token when searching, without requiring it
+  to be passed on each call.
+- Slicing without redundant bounds checks. Scan offsets are maintained within the haystack by the library;
+  caller-provided offsets are clamped to its length.
+- Giving the optimizer bounds and length guarantees. These follow from the scanners' bounded chunks, masked
+  tail results, and preservation of the haystack.
+
+These uses rely on a small set of internal guarantees, kept within the search and iterator implementations.
+
 ## Minimum supported Rust version
 
 This crate requires Rust 1.89 or later.
