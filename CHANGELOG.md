@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/Dr-Emann/memchr_n/compare/v0.1.7...v0.1.8) - 2026-09-26
+
+### Other
+- Add section explaining the (minimal) use of `unsafe` in the crate (by @Dr-Emann) - #22
+
 ## [0.1.7](https://github.com/Dr-Emann/memchr_n/compare/v0.1.6...v0.1.7) - 2026-09-22
 
 ### Other
