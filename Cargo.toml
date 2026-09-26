@@ -15,8 +15,8 @@ categories = ["algorithms", "text-processing"]
 manual_level = []
 
 [dependencies]
-fearless_simd = "1.0.0"
-fearless_simd_macros = "0.1.0"
+fearless_simd = { git = "https://github.com/linebender/fearless_simd" }
+fearless_simd_macros = { git = "https://github.com/linebender/fearless_simd" }
 
 [dev-dependencies]
 criterion = "0.8"

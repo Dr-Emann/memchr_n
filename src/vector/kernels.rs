@@ -221,12 +221,8 @@ fn lookup_membership_bytes<S: Simd, V: SimdInt<S, Element = u8, ByteVector = V>>
     match V::LEN {
         16 => {
             let indices = u8x16::from_slice(simd, indices.as_slice());
-            #[cfg(target_arch = "aarch64")]
-            if let Some(neon) = simd.level().as_neon() {
-                let res = super::aarch64_swizzle_32_to_16(neon, table.into(), indices.into());
-                return V::from_slice(simd, &res);
-            }
-            let res = table.swizzle_dyn(indices.combine(indices)).split().0;
+            let (lo, hi) = table.split();
+            let res = lo.concat_swizzle_dyn(hi, indices);
             V::from_slice(simd, res.as_slice())
         }
         32 => {

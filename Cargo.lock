@@ -193,14 +193,12 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 [[package]]
 name = "fearless_simd"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3772b63c40606beea8fe1f7b06a60de27ceb9bfc2d9dad3427368ca41dc7e62"
+source = "git+https://github.com/linebender/fearless_simd#64ae5061b17dc2d64f7703ecd197f9f27c34bf59"
 
 [[package]]
 name = "fearless_simd_macros"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e91d94c6885390b81782d7ee60fd6583b33907333a8b340de25ccf468353315"
+source = "git+https://github.com/linebender/fearless_simd#64ae5061b17dc2d64f7703ecd197f9f27c34bf59"
 dependencies = [
  "proc-macro2",
  "quote",

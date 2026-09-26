@@ -460,18 +460,6 @@ kernel! {
     }
 }
 
-kernel! {
-    #[inline(always)]
-    fn aarch64_swizzle_32_to_16(simd: Neon, table: [u8; 32], idx: [u8; 16]) -> [u8; 16] {
-        use core::arch::aarch64::*;
-
-        let table = u8x32::load_array(simd, table);
-        let idx = u8x16::load_array(simd, idx);
-        let res = vqtbl2q_u8(table.into(), idx.into());
-        u8x16::simd_from(simd, res).into()
-    }
-}
-
 pub(crate) fn scan_ops<S: Simd, K: Kernel>(simd: S) -> &'static ScanOps {
     /// Rebuilds a SIMD token, which holds no data beyond the support it proves.
     ///
