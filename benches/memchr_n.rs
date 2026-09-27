@@ -6,6 +6,8 @@ use std::time::Duration;
 const SHERLOCK: &[u8] = include_bytes!("haystacks/sherlock/huge.txt");
 const ALNUM: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const HEX_LOWER: &[u8] = b"0123456789abcdef";
+// Nine diagonal entries require more than SmallSet's eight nibble groups.
+const BITSET_DIAGONAL: &[u8] = &[0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
 const OURS: &str = "memchr_n";
 const THEIRS: &str = "memchr";
 
@@ -118,8 +120,9 @@ const BUILD_CASES: &[(&str, BuildCase)] = &[
     ("one-range", BuildCase::Range(b'0', b'9')),
     ("small-set", BuildCase::Bytes(b"aeiouAEI")),
     ("fixed-nibble", BuildCase::Bytes(b"abcdefghjl")),
-    ("bitset-16", BuildCase::Bytes(HEX_LOWER)),
-    ("bitset-62", BuildCase::Bytes(ALNUM)),
+    ("hex-16", BuildCase::Bytes(HEX_LOWER)),
+    ("alnum-62", BuildCase::Bytes(ALNUM)),
+    ("bitset-diagonal-9", BuildCase::Bytes(BITSET_DIAGONAL)),
 ];
 
 const COUNT_CASES: &[(&str, ByteSet)] = &[
@@ -131,8 +134,9 @@ const COUNT_CASES: &[(&str, ByteSet)] = &[
     ("one-range", ByteSet::Range(b'0', b'9')),
     ("small-set", ByteSet::List(b"aeiouAEI")),
     ("fixed-nibble", ByteSet::List(b"abcdefghjl")),
-    ("bitset-16", ByteSet::List(HEX_LOWER)),
-    ("bitset-62", ByteSet::List(ALNUM)),
+    ("hex-16", ByteSet::List(HEX_LOWER)),
+    ("alnum-62", ByteSet::List(ALNUM)),
+    ("bitset-diagonal-9", ByteSet::List(BITSET_DIAGONAL)),
 ];
 
 const ITERATE_CASES: &[(&str, ByteSet)] = &[
@@ -140,7 +144,8 @@ const ITERATE_CASES: &[(&str, ByteSet)] = &[
     ("not-byte", ByteSet::NotByte(b' ')),
     ("common-one", ByteSet::List(b"a")),
     ("common-three", ByteSet::List(b"ato")),
-    ("bitset-16", ByteSet::List(HEX_LOWER)),
+    ("hex-16", ByteSet::List(HEX_LOWER)),
+    ("bitset-diagonal-9", ByteSet::List(BITSET_DIAGONAL)),
 ];
 
 fn expected_count(set: ByteSet, haystack: &[u8]) -> usize {
@@ -235,6 +240,11 @@ fn planted_haystack(set: ByteSet, offset: Option<usize>) -> [u8; 128] {
 }
 
 fn bench_build(c: &mut Criterion) {
+    let finder = MemchrN::new(BITSET_DIAGONAL);
+    let debug = format!("{finder:?}");
+    assert!(debug.contains("BitsetLookup"), "bitset-diagonal-9: {debug}");
+    eprintln!("bitset-diagonal-9: {debug}");
+
     let mut group = c.benchmark_group("build");
     for &(name, case) in BUILD_CASES {
         group.bench_function(name, |b| b.iter(|| black_box(case).build()));
@@ -266,23 +276,29 @@ fn bench_find(c: &mut Criterion) {
         });
     }
 
-    let bitset = ByteSet::List(HEX_LOWER);
-    for (name, offset) in [
-        ("hit-000", Some(0usize)),
-        ("hit-064", Some(64)),
-        ("miss-128", None),
+    let bitset = ByteSet::List(BITSET_DIAGONAL);
+    for (set_name, set) in [
+        ("hex-16", ByteSet::List(HEX_LOWER)),
+        ("bitset-diagonal-9", bitset),
     ] {
-        let haystack = planted_haystack(bitset, offset);
-        let label = format!("bitset-16/{name}");
-        let finder = verified_finder(bitset, Backend::Auto, &haystack, &label);
-        group.bench_function(BenchmarkId::new(OURS, &label), |b| {
-            b.iter(|| black_box(&finder).find(black_box(&haystack)))
-        });
+        for (name, offset) in [
+            ("hit-000", Some(0usize)),
+            ("hit-064", Some(64)),
+            ("miss-128", None),
+        ] {
+            let haystack = planted_haystack(set, offset);
+            let label = format!("{set_name}/{name}");
+            let finder = verified_finder(set, Backend::Auto, &haystack, &label);
+            group.bench_function(BenchmarkId::new(OURS, &label), |b| {
+                b.iter(|| black_box(&finder).find(black_box(&haystack)))
+            });
+        }
     }
 
     for (name, set) in [
         ("one-byte", one_byte),
-        ("bitset-16", bitset),
+        ("hex-16", ByteSet::List(HEX_LOWER)),
+        ("bitset-diagonal-9", bitset),
         ("not-byte", ByteSet::NotByte(b'.')),
     ] {
         for len in [4096, 65536] {
@@ -330,8 +346,8 @@ fn bench_count(c: &mut Criterion) {
     }
 
     let set = ByteSet::List(HEX_LOWER);
-    let finder = verified_finder(set, Backend::Swar, SHERLOCK, "bitset-16/swar");
-    group.bench_function(BenchmarkId::new(OURS, "bitset-16/swar"), |b| {
+    let finder = verified_finder(set, Backend::Swar, SHERLOCK, "hex-16/swar");
+    group.bench_function(BenchmarkId::new(OURS, "hex-16/swar"), |b| {
         b.iter(|| black_box(&finder).iter(black_box(SHERLOCK)).count())
     });
     group.finish();
