@@ -1,7 +1,6 @@
 use super::Kernel;
 use crate::bitset::{ByteRange, ByteSet};
-use crate::search::StoredKernel;
-use crate::{BitsetLookup, FixedNibble, FixedNibbleTable, NibbleLookup};
+use crate::search::{BitsetLookup, FixedNibble, FixedNibbleTable, NibbleLookup, StoredKernel};
 use fearless_simd::prelude::*;
 use fearless_simd::{u8x16, u8x32, u8x64};
 

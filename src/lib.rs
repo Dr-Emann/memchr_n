@@ -458,17 +458,11 @@ impl Backend {
 
 impl Engine {
     #[must_use]
-    fn with_byte_shuffle(self) -> Self {
-        match self {
-            Engine::Vector(level) => {
-                if vector::has_byte_shuffle(level) {
-                    Engine::Vector(level)
-                } else {
-                    Engine::Swar
-                }
-            }
-            Engine::Swar => Engine::Swar,
-        }
+    fn byte_shuffle_level(self) -> Option<Level> {
+        let Engine::Vector(level) = self else {
+            return None;
+        };
+        vector::has_byte_shuffle(level).then_some(level)
     }
 }
 
@@ -506,12 +500,7 @@ impl MemchrN {
     }
 
     fn of_small_set(engine: Engine, byte_set: &ByteSet) -> Option<Self> {
-        let Engine::Vector(level) = engine else {
-            return None;
-        };
-        if !vector::has_byte_shuffle(level) {
-            return None;
-        }
+        let level = engine.byte_shuffle_level()?;
         let (lo_lookup, hi_lookup) = extract_nibble_lookups(byte_set)?;
         Some(Self {
             search: SearchPlan::vector(level, vector::kernels::SmallSet::new(lo_lookup, hi_lookup)),
@@ -519,12 +508,7 @@ impl MemchrN {
     }
 
     fn of_fixed_nibble_set(engine: Engine, possible_set: &[u8]) -> Option<Self> {
-        let Engine::Vector(level) = engine else {
-            return None;
-        };
-        if !vector::has_byte_shuffle(level) {
-            return None;
-        }
+        let level = engine.byte_shuffle_level()?;
         let fixed_nibble_table = extract_fixed_nibble_table(possible_set)?;
         Some(Self {
             search: SearchPlan::vector(
@@ -536,9 +520,9 @@ impl MemchrN {
 
     fn of_bitset_lookup(engine: Engine, byte_set: ByteSet) -> Self {
         let kernel = BitsetLookup::new(byte_set);
-        let search = match engine.with_byte_shuffle() {
-            Engine::Vector(level) => SearchPlan::vector(level, kernel),
-            Engine::Swar => SearchPlan::swar(kernel),
+        let search = match engine.byte_shuffle_level() {
+            Some(level) => SearchPlan::vector(level, kernel),
+            None => SearchPlan::swar(kernel),
         };
         Self { search }
     }
