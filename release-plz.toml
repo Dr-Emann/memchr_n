@@ -1,6 +1,6 @@
 [changelog]
 link_parsers = [
-    { pattern = "#(\\d+)", href = "https://github.com/Dr-Emann/memchr-n/issues/$1" },
+    { pattern = "#(\\d+)", href = "https://github.com/Dr-Emann/memchr_n/issues/$1" },
 ]
 commit_parsers = [
     { message = "^feat", group = "added" },
@@ -27,20 +27,24 @@ body = """
 ### {{ group | upper_first }}
     {% for commit in commits %}
         {%- if commit.scope -%}
-            - *({{commit.scope}})* {% if commit.breaking %}[**breaking**] {% endif %}\
-                {{ commit.message | upper_first }}{{ self::username(commit=commit) }}{{ self::pr(commit=commit) }}\
-                {%- if commit.links %} \
-                    ({% for link in commit.links %}[{{link.text}}]({{link.href}}) {% endfor -%})\
-                {% endif %}
+            - *({{commit.scope}})*\
         {% else -%}
-            - {% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message | upper_first }}{{ self::username(commit=commit) }}{{ self::pr(commit=commit) }}
-        {% endif -%}
+            -\
+        {% endif %} {% if commit.breaking %}[**breaking**] {% endif %}\
+            {{ commit.message | upper_first }}{{ self::username(commit=commit) }}{{ self::pr(commit=commit) }}{{ self::links(commit=commit) }}
     {% endfor -%}
 {% endfor %}
 {%- macro username(commit) -%}
     {% if commit.remote.username %} (by @{{ commit.remote.username }}){% endif -%}
 {% endmacro -%}
 {%- macro pr(commit) -%}
-    {% if commit.remote.pr_number %} - #{{ commit.remote.pr_number }}{% endif -%}
+    {% if commit.remote.pr_number and "/pull/" not in commit.message and "(#" not in commit.message %} - #{{ commit.remote.pr_number }}{% endif -%}
+{% endmacro -%}
+{%- macro links(commit) -%}
+    {% for link in commit.links | unique(attribute="href") -%}
+        {% if commit.remote.pr_number and link.text | trim_start_matches(pat="#") | int == commit.remote.pr_number -%}
+        {% elif link.href | replace(from="/issues/", to="/pull/") in commit.message -%}
+        {% elif link.href not in commit.message %} [{{ link.text }}]({{ link.href }}){% endif -%}
+    {% endfor -%}
 {% endmacro -%}
 """
