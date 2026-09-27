@@ -173,6 +173,12 @@ impl ByteSet {
     /// because a generic [`RangeBounds<u8>`] cannot be taken apart in a `const` context; use
     /// `0..=last` and `start..=255` for the half-open ends of the byte domain.
     ///
+    /// Only the range's [`start()`](RangeInclusive::start) and [`end()`](RangeInclusive::end)
+    /// are read, so even an exhausted range is treated as `*range.start()..=*range.end()`.
+    /// Those endpoint values are unspecified after exhaustion, so an exhausted range may
+    /// still add bytes. [`MemchrN::from_range`](crate::MemchrN::from_range) treats exhausted
+    /// ranges as empty when building a searcher.
+    ///
     /// # Examples
     ///
     /// ```
@@ -195,6 +201,12 @@ impl ByteSet {
     ///
     /// A range whose start is past its end removes nothing. Only [`RangeInclusive<u8>`] is
     /// accepted, for the reason given on [`add_range`](Self::add_range).
+    ///
+    /// Only the range's [`start()`](RangeInclusive::start) and [`end()`](RangeInclusive::end)
+    /// are read, so even an exhausted range is treated as `*range.start()..=*range.end()`.
+    /// Those endpoint values are unspecified after exhaustion, so an exhausted range may
+    /// still remove bytes. [`MemchrN::from_range`](crate::MemchrN::from_range) treats exhausted
+    /// ranges as empty when building a searcher.
     ///
     /// # Examples
     ///
