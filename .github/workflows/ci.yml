@@ -35,7 +35,7 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
       - name: Check fuzz workspace
-        run: cargo check --manifest-path fuzz/Cargo.toml --locked --all-targets
+        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
 
   test:
     name: Rust ${{ matrix.toolchain }} on ${{ matrix.os }}
