@@ -1,6 +1,5 @@
-use crate::BitsetLookup;
 use crate::bitset::ByteRange;
-use crate::search::StoredKernel;
+use crate::search::{BitsetLookup, StoredKernel};
 use crate::swar::{HIGH, Kernel, nonzero_bytes, splat};
 
 #[derive(Copy, Clone)]

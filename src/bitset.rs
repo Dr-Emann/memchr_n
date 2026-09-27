@@ -391,7 +391,7 @@ impl ByteSet {
         true
     }
 
-    pub(crate) fn as_array(&self) -> &[u8; 32] {
+    pub(crate) fn as_array(&self) -> &[u8; TABLE_BYTES] {
         &self.0
     }
 

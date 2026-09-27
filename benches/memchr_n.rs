@@ -95,34 +95,17 @@ impl Needles {
     }
 }
 
-#[derive(Copy, Clone)]
-enum BuildCase {
-    Bytes(&'static [u8]),
-    Range(u8, u8),
-    NotByte(u8),
-}
-
-impl BuildCase {
-    fn build(self) -> MemchrN {
-        match self {
-            Self::Bytes(bytes) => MemchrN::new(bytes),
-            Self::NotByte(byte) => MemchrN::from_not_byte(byte),
-            Self::Range(start, end) => MemchrN::from_range(start..=end),
-        }
-    }
-}
-
-const BUILD_CASES: &[(&str, BuildCase)] = &[
-    ("empty", BuildCase::Bytes(b"")),
-    ("one-byte", BuildCase::Bytes(b"z")),
-    ("not-byte", BuildCase::NotByte(b' ')),
-    ("three-bytes", BuildCase::Bytes(b"zRJ")),
-    ("one-range", BuildCase::Range(b'0', b'9')),
-    ("small-set", BuildCase::Bytes(b"aeiouAEI")),
-    ("fixed-nibble", BuildCase::Bytes(b"abcdefghjl")),
-    ("hex-16", BuildCase::Bytes(HEX_LOWER)),
-    ("alnum-62", BuildCase::Bytes(ALNUM)),
-    ("bitset-diagonal-9", BuildCase::Bytes(BITSET_DIAGONAL)),
+const BUILD_CASES: &[(&str, ByteSet)] = &[
+    ("empty", ByteSet::List(b"")),
+    ("one-byte", ByteSet::List(b"z")),
+    ("not-byte", ByteSet::NotByte(b' ')),
+    ("three-bytes", ByteSet::List(b"zRJ")),
+    ("one-range", ByteSet::Range(b'0', b'9')),
+    ("small-set", ByteSet::List(b"aeiouAEI")),
+    ("fixed-nibble", ByteSet::List(b"abcdefghjl")),
+    ("hex-16", ByteSet::List(HEX_LOWER)),
+    ("alnum-62", ByteSet::List(ALNUM)),
+    ("bitset-diagonal-9", ByteSet::List(BITSET_DIAGONAL)),
 ];
 
 const COUNT_CASES: &[(&str, ByteSet)] = &[
@@ -247,7 +230,7 @@ fn bench_build(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("build");
     for &(name, case) in BUILD_CASES {
-        group.bench_function(name, |b| b.iter(|| black_box(case).build()));
+        group.bench_function(name, |b| b.iter(|| black_box(case).finder(Backend::Auto)));
     }
     group.finish();
 }
