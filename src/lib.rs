@@ -293,11 +293,24 @@ impl FromIterator<u8> for MemchrN {
 /// let matches: Iter<'_> = finder.iter(b"hello");
 /// assert_eq!(matches.collect::<Vec<_>>(), vec![1, 4]);
 /// ```
-#[derive(Clone, Debug)]
+#[must_use = "iterators do nothing unless consumed"]
+#[derive(Clone)]
 pub struct Iter<'a> {
     finder: &'a MemchrN,
     state: IterState<'a>,
     match_bits: MatchedBitset,
+}
+
+impl fmt::Debug for Iter<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Iter")
+            .field("finder", self.finder)
+            .field("haystack_len", &self.state.haystack.len())
+            .field("scan_offset", &self.state.scan_offset)
+            .field("match_base", &self.state.match_base)
+            .field("match_bits", &self.match_bits)
+            .finish()
+    }
 }
 
 type MatchedBitset = u128;
@@ -669,7 +682,7 @@ mod tests {
     use super::*;
     use core::ops::Bound;
 
-    // Construction is cheap enough to use per search, so keep the value within one cache line.
+    // Keeping the prepared searcher within one cache line limits its storage cost.
     #[test]
     fn memchr_n_stays_small() {
         assert!(
@@ -683,6 +696,19 @@ mod tests {
     fn debug_names_the_chosen_kernel() {
         let debug = format!("{:?}", MemchrN::new(b"az"));
         assert!(debug.contains("TwoBytes"), "{debug}");
+    }
+
+    #[test]
+    fn iter_debug_shows_state_without_haystack_bytes() {
+        let finder = MemchrN::new(b"x");
+        let mut iter = finder.iter(b"secret x");
+        assert_eq!(iter.next(), Some(7));
+        let debug = format!("{iter:?}");
+        assert!(debug.contains("haystack_len: 8"), "{debug}");
+        assert!(debug.contains("scan_offset:"), "{debug}");
+        assert!(debug.contains("match_base:"), "{debug}");
+        assert!(debug.contains("match_bits:"), "{debug}");
+        assert!(!debug.contains("secret"), "{debug}");
     }
 
     #[track_caller]
