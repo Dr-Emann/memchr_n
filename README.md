@@ -93,7 +93,7 @@ and retains all matching positions from that batch. This lets it amortize the ba
 Calling `finder.iter(haystack).count()` uses a dedicated counting implementation instead of iterating over the matches.
 It accumulates into byte lane SIMD registers, only reducing to a single count when necessary.
 
-[`memchr`] also has a specialized counting implementation, but only for a single needle, but its SIMD implementation
+[`memchr`] also has a specialized counting implementation for a single needle, but its SIMD implementation
 reduces the matching positions to a bitset and counts them each step. By keeping the counts in SIMD registers and
 avoiding reduction for every step, `memchr-n` can be quite a bit faster than [`memchr`] for counting matches.
 Because [`memchr`] does not have a specialized implementation for counting with two or three needles, `memchr-n` can
@@ -130,4 +130,26 @@ These uses rely on a small set of internal guarantees, kept within the search an
 
 This crate requires Rust 1.89 or later.
 
+## Manual SIMD level selection
+
+The optional `manual_level` feature exposes [`Level`] and [`Backend::Level`] for choosing a
+specific SIMD level when constructing a searcher. This is useful for testing and benchmarking
+individual implementations. The default [`Backend::Auto`] detects the best supported level at
+runtime. An explicit level is preserved for vector kernels, so choose one supported by the
+running CPU.
+
 [`memchr`]: https://docs.rs/memchr
+[`Backend::Auto`]: https://docs.rs/memchr-n/latest/memchr_n/enum.Backend.html#variant.Auto
+[`Backend::Level`]: https://docs.rs/memchr-n/latest/memchr_n/enum.Backend.html#variant.Level
+[`ByteSet`]: https://docs.rs/memchr-n/latest/memchr_n/struct.ByteSet.html
+[`Iter`]: https://docs.rs/memchr-n/latest/memchr_n/struct.Iter.html
+[`Iter::advance_to`]: https://docs.rs/memchr-n/latest/memchr_n/struct.Iter.html#method.advance_to
+[`Level`]: https://docs.rs/memchr-n/latest/memchr_n/enum.Level.html
+[`MemchrN`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html
+[`MemchrN::find`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.find
+[`MemchrN::from_byte_set`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.from_byte_set
+[`MemchrN::from_iter`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.from_iter
+[`MemchrN::from_not_byte`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.from_not_byte
+[`MemchrN::from_range`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.from_range
+[`MemchrN::iter`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.iter
+[`MemchrN::new`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.new
