@@ -803,6 +803,50 @@ mod tests {
         }
     }
 
+    #[cfg(all(
+        feature = "manual_level",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn explicit_x86_levels_match_scalar_search() {
+        let detected = Level::new();
+        let mut levels = Vec::new();
+        if let Some(token) = detected.as_sse2() {
+            levels.push(("SSE2", Level::Sse2(token)));
+        }
+        if let Some(token) = detected.as_sse4_2() {
+            levels.push(("SSE4.2", Level::Sse4_2(token)));
+        }
+        if let Some(token) = detected.as_avx2() {
+            levels.push(("AVX2", Level::Avx2(token)));
+        }
+
+        for (name, level) in levels {
+            for set in sets() {
+                let finder = MemchrN::new_with_backend(&set, Backend::Level(level));
+                for len in [0, 1, 15, 16, 31, 32, 63, 64, 65, 127, 128, 129, 255, 256] {
+                    let haystack = haystack(len);
+                    let expected = naive(&set, &haystack);
+                    assert_eq!(
+                        finder.find(&haystack),
+                        expected.first().copied(),
+                        "{name} {set:?} {len}"
+                    );
+                    assert_eq!(
+                        finder.iter(&haystack).collect::<Vec<_>>(),
+                        expected,
+                        "{name} {set:?} {len}"
+                    );
+                    assert_eq!(
+                        finder.iter(&haystack).count(),
+                        expected.len(),
+                        "{name} {set:?} {len}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn from_range_accepts_inclusive_exclusive_and_unbounded_bounds() {
         let haystack = [0, 1, 2, 3, 254, 255];
