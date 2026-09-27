@@ -11,6 +11,9 @@ license = "MIT OR Apache-2.0"
 keywords = ["memchr", "simd", "search", "bytes", "scan"]
 categories = ["algorithms", "text-processing"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 manual_level = []
 
