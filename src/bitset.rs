@@ -258,6 +258,7 @@ impl ByteSet {
     /// assert_eq!(vowels.union(digits), vowels | digits);
     /// assert_eq!(vowels.union(digits).len(), 15);
     /// ```
+    #[must_use]
     pub const fn union(mut self, other: Self) -> Self {
         let mut i = 0;
         while i < TABLE_BYTES {
@@ -279,6 +280,7 @@ impl ByteSet {
     /// assert_eq!(vowels.intersection(hex), vowels & hex);
     /// assert_eq!(vowels.intersection(hex), ByteSet::from_bytes(b"ae"));
     /// ```
+    #[must_use]
     pub const fn intersection(mut self, other: Self) -> Self {
         let mut i = 0;
         while i < TABLE_BYTES {
@@ -301,6 +303,7 @@ impl ByteSet {
     /// assert!(!hex.difference(vowels).contains(b'a'));
     /// assert!(hex.difference(vowels).contains(b'b'));
     /// ```
+    #[must_use]
     pub const fn difference(mut self, other: Self) -> Self {
         let mut i = 0;
         while i < TABLE_BYTES {
@@ -322,6 +325,7 @@ impl ByteSet {
     /// assert_eq!(lower.symmetric_difference(vowels), lower ^ vowels);
     /// assert_eq!(lower.symmetric_difference(vowels), ByteSet::from_bytes(b"bceiou"));
     /// ```
+    #[must_use]
     pub const fn symmetric_difference(mut self, other: Self) -> Self {
         let mut i = 0;
         while i < TABLE_BYTES {
