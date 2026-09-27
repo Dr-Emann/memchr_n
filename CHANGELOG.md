@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/Dr-Emann/memchr_n/compare/v0.1.7...v0.1.8) - 2026-09-27
+
+### Fixed
+- Omit haystack bytes from iterator Debug and mark unused results (by @Dr-Emann) - #30
+- Correct changelog links and deduplicate PR references (by @Dr-Emann) - #27
+- Benchmark the vector bitset kernel (by @Dr-Emann) - #26 [#7](https://github.com/Dr-Emann/memchr_n/issues/7)
+
+### Other
+- Remove Cargo.lock from fuzzer directory (by @Dr-Emann)
+- Fuzz mixed iterator operations against scalar model (by @Dr-Emann) - #32
+- Share benchmark cases and shuffle eligibility (by @Dr-Emann) - #31
+- Cover explicit SIMD levels and lint ARM builds (by @Dr-Emann) - #29
+- Complete publication metadata and licenses (by @Dr-Emann) - #28
+- Clarify {add/remove}_range behavior with exhausted ranges (by @Dr-Emann) - #25
+- Add section explaining the (minimal) use of `unsafe` in the crate (by @Dr-Emann) - #22
+
 ## [0.1.7](https://github.com/Dr-Emann/memchr_n/compare/v0.1.6...v0.1.7) - 2026-09-22
 
 ### Other
