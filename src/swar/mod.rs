@@ -129,6 +129,54 @@ fn first_match<K: Kernel>(haystack: &[u8], kernel: &K) -> Option<usize> {
 }
 
 #[inline]
+fn last_match<K: Kernel>(haystack: &[u8], kernel: &K) -> Option<usize> {
+    #[inline]
+    fn last_lane(marks: u64) -> usize {
+        debug_assert!(marks != 0);
+        (63 - marks.leading_zeros() as usize) / 8
+    }
+
+    if haystack.len() < WORD_BYTES {
+        for (offset, &byte) in haystack.iter().enumerate().rev() {
+            if kernel.matches_byte(byte) {
+                return Some(offset);
+            }
+        }
+        return None;
+    }
+
+    let (prefix, words) = haystack.as_rchunks::<WORD_BYTES>();
+    let (word, pairs) = words.as_rchunks::<2>();
+    let mut end = haystack.len();
+    for [left, right] in pairs.iter().rev() {
+        let left = kernel.matches(u64::from_le_bytes(*left));
+        let right = kernel.matches(u64::from_le_bytes(*right));
+        end -= 2 * WORD_BYTES;
+        if (left | right) != 0 {
+            return Some(if right != 0 {
+                end + WORD_BYTES + last_lane(right)
+            } else {
+                end + last_lane(left)
+            });
+        }
+    }
+    for word in word {
+        let marks = kernel.matches(u64::from_le_bytes(*word));
+        end -= WORD_BYTES;
+        if marks != 0 {
+            return Some(end + last_lane(marks));
+        }
+    }
+    if prefix.is_empty() {
+        return None;
+    }
+    let word = haystack.first_chunk::<WORD_BYTES>().unwrap();
+    let marks = kernel.matches(u64::from_le_bytes(*word));
+    let marks = marks & (u64::MAX >> ((WORD_BYTES - prefix.len()) * 8));
+    (marks != 0).then(|| last_lane(marks))
+}
+
+#[inline]
 fn count_all<K: Kernel>(haystack: &[u8], kernel: &K) -> usize {
     // Drain after 255 words to prevent byte-lane overflow.
     const CHUNKS_PER_ACCUMULATOR: usize = u8::MAX as usize;
@@ -228,9 +276,25 @@ pub(crate) fn scan_ops<K: Kernel>() -> &'static ScanOps {
         self::first_match(haystack, kernel)
     }
 
+    unsafe fn last_match<K: Kernel>(
+        kernel_storage: &KernelStorage,
+        haystack: &[u8],
+    ) -> Option<usize> {
+        // SAFETY: `MemchrN` pairs `K` with its live `KernelStorage` field.
+        let kernel = unsafe { kernel_storage.get_unchecked::<K>() };
+        self::last_match(haystack, kernel)
+    }
+
     &const {
         // SAFETY: all entry points use `K`; word scans and masked tails preserve the scan contracts.
-        unsafe { ScanOps::new(next_match_batch::<K>, count_all::<K>, first_match::<K>) }
+        unsafe {
+            ScanOps::new(
+                next_match_batch::<K>,
+                count_all::<K>,
+                first_match::<K>,
+                last_match::<K>,
+            )
+        }
     }
 }
 
