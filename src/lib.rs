@@ -11,7 +11,7 @@ use crate::search::{BitsetLookup, FixedNibble, FixedNibbleTable, NibbleLookup, S
 use core::fmt;
 use core::ops::RangeBounds;
 
-pub use bitset::ByteSet;
+pub use bitset::{ByteSet, ByteSetIter};
 
 #[cfg(feature = "manual_level")]
 pub use fearless_simd::Level;
