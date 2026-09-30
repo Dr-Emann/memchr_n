@@ -6,6 +6,7 @@ use core::ops::{
 
 const TABLE_BITS: usize = 256;
 const TABLE_BYTES: usize = TABLE_BITS / u8::BITS as usize;
+const TABLE_WORDS: usize = TABLE_BITS / u64::BITS as usize;
 
 #[derive(Copy, Clone)]
 pub(crate) struct ByteRange {
@@ -20,11 +21,14 @@ pub(crate) struct ByteRange {
 /// set occupies 32 bytes no matter how many members it holds, and adding a byte that is already a
 /// member changes nothing.
 ///
-/// Two sets combine with the bit operators: `|` is [`union`](Self::union), `&` is
-/// [`intersection`](Self::intersection), `^` is
-/// [`symmetric_difference`](Self::symmetric_difference), `-` is
-/// [`difference`](Self::difference), and `!` is the complement. Every method is usable in a `const`
-/// context; the operators are not, so a `const` set combines through the named methods.
+/// Two sets can be combined with the bit operators:
+/// - `|` is [`union`](Self::union)
+/// - `&` is [`intersection`](Self::intersection)
+/// - `^` is [`symmetric_difference`](Self::symmetric_difference)
+/// - `-` is [`difference`](Self::difference), and `!` is the complement
+///
+/// Methods for building, combining, and checking sets are usable in a `const` context;
+/// operators are not, so the named methods must be used to build a set in a `const` context.
 ///
 /// # Examples
 ///
@@ -52,7 +56,7 @@ pub(crate) struct ByteRange {
 /// };
 /// assert!(IDENTIFIER.contains(b'x'));
 /// ```
-#[derive(Copy, Clone, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
 // The bitset kernel loads the whole table into a vector register.
 #[repr(align(16))]
 pub struct ByteSet([u8; TABLE_BYTES]);
@@ -352,6 +356,24 @@ impl ByteSet {
         self.0[table_index] & (1 << bit_index) != 0
     }
 
+    /// Iterates over the members in ascending byte order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memchr_n::ByteSet;
+    ///
+    /// let set = ByteSet::from_bytes(b"caba");
+    /// assert_eq!(set.iter().collect::<Vec<_>>(), b"abc");
+    /// ```
+    pub fn iter(&self) -> ByteSetIter {
+        ByteSetIter {
+            set: *self,
+            word_index: 0,
+            word: self.word(0),
+        }
+    }
+
     /// Returns the number of members, between zero and 256.
     ///
     /// # Examples
@@ -365,7 +387,7 @@ impl ByteSet {
     pub const fn len(&self) -> usize {
         let mut len = 0;
         let mut i = 0;
-        while i < TABLE_BYTES / 8 {
+        while i < TABLE_WORDS {
             len += self.word(i).count_ones() as usize;
             i += 1;
         }
@@ -386,7 +408,7 @@ impl ByteSet {
     /// ```
     pub const fn is_empty(&self) -> bool {
         let mut i = 0;
-        while i < TABLE_BYTES / 8 {
+        while i < TABLE_WORDS {
             if self.word(i) != 0 {
                 return false;
             }
@@ -437,7 +459,7 @@ impl ByteSet {
 
     pub(crate) fn excluded_byte(&self) -> Option<u8> {
         let mut excluded = None;
-        for i in 0..TABLE_BYTES / 8 {
+        for i in 0..TABLE_WORDS {
             let missing = !self.word(i);
             if missing == 0 {
                 continue;
@@ -455,7 +477,7 @@ impl ByteSet {
         let mut last = 0;
         let mut count = 0;
         let mut i = 0;
-        while i < TABLE_BYTES / 8 {
+        while i < TABLE_WORDS {
             let word = self.word(i);
             if word != 0 {
                 let base = (i * 64) as u32;
@@ -484,7 +506,7 @@ impl ByteSet {
     pub(crate) const fn write_members<const N: usize>(&self, members: &mut [u8; N]) -> Option<u8> {
         let mut count = 0;
         let mut i = 0;
-        while i < TABLE_BYTES / 8 {
+        while i < TABLE_WORDS {
             let mut word = self.word(i);
             while word != 0 {
                 if count == N {
@@ -511,6 +533,71 @@ impl ByteSet {
             self.0[b + 6],
             self.0[b + 7],
         ])
+    }
+}
+
+/// An iterator over the distinct members of a [`ByteSet`] in ascending byte order.
+///
+/// # Examples
+///
+/// ```
+/// use memchr_n::ByteSet;
+///
+/// let set = ByteSet::from_bytes(b"zaz");
+/// assert_eq!(set.into_iter().collect::<Vec<_>>(), b"az");
+/// ```
+pub struct ByteSetIter {
+    set: ByteSet,
+    word_index: usize,
+    word: u64,
+}
+
+impl Iterator for ByteSetIter {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        loop {
+            if self.word != 0 {
+                let byte = (self.word_index * 64 + self.word.trailing_zeros() as usize) as u8;
+                self.word &= self.word - 1;
+                return Some(byte);
+            }
+            if self.word_index + 1 == TABLE_WORDS {
+                return None;
+            }
+            self.word_index += 1;
+            self.word = self.set.word(self.word_index);
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let mut remaining = self.word.count_ones() as usize;
+        for i in self.word_index + 1..TABLE_WORDS {
+            remaining += self.set.word(i).count_ones() as usize;
+        }
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for ByteSetIter {}
+
+impl core::iter::FusedIterator for ByteSetIter {}
+
+impl IntoIterator for ByteSet {
+    type Item = u8;
+    type IntoIter = ByteSetIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl IntoIterator for &ByteSet {
+    type Item = u8;
+    type IntoIter = ByteSetIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -627,6 +714,52 @@ impl fmt::Debug for ByteSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn equal_sets_hash_the_same() {
+        let first = ByteSet::from_bytes(b"caba");
+        let second = ByteSet::from_bytes(b"abc");
+        let mut sets = HashSet::new();
+        sets.insert(first);
+        assert!(sets.contains(&second));
+    }
+
+    #[test]
+    fn iteration_visits_distinct_members_in_order() {
+        let set = ByteSet::from_bytes(&[255, 64, 8, 0, 128, 7, 63, 127, 64]);
+        let expected = [0, 7, 8, 63, 64, 127, 128, 255];
+        assert_eq!(set.iter().collect::<Vec<_>>(), expected);
+        assert_eq!(set.into_iter().collect::<Vec<_>>(), expected);
+        assert_eq!((&set).into_iter().collect::<Vec<_>>(), expected);
+        assert_eq!(ByteSet::new().iter().next(), None);
+        assert_eq!(
+            ByteSet::full().iter().collect::<Vec<_>>(),
+            (0..=255).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn iteration_reports_exact_remaining_length() {
+        let set = ByteSet::from_bytes(&[255, 64, 63, 0]);
+        let mut iter = set.iter();
+        assert_eq!(iter.len(), 4);
+        assert_eq!(iter.next(), Some(0));
+        assert_eq!(iter.len(), 3);
+        assert_eq!(iter.next(), Some(63));
+        assert_eq!(iter.len(), 2);
+        assert_eq!(iter.next(), Some(64));
+        assert_eq!(iter.len(), 1);
+        assert_eq!(iter.next(), Some(255));
+        assert_eq!(iter.len(), 0);
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next(), None);
+
+        let mut empty = ByteSet::new().iter();
+        assert_eq!(empty.len(), 0);
+        assert_eq!(empty.next(), None);
+        assert_eq!(empty.next(), None);
+    }
 
     #[test]
     fn identifies_exactly_one_excluded_byte() {

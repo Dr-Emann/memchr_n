@@ -24,7 +24,10 @@ A [`ByteSet`] is built up a byte, a range, or a slice at a time, and can be comb
 (`|`, `&`, `^`, `-`, and `!`). This makes sets convenient to describe through unions, intersections, differences,
 and complements.
 
-All public inherent `ByteSet` methods are usable in a `const` context, so a set can be built once as a `const`.
+`ByteSet` implements `Hash` and yields its distinct members in ascending order through `iter()` or a `for` loop.
+
+Methods for building, combining, and checking sets are usable in a `const` context, so a set can be built once as a `const`.
+Iteration is available at runtime.
 In constant expressions, use the named methods such as `union`, `difference`, and `invert` instead of the overloaded
 operators:
 
