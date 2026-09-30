@@ -65,6 +65,16 @@ impl SearchPlan {
         res
     }
 
+    /// Returns the offset of the last matching byte in `haystack`.
+    #[inline]
+    pub(crate) fn last_match(&self, haystack: &[u8]) -> Option<usize> {
+        // SAFETY: the constructors pair the table with its live kernel and a supported SIMD level.
+        let res = unsafe { (self.scan_ops.last_match)(&self.kernel_storage, haystack) };
+        // SAFETY: `ScanOps::last_match` guarantees every returned offset is within `haystack`.
+        unsafe { core::hint::assert_unchecked(res.is_none_or(|idx| idx < haystack.len())) };
+        res
+    }
+
     /// Counts the matching bytes in `haystack`.
     #[inline]
     pub(crate) fn count_all(&self, haystack: &[u8]) -> usize {
@@ -262,6 +272,10 @@ pub(crate) struct ScanOps {
     /// Returns the lowest matching index, strictly below `haystack.len()`, or `None` if absent.
     /// Callers need only satisfy the shared requirements.
     first_match: unsafe fn(&KernelStorage, &[u8]) -> Option<usize>,
+
+    /// Returns the highest matching index, strictly below `haystack.len()`, or `None` if absent.
+    /// Callers need only satisfy the shared requirements.
+    last_match: unsafe fn(&KernelStorage, &[u8]) -> Option<usize>,
 }
 
 impl ScanOps {
@@ -270,16 +284,18 @@ impl ScanOps {
     /// # Safety
     ///
     /// All entry points must use the same kernel and SIMD level and uphold the contracts of
-    /// [`Self::next_match_batch`], [`Self::count_all`], and [`Self::first_match`].
+    /// [`Self::next_match_batch`], [`Self::count_all`], [`Self::first_match`], and [`Self::last_match`].
     pub(crate) const unsafe fn new(
         next_match_batch: unsafe fn(&KernelStorage, &mut IterState<'_>) -> MatchedBitset,
         count_all: unsafe fn(&KernelStorage, &[u8]) -> usize,
         first_match: unsafe fn(&KernelStorage, &[u8]) -> Option<usize>,
+        last_match: unsafe fn(&KernelStorage, &[u8]) -> Option<usize>,
     ) -> Self {
         Self {
             next_match_batch,
             count_all,
             first_match,
+            last_match,
         }
     }
 }
@@ -291,17 +307,17 @@ fn never_scan_ops() -> &'static ScanOps {
         0
     }
 
-    fn count_all(_data: &KernelStorage, _haystack: &[u8]) -> usize {
+    fn count_zero(_data: &KernelStorage, _haystack: &[u8]) -> usize {
         0
     }
 
-    fn first_match(_data: &KernelStorage, _haystack: &[u8]) -> Option<usize> {
+    fn never_match(_data: &KernelStorage, _haystack: &[u8]) -> Option<usize> {
         None
     }
 
     &const {
         // SAFETY: these entry points never match or read the kernel; batches exhaust the haystack.
-        unsafe { ScanOps::new(next_match_batch, count_all, first_match) }
+        unsafe { ScanOps::new(next_match_batch, count_zero, never_match, never_match) }
     }
 }
 
@@ -363,9 +379,15 @@ mod tests {
             "{case}"
         );
         assert_eq!(plan.count_all(&haystack), expected.len(), "{case}");
+        assert_eq!(
+            plan.last_match(&haystack),
+            expected.last().copied(),
+            "{case}"
+        );
         assert_eq!(batched_offsets(plan, &haystack), expected, "{case}");
 
         assert_eq!(plan.first_match(&[]), None, "{case} on empty input");
+        assert_eq!(plan.last_match(&[]), None, "{case} on empty input");
         assert_eq!(plan.count_all(&[]), 0, "{case} on empty input");
         let mut state = IterState {
             haystack: &[],

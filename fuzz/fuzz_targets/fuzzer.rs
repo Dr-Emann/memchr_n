@@ -26,6 +26,14 @@ fn target(allow_simd: bool, words: [u64; 4], haystack: &[u8]) {
 
     assert_eq!(finder.iter(haystack).collect::<Vec<_>>(), expected);
     assert_eq!(finder.iter(haystack).count(), expected.len());
+    assert_eq!(finder.rfind(haystack), expected.last().copied());
+
+    let mut end = haystack.len();
+    for &offset in expected.iter().rev() {
+        assert_eq!(finder.rfind(&haystack[..end]), Some(offset));
+        end = offset;
+    }
+    assert_eq!(finder.rfind(&haystack[..end]), None);
 
     let mut start = 0;
     for offset in expected {

@@ -1,4 +1,7 @@
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{
+    BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+    measurement::WallTime,
+};
 use memchr_n::{Backend, MemchrN};
 use std::hint::black_box;
 use std::time::Duration;
@@ -61,6 +64,14 @@ impl Needles {
             Self::One(a) => memchr::memchr(a, haystack),
             Self::Two(a, b) => memchr::memchr2(a, b, haystack),
             Self::Three(a, b, c) => memchr::memchr3(a, b, c, haystack),
+        }
+    }
+
+    fn rfind(self, haystack: &[u8]) -> Option<usize> {
+        match self {
+            Self::One(a) => memchr::memrchr(a, haystack),
+            Self::Two(a, b) => memchr::memrchr2(a, b, haystack),
+            Self::Three(a, b, c) => memchr::memrchr3(a, b, c, haystack),
         }
     }
 
@@ -150,6 +161,16 @@ fn expected_find(set: ByteSet, haystack: &[u8]) -> Option<usize> {
     None
 }
 
+fn expected_rfind(set: ByteSet, haystack: &[u8]) -> Option<usize> {
+    let mut last = None;
+    for (offset, &byte) in haystack.iter().enumerate() {
+        if set.contains(byte) {
+            last = Some(offset);
+        }
+    }
+    last
+}
+
 fn expected_offset_sum(set: ByteSet, haystack: &[u8]) -> usize {
     let mut sum = 0usize;
     for (offset, &byte) in haystack.iter().enumerate() {
@@ -176,6 +197,11 @@ fn verified_finder(set: ByteSet, backend: Backend, haystack: &[u8], label: &str)
         "first-match mismatch for {label}"
     );
     assert_eq!(
+        finder.rfind(haystack),
+        expected_rfind(set, haystack),
+        "last-match mismatch for {label}"
+    );
+    assert_eq!(
         finder.iter(haystack).count(),
         expected_count(set, haystack),
         "count mismatch for {label}"
@@ -194,6 +220,11 @@ fn verified_needles(set: ByteSet, haystack: &[u8], label: &str) -> Option<Needle
         needles.find(haystack),
         expected_find(set, haystack),
         "memchr first-match mismatch for {label}"
+    );
+    assert_eq!(
+        needles.rfind(haystack),
+        expected_rfind(set, haystack),
+        "memchr last-match mismatch for {label}"
     );
     assert_eq!(
         needles.count(haystack),
@@ -312,6 +343,90 @@ fn bench_find(c: &mut Criterion) {
     group.finish();
 }
 
+fn reverse_haystack(set: ByteSet, len: usize, offset: Option<usize>) -> Vec<u8> {
+    let mut filler = None;
+    let mut needle = None;
+    for byte in 0..=u8::MAX {
+        if set.contains(byte) {
+            needle = Some(byte);
+        } else {
+            filler = Some(byte);
+        }
+    }
+    let mut haystack = vec![filler.expect("reverse benchmark set must permit misses"); len];
+    if let Some(offset) = offset {
+        haystack[offset] = needle.expect("reverse benchmark set must permit hits");
+    }
+    assert_eq!(expected_rfind(set, &haystack), offset);
+    haystack
+}
+
+fn bench_rfind_case(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    set: ByteSet,
+    haystack: &[u8],
+    label: &str,
+) {
+    for (backend_name, backend) in [("auto", Backend::Auto), ("swar", Backend::Swar)] {
+        let label = format!("{backend_name}/{label}");
+        let finder = verified_finder(set, backend, haystack, &label);
+        group.bench_function(BenchmarkId::new(OURS, &label), |b| {
+            b.iter(|| black_box(&finder).rfind(black_box(haystack)))
+        });
+    }
+    let Some(needles) = verified_needles(set, haystack, label) else {
+        return;
+    };
+    group.bench_function(BenchmarkId::new(THEIRS, label), |b| {
+        b.iter(|| black_box(needles).rfind(black_box(haystack)))
+    });
+}
+
+fn bench_rfind(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rfind");
+    let one_byte = ByteSet::List(b"x");
+    for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+        for (name, offset) in [
+            ("miss", None),
+            ("hit-start", Some(0)),
+            ("hit-end", len.checked_sub(1)),
+        ] {
+            if len == 0 && name != "miss" {
+                continue;
+            }
+            let haystack = reverse_haystack(one_byte, len, offset);
+            let label = format!("one-byte/{name}-{len:03}");
+            bench_rfind_case(&mut group, one_byte, &haystack, &label);
+        }
+    }
+
+    for (set_name, set) in [
+        ("one-byte", one_byte),
+        ("two-bytes", ByteSet::List(b"xy")),
+        ("three-bytes", ByteSet::List(b"xyz")),
+        ("not-byte", ByteSet::NotByte(b'.')),
+        ("one-range", ByteSet::Range(b'0', b'9')),
+        ("small-set", ByteSet::List(b"aeiouAEI")),
+        ("fixed-nibble", ByteSet::List(b"abcdefghjl")),
+        ("hex-16", ByteSet::List(HEX_LOWER)),
+        ("alnum-62", ByteSet::List(ALNUM)),
+        ("bitset-diagonal-9", ByteSet::List(BITSET_DIAGONAL)),
+    ] {
+        for len in [128, 4096, 65536] {
+            for (name, offset) in [
+                ("miss", None),
+                ("hit-start", Some(1)),
+                ("hit-end", Some(len - 2)),
+            ] {
+                let haystack = reverse_haystack(set, len, offset);
+                let label = format!("{set_name}/{name}-{len:03}");
+                bench_rfind_case(&mut group, set, &haystack, &label);
+            }
+        }
+    }
+    group.finish();
+}
+
 fn bench_count(c: &mut Criterion) {
     let mut group = c.benchmark_group("count/sherlock");
     group.throughput(Throughput::Bytes(SHERLOCK.len() as u64));
@@ -360,6 +475,6 @@ criterion_group! {
         .sample_size(20)
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = bench_build, bench_find, bench_count, bench_iterate
+    targets = bench_build, bench_find, bench_rfind, bench_count, bench_iterate
 }
 criterion_main!(benches);

@@ -248,6 +248,25 @@ impl MemchrN {
         self.search.first_match(haystack)
     }
 
+    /// Returns the offset of the last matching byte in `haystack`.
+    ///
+    /// The offset is measured from the start of `haystack`. Returns `None` if
+    /// the haystack is empty or contains no matching byte.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memchr_n::MemchrN;
+    ///
+    /// let finder = MemchrN::new(b"aeiou");
+    /// assert_eq!(finder.rfind(b"rhythm and blues"), Some(14));
+    /// assert_eq!(finder.rfind(b"rhythm"), None);
+    /// ```
+    #[inline]
+    pub fn rfind(&self, haystack: &[u8]) -> Option<usize> {
+        self.search.last_match(haystack)
+    }
+
     /// Returns an [`Iter`] over the offsets of every matching byte in `haystack`.
     ///
     /// If only the first match is needed, prefer [`find`](Self::find).
@@ -843,6 +862,11 @@ mod tests {
                         "{name} {set:?} {len}"
                     );
                     assert_eq!(
+                        finder.rfind(&haystack),
+                        expected.last().copied(),
+                        "{name} {set:?} {len}"
+                    );
+                    assert_eq!(
                         finder.iter(&haystack).collect::<Vec<_>>(),
                         expected,
                         "{name} {set:?} {len}"
@@ -886,6 +910,7 @@ mod tests {
                     let expected = start <= byte && byte <= last;
                     let haystack = [byte];
                     assert_eq!(searcher.find(&haystack), expected.then_some(0));
+                    assert_eq!(searcher.rfind(&haystack), expected.then_some(0));
                     assert_eq!(searcher.iter(&haystack).next(), expected.then_some(0));
                     assert_eq!(searcher.iter(&haystack).count(), usize::from(expected));
                 }
@@ -1073,6 +1098,7 @@ mod tests {
     #[track_caller]
     fn assert_same_finder(built: &MemchrN, expected: &MemchrN, case: &str) {
         let all: Vec<u8> = (0..=u8::MAX).collect();
+        assert_eq!(built.rfind(&all), expected.rfind(&all), "{case}");
         assert_eq!(
             built.iter(&all).collect::<Vec<_>>(),
             expected.iter(&all).collect::<Vec<_>>(),
@@ -1232,7 +1258,8 @@ mod tests {
     #[test]
     fn find_matches_naive() {
         for set in sets() {
-            for (name, searcher) in [("vector", build(&set)), ("word", build_word(&set))] {
+            for backend in test_backends() {
+                let searcher = MemchrN::new_with_backend(&set, backend);
                 let lens = (0..=80).chain([127, 128, 129, 255, 256, 1000]);
                 for len in lens {
                     let haystack = haystack(len);
@@ -1240,8 +1267,197 @@ mod tests {
                     assert_eq!(
                         searcher.find(&haystack),
                         expected,
-                        "{name} set {set:?} len {len}"
+                        "{backend:?} set {set:?} len {len}"
                     );
+                }
+            }
+        }
+    }
+
+    fn test_backends() -> Vec<Backend> {
+        let backends = vec![Backend::Auto, Backend::Swar];
+        #[cfg(feature = "manual_level")]
+        let backends = {
+            let mut backends = backends;
+            let baseline = Level::baseline();
+            let resolved = Level::new();
+            backends.push(Backend::Level(baseline));
+            backends.push(Backend::Level(resolved));
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            for level in [
+                resolved.as_sse2().map(Level::Sse2),
+                resolved.as_sse4_2().map(Level::Sse4_2),
+                resolved.as_avx2().map(Level::Avx2),
+                resolved.as_avx512().map(Level::Avx512),
+            ] {
+                let Some(level) = level else {
+                    continue;
+                };
+                if core::mem::discriminant(&level) != core::mem::discriminant(&baseline)
+                    && core::mem::discriminant(&level) != core::mem::discriminant(&resolved)
+                {
+                    backends.push(Backend::Level(level));
+                }
+            }
+            backends
+        };
+        backends
+    }
+
+    #[test]
+    fn rfind_matches_naive_and_iteration() {
+        let mut sets = sets();
+        sets.extend([vec![0], vec![255], vec![0, 255], (0..=255).collect()]);
+        for set in sets {
+            for backend in test_backends() {
+                let finder = MemchrN::new_with_backend(&set, backend);
+                for len in (0..=80).chain([127, 128, 129, 191, 192, 193, 255, 256, 257, 1000]) {
+                    let mut haystack = haystack(len);
+                    if len > 1 {
+                        haystack[len / 2] = 0;
+                        haystack[len - 1] = 255;
+                    }
+                    let expected = naive(&set, &haystack).last().copied();
+                    assert_eq!(
+                        finder.rfind(&haystack),
+                        expected,
+                        "{backend:?} {set:?} {len}"
+                    );
+                    assert_eq!(
+                        finder.rfind(&haystack),
+                        finder.iter(&haystack).last(),
+                        "{backend:?} {set:?} {len}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rfind_reports_every_short_offset() {
+        let mut sets = sets();
+        sets.extend([vec![0], vec![255], vec![0, 255]]);
+        for set in sets {
+            let Some(&needle) = set.first() else {
+                continue;
+            };
+            let mut pad = 0;
+            while set.contains(&pad) {
+                pad += 1;
+            }
+            for backend in test_backends() {
+                let finder = MemchrN::new_with_backend(&set, backend);
+                for len in 0..=80 {
+                    let mut haystack = vec![pad; len];
+                    assert_eq!(finder.rfind(&haystack), None, "{backend:?} {set:?} {len}");
+                    for offset in 0..len {
+                        haystack[offset] = needle;
+                        assert_eq!(
+                            finder.rfind(&haystack),
+                            Some(offset),
+                            "{backend:?} {set:?} len {len} offset {offset}"
+                        );
+                        haystack[offset] = pad;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rfind_respects_subslice_bounds_and_prefers_the_last_match() {
+        let mut sets = sets();
+        sets.extend([vec![0], vec![255], vec![0, 255]]);
+        for set in sets {
+            let Some(&needle) = set.first() else {
+                continue;
+            };
+            let mut pad = 0;
+            while set.contains(&pad) {
+                pad += 1;
+            }
+            for backend in test_backends() {
+                let finder = MemchrN::new_with_backend(&set, backend);
+                for len in [
+                    0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 79, 80, 81, 127, 128, 129,
+                    191, 192, 193, 255, 256, 257, 511, 512, 513,
+                ] {
+                    for alignment in 0..64 {
+                        let mut storage = vec![needle; len + 128];
+                        let start = alignment + 1;
+                        let haystack = &mut storage[start..start + len];
+                        haystack.fill(pad);
+                        assert_eq!(
+                            finder.rfind(haystack),
+                            None,
+                            "{backend:?} {set:?} len {len} alignment {alignment}"
+                        );
+                        let mut last = 0;
+                        for offset in [
+                            0,
+                            1,
+                            7,
+                            8,
+                            15,
+                            16,
+                            31,
+                            32,
+                            63,
+                            64,
+                            127,
+                            128,
+                            len / 2,
+                            len.saturating_sub(1),
+                        ] {
+                            if offset >= len {
+                                continue;
+                            }
+                            haystack[offset] = needle;
+                            last = last.max(offset);
+                            assert_eq!(
+                                finder.rfind(haystack),
+                                Some(last),
+                                "{backend:?} {set:?} len {len} alignment {alignment} offset {offset}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rfind_ranges_and_complements_match_naive() {
+        for backend in test_backends() {
+            for (start, last) in [(b'0', b'9'), (0, 127), (127, 130), (128, 255), (0, 255)] {
+                let set: Vec<u8> = (start..=last).collect();
+                let finder = MemchrN::from_range_with_backend(start..=last, backend);
+                for len in (0..=80).chain([127, 128, 129, 255, 256, 257, 1000]) {
+                    let haystack = haystack(len);
+                    assert_eq!(
+                        finder.rfind(&haystack),
+                        naive(&set, &haystack).last().copied(),
+                        "{backend:?} {start}..={last} {len}"
+                    );
+                    assert_eq!(finder.rfind(&haystack), finder.iter(&haystack).last());
+                }
+            }
+            for range in [
+                (Bound::Excluded(255), Bound::Unbounded),
+                (Bound::Unbounded, Bound::Excluded(0)),
+                (Bound::Included(3), Bound::Excluded(3)),
+            ] {
+                let finder = MemchrN::from_range_with_backend(range, backend);
+                for len in [0, 1, 15, 16, 64, 65, 128, 1000] {
+                    assert_eq!(finder.rfind(&haystack(len)), None);
+                }
+            }
+            for excluded in [0, 1, b' ', 127, 128, 254, 255] {
+                let finder = MemchrN::from_not_byte_with_backend(excluded, backend);
+                for len in (0..=80).chain([127, 128, 129, 255, 256, 257, 1000]) {
+                    let haystack = haystack(len);
+                    assert_not_byte(&finder, excluded, &haystack);
+                    assert_eq!(finder.rfind(&haystack), finder.iter(&haystack).last());
                 }
             }
         }
@@ -1356,7 +1572,8 @@ mod tests {
 
     #[test]
     fn find_reports_every_offset() {
-        for (name, searcher) in [("vector", build(b"x")), ("word", build_word(b"x"))] {
+        for backend in test_backends() {
+            let searcher = MemchrN::new_with_backend(b"x", backend);
             for len in 0..=80 {
                 for offset in 0..len {
                     let mut haystack = vec![b'.'; len];
@@ -1364,13 +1581,13 @@ mod tests {
                     assert_eq!(
                         searcher.find(&haystack),
                         Some(offset),
-                        "{name} len {len} offset {offset}"
+                        "{backend:?} len {len} offset {offset}"
                     );
                 }
                 assert_eq!(
                     searcher.find(&vec![b'.'; len]),
                     None,
-                    "{name} miss len {len}"
+                    "{backend:?} miss len {len}"
                 );
             }
         }
@@ -1425,6 +1642,11 @@ mod tests {
                             let expected = set.contains(&byte).then_some(offset);
                             assert_eq!(
                                 searcher.find(&haystack),
+                                expected,
+                                "{name} set {set:?} byte {byte} len {len} offset {offset}"
+                            );
+                            assert_eq!(
+                                searcher.rfind(&haystack),
                                 expected,
                                 "{name} set {set:?} byte {byte} len {len} offset {offset}"
                             );
@@ -1501,13 +1723,14 @@ mod tests {
     #[test]
     fn find_agrees_with_the_iterator() {
         for set in sets() {
-            for (name, searcher) in [("vector", build(&set)), ("word", build_word(&set))] {
+            for backend in test_backends() {
+                let searcher = MemchrN::new_with_backend(&set, backend);
                 for len in (0..=80).chain([127, 128, 129, 191, 192, 255, 256, 1000]) {
                     let haystack = haystack(len);
                     assert_eq!(
                         searcher.find(&haystack),
                         searcher.iter(&haystack).next(),
-                        "{name} set {set:?} len {len}"
+                        "{backend:?} set {set:?} len {len}"
                     );
                 }
             }
@@ -1530,6 +1753,7 @@ mod tests {
             }
         }
         assert_eq!(searcher.find(haystack), expected.first().copied());
+        assert_eq!(searcher.rfind(haystack), expected.last().copied());
         assert_eq!(searcher.iter(haystack).collect::<Vec<_>>(), expected);
         assert_eq!(searcher.iter(haystack).count(), expected.len());
         for n in [0, 1, 7, 63, 64, 127, 128, haystack.len()] {

@@ -61,9 +61,10 @@ available CPU features. Construction can be relatively expensive compared with a
 searcher when possible. For a fixed byte set used throughout a program, consider storing it globally in a
 `LazyLock` or `OnceLock`.
 
-There are two main things you can do with a [`MemchrN`]:
+There are three main things you can do with a [`MemchrN`]:
 
 - [`MemchrN::find`] finds the first position of a byte in a haystack that belongs to the set.
+- [`MemchrN::rfind`] finds the last position of a byte in a haystack that belongs to the set.
 - [`MemchrN::iter`] returns an iterator which iterates over the positions of every byte in a haystack that belongs
   to the set.
 
@@ -150,6 +151,7 @@ running CPU.
 [`Level`]: https://docs.rs/memchr-n/latest/memchr_n/enum.Level.html
 [`MemchrN`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html
 [`MemchrN::find`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.find
+[`MemchrN::rfind`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.rfind
 [`MemchrN::from_byte_set`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.from_byte_set
 [`MemchrN::from_iter`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.from_iter
 [`MemchrN::from_not_byte`]: https://docs.rs/memchr-n/latest/memchr_n/struct.MemchrN.html#method.from_not_byte
