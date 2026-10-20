@@ -76,14 +76,15 @@ impl Kernel for NotByte {
 #[derive(Copy, Clone)]
 pub(crate) struct OneRange {
     splatted_start: [u8; 16],
-    splatted_last: [u8; 16],
+    /// Splatted `last - start`.
+    splatted_span: [u8; 16],
 }
 
 impl OneRange {
     pub(crate) fn new(ByteRange { start, last }: ByteRange) -> Self {
         Self {
             splatted_start: [start; 16],
-            splatted_last: [last; 16],
+            splatted_span: [last.wrapping_sub(start); 16],
         }
     }
 }
@@ -92,14 +93,17 @@ impl Kernel for OneRange {
     #[inline(always)]
     fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
         let simd = chunk.token();
-        chunk.simd_ge(V::block_splat(u8x16::load_array(simd, self.splatted_start)))
-            & chunk.simd_le(V::block_splat(u8x16::load_array(simd, self.splatted_last)))
+        // Wrapping subtraction, so a byte before the range wraps to above 0..span.
+        // This lets us check the range with a subtraction and a compare, rather than two compares
+        // and an AND.
+        let shifted = chunk - V::block_splat(u8x16::load_array(simd, self.splatted_start));
+        shifted.simd_le(V::block_splat(u8x16::load_array(simd, self.splatted_span)))
     }
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        let (start, last) = (self.splatted_start[0], self.splatted_last[0]);
-        start <= byte && byte <= last
+        let (start, span) = (self.splatted_start[0], self.splatted_span[0]);
+        byte.wrapping_sub(start) <= span
     }
 }
 
