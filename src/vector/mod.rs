@@ -4,7 +4,7 @@ use crate::search::{KernelStorage, ScanOps, StoredKernel};
 use crate::{IterState, MatchedBitset};
 use core::mem::transmute_copy;
 use fearless_simd::prelude::*;
-use fearless_simd::{Bytes, Level, i8x16, i8x32, i8x64, kernel, u8x16, u8x32, u8x64, u64x2};
+use fearless_simd::{Level, i8x16, i8x32, i8x64, kernel, u8x16, u8x32, u8x64, u64x2};
 use fearless_simd_macros::simd;
 
 const CHUNK_BYTES: usize = 64;
@@ -29,7 +29,7 @@ pub(crate) trait Kernel: StoredKernel {
 
 /// A vector of `u8` lanes that can be reinterpreted as `i8` lanes.
 ///
-/// x86 only compares bytes as signed, so kernels that bias their bytes into signed order can
+/// x86 below AVX-512 only compares bytes as signed, so kernels that bias their bytes into signed order can
 /// compare them in one instruction.
 pub(crate) trait ByteLanes<S: Simd>:
     SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = Self>

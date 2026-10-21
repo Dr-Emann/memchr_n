@@ -2,7 +2,7 @@ use super::{ByteLanes, Kernel};
 use crate::bitset::{ByteRange, ByteSet};
 use crate::search::{BitsetLookup, FixedNibble, FixedNibbleTable, NibbleLookup, StoredKernel};
 use fearless_simd::prelude::*;
-use fearless_simd::{Bytes, i8x16, u8x16, u8x32, u8x64};
+use fearless_simd::{i8x16, u8x16, u8x32, u8x64};
 
 /// Compares each byte with up to three needles.
 #[derive(Copy, Clone)]
@@ -97,7 +97,7 @@ impl Kernel for OneRange {
     #[inline(always)]
     fn matches<S: Simd, V: ByteLanes<S>>(&self, chunk: V) -> V::Mask {
         let simd = chunk.token();
-        // Wrapping subtraction, so a byte before the range wraps to above 0..span, and the extra
+        // Wrapping subtraction, so a byte before the range wraps to above 0..=span, and the extra
         // 128 moves `start` to `i8::MIN`. x86 has no unsigned byte compare below AVX-512, but a
         // signed compare is one instruction, so this is a subtraction and a single compare.
         let biased = chunk - V::block_splat(u8x16::load_array(simd, self.splatted_biased_start));
