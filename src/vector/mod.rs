@@ -4,7 +4,7 @@ use crate::search::{KernelStorage, ScanOps, StoredKernel};
 use crate::{IterState, MatchedBitset};
 use core::mem::transmute_copy;
 use fearless_simd::prelude::*;
-use fearless_simd::{Level, i8x16, i8x64, kernel, u8x16, u8x32, u8x64, u64x2};
+use fearless_simd::{Level, i8x16, i8x32, i8x64, kernel, u8x16, u8x32, u8x64, u64x2};
 use fearless_simd_macros::simd;
 
 const CHUNK_BYTES: usize = 64;
@@ -19,15 +19,35 @@ const PROBE_BYTES: usize = 1;
 
 /// Tests a chunk of [`CHUNK_BYTES`] bytes against a byte set.
 pub(crate) trait Kernel: StoredKernel {
-    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
-        &self,
-        chunk: V,
-    ) -> V::Mask;
+    fn matches<S: Simd, V: ByteLanes<S>>(&self, chunk: V) -> V::Mask;
 
     /// Whether the byte set holds `byte`.
     ///
     /// This scalar path avoids staging for the leading bytes of short haystacks.
     fn matches_byte(&self, byte: u8) -> bool;
+}
+
+/// A vector of `u8` lanes that can be reinterpreted as `i8` lanes.
+///
+/// x86 below AVX-512 only compares bytes as signed, so kernels that bias their bytes into signed order can
+/// compare them in one instruction.
+pub(crate) trait ByteLanes<S: Simd>:
+    SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = Self>
+{
+    /// The same lanes as `i8`.
+    type Signed: SimdInt<S, Element = i8, Block = i8x16<S>, Mask = Self::Mask, ByteVector = Self>;
+}
+
+impl<S: Simd> ByteLanes<S> for u8x16<S> {
+    type Signed = i8x16<S>;
+}
+
+impl<S: Simd> ByteLanes<S> for u8x32<S> {
+    type Signed = i8x32<S>;
+}
+
+impl<S: Simd> ByteLanes<S> for u8x64<S> {
+    type Signed = i8x64<S>;
 }
 
 /// Whether the target has a single-instruction dynamic byte shuffle.
@@ -156,8 +176,7 @@ fn first_match<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -> Opti
     let native_width = S::u8s::LEN;
     if native_width < CHUNK_BYTES {
         for chunk in rest.chunks_exact(native_width) {
-            let matched = kernel.matches(S::u8s::from_slice(simd, chunk));
-            if let Some(lane) = first_matching_lane(matched) {
+            if let Some(lane) = native_matching_lane(simd, kernel, chunk, Lane::First) {
                 return Some(offset + lane);
             }
             offset += native_width;
@@ -168,8 +187,7 @@ fn first_match<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -> Opti
         return None;
     }
     let offset = haystack.len() - native_width;
-    let matched = kernel.matches(S::u8s::from_slice(simd, &haystack[offset..]));
-    first_matching_lane(matched).map(|lane| offset + lane)
+    native_matching_lane(simd, kernel, &haystack[offset..], Lane::First).map(|lane| offset + lane)
 }
 
 #[inline(always)]
@@ -211,8 +229,7 @@ fn last_match<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -> Optio
     if native_width < CHUNK_BYTES {
         for chunk in prefix.rchunks_exact(native_width) {
             end -= native_width;
-            let matched = kernel.matches(S::u8s::from_slice(simd, chunk));
-            if let Some(lane) = last_matching_lane(matched) {
+            if let Some(lane) = native_matching_lane(simd, kernel, chunk, Lane::Last) {
                 return Some(end + lane);
             }
         }
@@ -221,8 +238,41 @@ fn last_match<S: Simd, K: Kernel>(simd: S, haystack: &[u8], kernel: &K) -> Optio
         return None;
     }
     // The overlapping suffix was already checked and contains no matches.
-    let matched = kernel.matches(S::u8s::from_slice(simd, &haystack[..native_width]));
-    last_matching_lane(matched)
+    native_matching_lane(simd, kernel, &haystack[..native_width], Lane::Last)
+}
+
+/// Which matching lane [`native_matching_lane`] reports.
+#[derive(Copy, Clone)]
+enum Lane {
+    First,
+    Last,
+}
+
+/// Returns the first or last matching lane of a native-width `chunk`.
+///
+/// `S::u8s` is always one of the concrete byte vectors, but the compiler cannot prove it is a
+/// [`ByteLanes`] for an opaque level, so this picks the concrete type by width.
+#[inline(always)]
+fn native_matching_lane<S: Simd, K: Kernel>(
+    simd: S,
+    kernel: &K,
+    chunk: &[u8],
+    lane: Lane,
+) -> Option<usize> {
+    #[inline(always)]
+    fn pick<S: Simd, M: SimdMask<S, Element = i8>>(matched: M, lane: Lane) -> Option<usize> {
+        match lane {
+            Lane::First => first_matching_lane(matched),
+            Lane::Last => last_matching_lane(matched),
+        }
+    }
+
+    match S::u8s::LEN {
+        16 => pick(kernel.matches(u8x16::from_slice(simd, chunk)), lane),
+        32 => pick(kernel.matches(u8x32::from_slice(simd, chunk)), lane),
+        64 => pick(kernel.matches(u8x64::from_slice(simd, chunk)), lane),
+        width => unreachable!("no byte vector has {width} lanes"),
+    }
 }
 
 #[inline(always)]
