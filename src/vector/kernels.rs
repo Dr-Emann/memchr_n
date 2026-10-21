@@ -1,8 +1,8 @@
-use super::Kernel;
+use super::{ByteLanes, Kernel};
 use crate::bitset::{ByteRange, ByteSet};
 use crate::search::{BitsetLookup, FixedNibble, FixedNibbleTable, NibbleLookup, StoredKernel};
 use fearless_simd::prelude::*;
-use fearless_simd::{u8x16, u8x32, u8x64};
+use fearless_simd::{Bytes, i8x16, u8x16, u8x32, u8x64};
 
 /// Compares each byte with up to three needles.
 #[derive(Copy, Clone)]
@@ -25,7 +25,7 @@ where
     Self: StoredKernel,
 {
     #[inline(always)]
-    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
+    fn matches<S: Simd, V: ByteLanes<S>>(&self, chunk: V) -> V::Mask {
         let simd = chunk.token();
         let mut matched = V::Mask::splat(simd, false);
         for &needle in &self.splatted_needles {
@@ -60,7 +60,7 @@ impl NotByte {
 
 impl Kernel for NotByte {
     #[inline(always)]
-    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
+    fn matches<S: Simd, V: ByteLanes<S>>(&self, chunk: V) -> V::Mask {
         !chunk.simd_eq(V::block_splat(u8x16::load_array(
             chunk.token(),
             self.splatted_byte,
@@ -75,35 +75,40 @@ impl Kernel for NotByte {
 
 #[derive(Copy, Clone)]
 pub(crate) struct OneRange {
-    splatted_start: [u8; 16],
-    /// Splatted `last - start`.
-    splatted_span: [u8; 16],
+    /// Splatted `start + 128`, which moves `start` to `i8::MIN`.
+    splatted_biased_start: [u8; 16],
+    /// Splatted `last - start + 1 - 128`, the exclusive signed bound after biasing.
+    splatted_limit: [i8; 16],
 }
 
 impl OneRange {
+    /// Full ranges must use an always-matching plan instead, since no strict bound covers them.
     pub(crate) fn new(ByteRange { start, last }: ByteRange) -> Self {
+        let span = last.wrapping_sub(start);
+        debug_assert!(span != u8::MAX, "a full range has no strict upper bound");
         Self {
-            splatted_start: [start; 16],
-            splatted_span: [last.wrapping_sub(start); 16],
+            splatted_biased_start: [start.wrapping_add(0x80); 16],
+            splatted_limit: [(span.wrapping_add(1) ^ 0x80).cast_signed(); 16],
         }
     }
 }
 
 impl Kernel for OneRange {
     #[inline(always)]
-    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>>>(&self, chunk: V) -> V::Mask {
+    fn matches<S: Simd, V: ByteLanes<S>>(&self, chunk: V) -> V::Mask {
         let simd = chunk.token();
-        // Wrapping subtraction, so a byte before the range wraps to above 0..span.
-        // This lets us check the range with a subtraction and a compare, rather than two compares
-        // and an AND.
-        let shifted = chunk - V::block_splat(u8x16::load_array(simd, self.splatted_start));
-        shifted.simd_le(V::block_splat(u8x16::load_array(simd, self.splatted_span)))
+        // Wrapping subtraction, so a byte before the range wraps to above 0..span, and the extra
+        // 128 moves `start` to `i8::MIN`. x86 has no unsigned byte compare below AVX-512, but a
+        // signed compare is one instruction, so this is a subtraction and a single compare.
+        let biased = chunk - V::block_splat(u8x16::load_array(simd, self.splatted_biased_start));
+        let limit = V::Signed::block_splat(i8x16::load_array(simd, self.splatted_limit));
+        V::Signed::from_bytes(biased).simd_lt(limit)
     }
 
     #[inline(always)]
     fn matches_byte(&self, byte: u8) -> bool {
-        let (start, span) = (self.splatted_start[0], self.splatted_span[0]);
-        byte.wrapping_sub(start) <= span
+        let (biased_start, limit) = (self.splatted_biased_start[0], self.splatted_limit[0]);
+        byte.wrapping_sub(biased_start).cast_signed() < limit
     }
 }
 
@@ -124,10 +129,7 @@ impl SmallSet {
 
 impl Kernel for SmallSet {
     #[inline(always)]
-    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
-        &self,
-        chunk: V,
-    ) -> V::Mask {
+    fn matches<S: Simd, V: ByteLanes<S>>(&self, chunk: V) -> V::Mask {
         let simd = chunk.token();
         let lo_lookup = V::block_splat(u8x16::load_array(simd, self.lo_lookup.0));
         let hi_lookup = V::block_splat(u8x16::load_array(simd, self.hi_lookup.0));
@@ -169,10 +171,7 @@ impl FixedNibbleSet {
 
 impl Kernel for FixedNibbleSet {
     #[inline(always)]
-    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
-        &self,
-        chunk: V,
-    ) -> V::Mask {
+    fn matches<S: Simd, V: ByteLanes<S>>(&self, chunk: V) -> V::Mask {
         let table = V::block_splat(u8x16::simd_from(chunk.token(), self.table));
         let non_const_nibbles = match self.fixed_nibble {
             FixedNibble::Low => chunk >> 4,
@@ -195,10 +194,7 @@ impl Kernel for FixedNibbleSet {
 
 impl Kernel for BitsetLookup {
     #[inline(always)]
-    fn matches<S: Simd, V: SimdInt<S, Element = u8, Block = u8x16<S>, ByteVector = V>>(
-        &self,
-        chunk: V,
-    ) -> V::Mask {
+    fn matches<S: Simd, V: ByteLanes<S>>(&self, chunk: V) -> V::Mask {
         let bits = V::block_splat(u8x16::from_fn(chunk.token(), |i| 1 << (i % 8)));
         let bit = bits.swizzle_dyn_within_blocks(chunk & 0b0111);
         !(bit & lookup_membership_bytes(self.byte_set(), chunk >> 3)).simd_eq(0)

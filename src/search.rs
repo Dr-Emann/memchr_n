@@ -46,6 +46,17 @@ impl SearchPlan {
         }
     }
 
+    /// Plans a search that matches every byte.
+    pub(crate) fn always() -> Self {
+        Self {
+            // The entry points never read the kernel, so the storage only needs some live field.
+            kernel_storage: ().into(),
+            scan_ops: always_scan_ops(),
+            engine: Engine::Swar,
+            kernel_kind: KernelKind::Always,
+        }
+    }
+
     pub(crate) fn engine(&self) -> Engine {
         self.engine
     }
@@ -140,6 +151,7 @@ pub(crate) enum KernelKind {
     ThreeBytes,
     OneRange,
     Never,
+    Always,
 }
 
 /// A kernel that [`KernelStorage`] can hold, along with the [`KernelKind`] naming it.
@@ -318,6 +330,34 @@ fn never_scan_ops() -> &'static ScanOps {
     &const {
         // SAFETY: these entry points never match or read the kernel; batches exhaust the haystack.
         unsafe { ScanOps::new(next_match_batch, count_zero, never_match, never_match) }
+    }
+}
+
+fn always_scan_ops() -> &'static ScanOps {
+    fn next_match_batch(_data: &KernelStorage, state: &mut IterState<'_>) -> MatchedBitset {
+        let len = (state.haystack.len() - state.scan_offset).min(MatchedBitset::BITS as usize);
+        state.match_base = state.scan_offset;
+        state.scan_offset += len;
+        MatchedBitset::MAX.unbounded_shr(MatchedBitset::BITS - len as u32)
+    }
+
+    fn count_len(_data: &KernelStorage, haystack: &[u8]) -> usize {
+        haystack.len()
+    }
+
+    fn first_match(_data: &KernelStorage, haystack: &[u8]) -> Option<usize> {
+        (!haystack.is_empty()).then_some(0)
+    }
+
+    fn last_match(_data: &KernelStorage, haystack: &[u8]) -> Option<usize> {
+        haystack.len().checked_sub(1)
+    }
+
+    &const {
+        // SAFETY: these entry points never read the kernel. Each batch claims at most
+        // `MatchedBitset::BITS` bytes starting at the old scan offset, stopping at the haystack's
+        // end, and sets exactly their bits; an exhausted haystack yields zero without moving.
+        unsafe { ScanOps::new(next_match_batch, count_len, first_match, last_match) }
     }
 }
 
@@ -621,5 +661,45 @@ mod tests {
     #[test]
     fn never_constructor_matches_nothing() {
         assert_swar_plan(SearchPlan::never(), "never", KernelKind::Never, &|_| false);
+    }
+
+    #[test]
+    fn vector_range_bounds_survive_the_signed_bias() {
+        use crate::vector::kernels;
+
+        let mut levels = vec![Level::baseline(), Level::new()];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            let detected = Level::new();
+            levels.extend(detected.as_sse2().map(Level::Sse2));
+            levels.extend(detected.as_sse4_2().map(Level::Sse4_2));
+            levels.extend(detected.as_avx2().map(Level::Avx2));
+        }
+        // Bounds on both sides of the bias's wrap point and at the ends of the byte domain.
+        let bounds = [0, 1, b'a', 0x7E, 0x7F, 0x80, 0x81, 0xFE, 0xFF];
+        for level in levels {
+            for start in bounds {
+                for last in bounds {
+                    if start > last || (start, last) == (0, u8::MAX) {
+                        continue;
+                    }
+                    let range = ByteRange { start, last };
+                    assert_vector_plan(
+                        SearchPlan::vector(level, kernels::OneRange::new(range)),
+                        &format!("vector OneRange {start}..={last} at {level:?}"),
+                        level,
+                        KernelKind::OneRange,
+                        &|byte| (start..=last).contains(&byte),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn always_constructor_matches_everything() {
+        assert_swar_plan(SearchPlan::always(), "always", KernelKind::Always, &|_| {
+            true
+        });
     }
 }
