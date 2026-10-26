@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/Dr-Emann/memchr_n/compare/v0.1.10...v0.1.11) - 2026-10-26
+
+### Other
+- *(deps)* Bump dtolnay/rust-toolchain (by @dependabot[bot]) - #43
+
 ## [0.1.10](https://github.com/Dr-Emann/memchr_n/compare/v0.1.9...v0.1.10) - 2026-10-21
 
 ### Other
