@@ -508,7 +508,14 @@ impl MemchrN {
         Self { search }
     }
 
+    /// Every constructor that can describe all 256 bytes builds its searcher here.
     fn of_range(engine: Engine, range: ByteRange) -> Self {
+        // The vector range kernel cannot express a full span, and nothing beats matching everything.
+        if range.start == 0 && range.last == u8::MAX {
+            return Self {
+                search: SearchPlan::always(),
+            };
+        }
         let search = match engine {
             Engine::Vector(level) => {
                 SearchPlan::vector(level, vector::kernels::OneRange::new(range))
@@ -1798,6 +1805,71 @@ mod tests {
             let searcher: MemchrN = bytes.into_iter().collect();
             assert_eq!(format!("{:?}", searcher.search.kernel_kind()), "NotByte");
             assert_not_byte(&searcher, excluded, &haystack);
+        }
+    }
+
+    #[test]
+    fn every_full_set_constructor_selects_the_always_kernel() {
+        let all: Vec<u8> = (0..=u8::MAX).collect();
+        let mut inverted = ByteSet::new();
+        inverted.invert();
+        let mut ranged = ByteSet::new();
+        ranged.add_range(0..=u8::MAX);
+        let halves = ByteSet::from_bytes(&all[..128]).union(ByteSet::from_bytes(&all[128..]));
+
+        let backends = [
+            Backend::Auto,
+            Backend::Swar,
+            #[cfg(feature = "manual_level")]
+            Backend::Level(Level::baseline()),
+            #[cfg(feature = "manual_level")]
+            Backend::Level(Level::new()),
+        ];
+
+        let mut searchers = vec![
+            MemchrN::from_range(..),
+            MemchrN::from_byte_set(ByteSet::full()),
+            MemchrN::new(&all),
+            all.iter().copied().collect(),
+        ];
+        for backend in backends {
+            searchers.extend([
+                MemchrN::from_range_with_backend(.., backend),
+                MemchrN::from_range_with_backend(0..=u8::MAX, backend),
+                MemchrN::from_range_with_backend(0.., backend),
+                MemchrN::from_range_with_backend(..=u8::MAX, backend),
+                MemchrN::from_byte_set_with_backend(ByteSet::full(), backend),
+                MemchrN::from_byte_set_with_backend(inverted, backend),
+                MemchrN::from_byte_set_with_backend(ranged, backend),
+                MemchrN::from_byte_set_with_backend(halves, backend),
+                MemchrN::new_with_backend(&all, backend),
+            ]);
+        }
+
+        for (i, searcher) in searchers.iter().enumerate() {
+            assert_eq!(
+                format!("{:?}", searcher.search.kernel_kind()),
+                "Always",
+                "searcher {i}"
+            );
+            for len in [0, 1, 63, 64, 127, 128, 129, 255, 256, 257, 513] {
+                let haystack = haystack(len);
+                let expected: Vec<usize> = (0..len).collect();
+                assert_eq!(searcher.find(&haystack), expected.first().copied());
+                assert_eq!(searcher.rfind(&haystack), expected.last().copied());
+                assert_eq!(searcher.iter(&haystack).collect::<Vec<_>>(), expected);
+                assert_eq!(searcher.iter(&haystack).count(), len);
+                for n in [0, 1, 127, 128, 129, len] {
+                    let mut iter = searcher.iter(&haystack);
+                    assert_eq!(iter.nth(n), expected.get(n).copied());
+                    assert_eq!(iter.count(), len.saturating_sub(n + 1));
+                }
+                for idx in [0, 1, 128, len / 2, len] {
+                    let mut iter = searcher.iter(&haystack);
+                    iter.advance_to(idx);
+                    assert_eq!(iter.collect::<Vec<_>>(), expected[idx.min(len)..]);
+                }
+            }
         }
     }
 
